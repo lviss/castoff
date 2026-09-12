@@ -91,8 +91,8 @@ perl -e '
 ### Whole-system checks
 
 ```sh
-nix flake check   # evaluates the daemon package, the tv-box and tv-box-vm NixOS
-                   # configurations, and the dev shell
+nix flake check   # builds and tests the daemon package (via `checks`), and evaluates
+                   # the tv-box and tv-box-vm NixOS configurations and the dev shell
 ```
 
 ### NixOS VM, no TV hardware required
