@@ -54,6 +54,10 @@
         tv-box-vm = tv-box-vm-system.config.system.build.vm;
       };
 
+      checks.${system} = {
+        castoff-daemon = castoff-daemon;
+      };
+
       apps.${system}.castoff-daemon = {
         type = "app";
         program = "${castoff-daemon}/bin/castoff-daemon";

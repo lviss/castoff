@@ -126,9 +126,7 @@ async fn send_status(socket: &mut TcpStream, player: &Arc<Player>) -> Result<()>
 
 async fn send_volume(socket: &mut TcpStream, player: &Arc<Player>) -> Result<()> {
     let player = Arc::clone(player);
-    let (volume, generation_time) =
-        tokio::task::spawn_blocking(move || (player.volume(), player.status().generation_time))
-            .await?;
+    let volume = tokio::task::spawn_blocking(move || player.volume()).await?;
     #[derive(serde::Serialize)]
     #[serde(rename_all = "camelCase")]
     struct VolumeUpdateMessage {
@@ -139,7 +137,7 @@ async fn send_volume(socket: &mut TcpStream, player: &Arc<Player>) -> Result<()>
         socket,
         Opcode::VolumeUpdate,
         &VolumeUpdateMessage {
-            generation_time,
+            generation_time: player::now_millis(),
             volume,
         },
     )

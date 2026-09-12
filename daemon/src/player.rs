@@ -135,7 +135,7 @@ fn to_mpv_volume(fcast_volume: f64) -> f64 {
     (fcast_volume.clamp(0.0, 1.0)) * 100.0
 }
 
-fn now_millis() -> u64 {
+pub(crate) fn now_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
