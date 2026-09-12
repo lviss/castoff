@@ -196,3 +196,45 @@ pub struct PlaybackUpdateMessage {
 pub struct PlaybackErrorMessage {
     pub message: String,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// FCast v2 (docs.fcast.org/protocol/v2) specifies `PlaybackUpdate.state`
+    /// as an integer enum, not a string. A real sender/receiver on the wire
+    /// only ever sees the JSON produced here, so assert on that JSON directly.
+    #[test]
+    fn playback_update_state_serializes_as_numeric_on_the_wire() {
+        let msg = PlaybackUpdateMessage {
+            generation_time: 1234,
+            state: PlaybackState::Playing,
+            time: Some(1.5),
+            duration: Some(10.0),
+            speed: Some(1.0),
+        };
+        let value: serde_json::Value = serde_json::to_value(&msg).unwrap();
+        assert_eq!(value["state"], serde_json::json!(1));
+
+        for (state, expected) in [
+            (PlaybackState::Idle, 0),
+            (PlaybackState::Playing, 1),
+            (PlaybackState::Paused, 2),
+        ] {
+            let encoded = serde_json::to_string(&state).unwrap();
+            assert_eq!(encoded, expected.to_string());
+        }
+    }
+
+    #[test]
+    fn playback_state_round_trips_through_numeric_wire_values() {
+        for (raw, expected) in [
+            ("0", PlaybackState::Idle),
+            ("1", PlaybackState::Playing),
+            ("2", PlaybackState::Paused),
+        ] {
+            let decoded: PlaybackState = serde_json::from_str(raw).unwrap();
+            assert_eq!(decoded, expected);
+        }
+    }
+}

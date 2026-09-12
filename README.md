@@ -43,7 +43,7 @@ Implemented opcodes (all of FCast v2's playback-control surface):
 
 | Opcode | Direction | Daemon behavior |
 | --- | --- | --- |
-| `Play` (1) | sender -> receiver | `loadfile` the given `url`/`content` into mpv; replies with `PlaybackUpdate` |
+| `Play` (1) | sender -> receiver | `loadfile` the given `url` into mpv (inline `content`, e.g. a DASH manifest, is rejected -- not yet supported); replies with `PlaybackUpdate` |
 | `Pause` (2) / `Resume` (3) | sender -> receiver | toggles mpv's `pause` property; replies with `PlaybackUpdate` |
 | `Stop` (4) | sender -> receiver | stops playback, mpv returns to idle; replies with `PlaybackUpdate` |
 | `Seek` (5) | sender -> receiver | absolute seek; replies with `PlaybackUpdate` |

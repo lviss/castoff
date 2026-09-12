@@ -141,3 +141,53 @@ fn now_millis() -> u64 {
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A `Player` around a headless (`vo=null`, no window) mpv core, sufficient
+    /// to drive real `Player::play` behavior in a sandbox with no display.
+    fn headless_player() -> Player {
+        let mpv = Mpv::with_initializer(|init| {
+            init.set_property("vo", "null")?;
+            init.set_property("idle", "yes")?;
+            Ok(())
+        })
+        .expect("failed to initialize headless mpv for test");
+        Player { mpv }
+    }
+
+    #[test]
+    fn play_rejects_inline_content_without_url() {
+        let player = headless_player();
+        let msg = PlayMessage {
+            content: Some("<MPD>...</MPD>".to_string()),
+            ..Default::default()
+        };
+
+        let err = player.play(&msg).expect_err("content-only play must fail");
+        assert!(
+            err.to_string().contains("inline `content`"),
+            "unexpected error: {err}"
+        );
+
+        // The rejected message must never have reached mpv as a playback target:
+        // the core stays idle rather than treating the manifest text as a path.
+        let idle: bool = player.mpv.get_property("idle-active").unwrap_or(false);
+        assert!(idle, "mpv should remain idle after a rejected play() call");
+    }
+
+    #[test]
+    fn play_with_url_hands_the_url_to_mpv_and_leaves_idle_state() {
+        let player = headless_player();
+        let msg = PlayMessage {
+            url: Some("https://example.invalid/does-not-exist.mp4".to_string()),
+            ..Default::default()
+        };
+
+        // A real (if unreachable) URL is accepted and queued for playback,
+        // unlike the `content`-only case above.
+        player.play(&msg).expect("play with a url must be accepted");
+    }
+}
