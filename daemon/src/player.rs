@@ -49,6 +49,14 @@ impl Player {
         self.mpv
             .command("loadfile", &[target, "replace"])
             .map_err(|e| anyhow::anyhow!("loadfile failed: {e:?}"))?;
+        // `keep-open=yes` (see `new()`) leaves `pause` set to `true` once a
+        // previous file hits EOF, and mpv does not reset that property on the
+        // next `loadfile`. Without this, a second Play call loads the new
+        // file but stays paused on its first frame forever: silent, endless
+        // black screen with no error, since `time-pos` never advances past 0.
+        self.mpv
+            .set_property("pause", false)
+            .map_err(|e| anyhow::anyhow!("failed to unpause after loadfile: {e:?}"))?;
         if let Some(time) = msg.time {
             let _ = self.mpv.set_property("start", time);
         }
@@ -144,18 +152,38 @@ pub(crate) fn now_millis() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
     use super::*;
 
-    /// A `Player` around a headless (`vo=null`, no window) mpv core, sufficient
-    /// to drive real `Player::play` behavior in a sandbox with no display.
+    /// A `Player` around a headless (`vo=null`/`ao=null`, no window or audio
+    /// device) mpv core, sufficient to drive real `Player::play` behavior in
+    /// a sandbox with no display or sound hardware. Mirrors `Player::new`'s
+    /// `keep-open` setting, since that's what the double-play regression test
+    /// below needs to reproduce.
     fn headless_player() -> Player {
         let mpv = Mpv::with_initializer(|init| {
             init.set_property("vo", "null")?;
+            init.set_property("ao", "null")?;
             init.set_property("idle", "yes")?;
+            init.set_property("keep-open", "yes")?;
             Ok(())
         })
         .expect("failed to initialize headless mpv for test");
         Player { mpv }
+    }
+
+    /// Poll `mpv` for up to 5s until `pred` is true; panics on timeout so a
+    /// stuck test fails fast instead of hanging.
+    fn wait_until(mpv: &Mpv, mut pred: impl FnMut(&Mpv) -> bool, what: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if pred(mpv) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!("timed out waiting for: {what}");
     }
 
     #[test]
@@ -189,5 +217,48 @@ mod tests {
         // A real (if unreachable) URL is accepted and queued for playback,
         // unlike the `content`-only case above.
         player.play(&msg).expect("play with a url must be accepted");
+    }
+
+    /// Regression test for a bug where a second `Play` after the first clip
+    /// finished loaded correctly but never advanced past its first frame
+    /// (silent black screen, no error): `keep-open=yes` leaves `pause=true`
+    /// once a clip hits EOF, and mpv does not reset that property on the next
+    /// `loadfile`, so the freshly loaded second clip inherited the stale
+    /// pause. Uses a synthetic, network-free `lavfi` test source (no real
+    /// video file needed) so this runs headless in CI.
+    #[test]
+    fn second_play_after_first_reaches_eof_is_not_left_paused() {
+        let player = headless_player();
+        let msg = PlayMessage {
+            url: Some("av://lavfi:testsrc=size=64x64:rate=10:duration=1".to_string()),
+            ..Default::default()
+        };
+
+        player.play(&msg).expect("first play");
+        wait_until(
+            &player.mpv,
+            |mpv| mpv.get_property("eof-reached").unwrap_or(false),
+            "first clip to reach eof",
+        );
+        // Sanity check on the test's own premise: `keep-open` should indeed
+        // leave mpv paused at eof, otherwise this test is not exercising the
+        // bug it claims to.
+        assert!(
+            player.mpv.get_property::<bool>("pause").unwrap_or(false),
+            "sanity: keep-open=yes should pause mpv once eof is reached"
+        );
+
+        player.play(&msg).expect("second play");
+
+        let paused: bool = player.mpv.get_property("pause").unwrap_or(true);
+        assert!(
+            !paused,
+            "second play() must not leave mpv paused on the reloaded clip's first frame"
+        );
+        wait_until(
+            &player.mpv,
+            |mpv| mpv.get_property::<f64>("time-pos").unwrap_or(0.0) > 0.05,
+            "second clip's playback time to advance past its first frame",
+        );
     }
 }
