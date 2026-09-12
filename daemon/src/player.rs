@@ -3,7 +3,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use libmpv2::Mpv;
 
 use crate::fcast::{PlayMessage, PlaybackState, PlaybackUpdateMessage};
@@ -38,11 +38,14 @@ impl Player {
     }
 
     pub fn play(&self, msg: &PlayMessage) -> Result<()> {
-        let target = msg
-            .url
-            .as_deref()
-            .or(msg.content.as_deref())
-            .context("Play message has neither `url` nor `content`")?;
+        let target = match (msg.url.as_deref(), msg.content.as_deref()) {
+            (Some(url), _) => url,
+            (None, Some(_)) => anyhow::bail!(
+                "Play message carries inline `content` (e.g. a DASH manifest) with no `url`; \
+                 inline manifest playback is not yet supported"
+            ),
+            (None, None) => anyhow::bail!("Play message has neither `url` nor `content`"),
+        };
         self.mpv
             .command("loadfile", &[target, "replace"])
             .map_err(|e| anyhow::anyhow!("loadfile failed: {e:?}"))?;

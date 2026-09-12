@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::io;
 
 use serde::{Deserialize, Serialize};
+use serde_repr::{Deserialize_repr, Serialize_repr};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const DEFAULT_PORT: u16 = 46899;
@@ -170,7 +171,7 @@ pub struct VersionMessage {
     pub version: u32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize_repr, Deserialize_repr)]
 #[repr(u8)]
 pub enum PlaybackState {
     Idle = 0,
