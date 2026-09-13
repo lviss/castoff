@@ -92,14 +92,23 @@ impl Player {
             (None, None) => anyhow::bail!("Play message has neither `url` nor `content`"),
         };
         self.hide_idle_screen()?;
-        // Recorded before `loadfile` so the background error listener (see
-        // `spawn_error_logger`) can already attribute an error that arrives
-        // while resolution/opening is still in flight (e.g. a slow or
-        // failing `ytdl_hook`/`yt-dlp` YouTube lookup).
-        *self.last_target.lock().unwrap() = target.to_string();
+        // Held across both the write and the `loadfile` submission so two
+        // concurrent `play()` calls (one per FCast connection, see main.rs)
+        // can't interleave: without this, connection B could set
+        // `last_target` between connection A's write and A's `loadfile`
+        // call, so an async error later attributed to A's in-flight load
+        // would wrongly blame B's url. Serializing the pair keeps
+        // `last_target` in the same order as submission to mpv, which is
+        // what the background error listener (see `spawn_error_logger`)
+        // relies on to attribute an error that arrives while
+        // resolution/opening is still in flight (e.g. a slow or failing
+        // `ytdl_hook`/`yt-dlp` YouTube lookup).
+        let mut last_target = self.last_target.lock().unwrap();
+        *last_target = target.to_string();
         self.mpv
             .command("loadfile", &[target, "replace"])
             .map_err(|e| anyhow::anyhow!("loadfile failed for url {target:?}: {e:?}"))?;
+        drop(last_target);
         // `keep-open=yes` (see `new()`) leaves `pause` set to `true` once a
         // previous file hits EOF, and mpv does not reset that property on the
         // next `loadfile`. Without this, a second Play call loads the new
