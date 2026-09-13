@@ -196,10 +196,12 @@ impl Player {
 
     /// Stop playback and return to mpv's idle state (no decode pipeline
     /// running), fading the old video out and the idle clock in rather than
-    /// cutting straight to it. A Stop while already idle is a no-op transition
-    /// (just re-asserts the clock), so it doesn't blink the screen.
+    /// cutting straight to it. A Stop while already idle and not loading is a
+    /// no-op transition (just re-asserts the clock), so it doesn't blink the
+    /// screen.
     pub fn stop(&self) -> Result<()> {
         let was_playing = !self.mpv.get_property::<bool>("idle-active").unwrap_or(true);
+        let was_loading = self.overlay.is_active();
         if was_playing {
             if let Err(e) = self.overlay.conceal() {
                 let _ = self.abort_loading_to_idle();
@@ -210,26 +212,41 @@ impl Player {
             let _ = self.abort_loading_to_idle();
             return Err(anyhow::anyhow!("stop failed: {e:?}"));
         }
-        // Draw the clock underneath the still-opaque fade rect, then reveal
-        // it. `reveal` is a no-op when no overlay is up (the already-idle
-        // case), so this stays cheap there. If drawing the clock fails, still
-        // tear the overlay down rather than leaving the opaque fade up.
-        if let Err(e) = self.show_idle_screen(IdleScreen::Clock) {
-            let _ = self.abort_loading_to_idle();
-            return Err(e);
+        if was_playing || was_loading {
+            self.fade_in_idle_clock()
+        } else {
+            self.show_idle_screen(IdleScreen::Clock)
         }
-        self.overlay.reveal()
+    }
+
+    /// Fade the idle clock in from black: drop the cover overlays (the screen
+    /// behind is already black from `conceal` or the loading overlay), ramp
+    /// the clock's own OSD alpha up, then install it as the current idle
+    /// screen. The clock cannot be revealed by fading a cover rect away: mpv
+    /// stacks overlays by recency, so a clock re-created after the rect would
+    /// sit above it and pop in instead of fading.
+    fn fade_in_idle_clock(&self) -> Result<()> {
+        // Cancel/remove only the spinner; the opaque fade rect stays as the
+        // black backdrop (a not-yet-cleared video frame must not flash
+        // through). Draw the clock above it at zero opacity, ramp that alpha
+        // up, and only then drop the rect -- by then the clock's own opaque
+        // background covers the canvas, so removing the rect is invisible.
+        self.overlay.stop_spinner()?;
+        self.idle.render_at(IdleScreen::Clock, 0)?;
+        self.overlay
+            .fade_in(|opacity| self.idle.render_at(IdleScreen::Clock, opacity))?;
+        self.overlay.clear()?;
+        self.show_idle_screen(IdleScreen::Clock)
     }
 
     /// A load ended without ever starting playback: cancel the spinner (if
-    /// it's up) and return to the idle clock, so a failed Play ends on the
+    /// it's up) and fade back to the idle clock, so a failed Play ends on the
     /// idle screen with the console error report rather than an endless
-    /// spinner. Used by the synchronous error paths in `play`/`stop`; showing
-    /// the clock and clearing the overlay are both idempotent, so it is safe
-    /// to call even when the overlay has already cleared itself.
+    /// spinner. Used by the synchronous error paths in `play`/`stop`; clearing
+    /// the overlay and showing the clock are both idempotent, so it is safe to
+    /// call even when the overlay has already cleared itself.
     fn abort_loading_to_idle(&self) -> Result<()> {
-        let _ = self.show_idle_screen(IdleScreen::Clock);
-        self.overlay.reveal()
+        self.fade_in_idle_clock()
     }
 
     pub fn seek(&self, time: f64) -> Result<()> {
@@ -385,10 +402,16 @@ fn spawn_lifecycle_watcher(
 /// Put the idle clock back and tear the spinner down because the in-flight
 /// load is not going to start. A no-op when nothing is showing.
 fn restore_idle_clock(idle: &IdleScreenController, overlay: &PlaybackOverlay) {
-    if overlay.is_active() {
-        let _ = idle.show(IdleScreen::Clock);
-        let _ = overlay.reveal();
+    if !overlay.is_active() {
+        return;
     }
+    // See `Player::fade_in_idle_clock`: keep the opaque rect as the backdrop,
+    // fade the clock in above it, then drop the rect.
+    let _ = overlay.stop_spinner();
+    let _ = idle.render_at(IdleScreen::Clock, 0);
+    let _ = overlay.fade_in(|opacity| idle.render_at(IdleScreen::Clock, opacity));
+    let _ = overlay.clear();
+    let _ = idle.show(IdleScreen::Clock);
 }
 
 /// Dispatch one lifecycle event; returns `false` when the watcher should stop

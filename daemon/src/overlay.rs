@@ -14,9 +14,28 @@
 //! Play request is genuinely in flight and is torn down the moment playback
 //! restarts, a load fails, or a newer command supersedes it. Nothing here
 //! redraws on a timer once settled.
+//!
+//! The observable sequence, confirmed on a real mpv/X capture:
+//!
+//! * A Play first fades the old content (idle clock or previous video) to
+//!   black (`conceal`, ~400ms), then shows the rotating spinner on the black.
+//!   When mpv reports playback has started, the spinner is removed and the
+//!   black fades away (`reveal`, ~400ms) to the new video. So the fade covers
+//!   both boundaries on a Play -- idle/old content to black, and black to new
+//!   video -- with the spinner sitting between them; it never masks either
+//!   fade because it is drawn only after `conceal` finishes and is cleared
+//!   before `reveal`'s first frame.
+//! * A Stop fades the video to black (`conceal`, ~400ms), then fades the idle
+//!   clock in over that same black (`Player::fade_in_idle_clock`, ~400ms). The
+//!   clock is itself an OSD overlay, and mpv stacks overlays by recency rather
+//!   than by id, so a cover rect cannot be faded away to reveal a clock that
+//!   was re-created on top of it -- instead the clock's own `\1a` alpha is
+//!   ramped up while the opaque rect stays behind it as a black backdrop (so
+//!   a not-yet-cleared video frame can't flash through), then the rect is
+//!   dropped once the clock's own opaque background covers the canvas.
 
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use libmpv2::Mpv;
@@ -28,22 +47,40 @@ use libmpv2::Mpv;
 const CANVAS_WIDTH: i64 = 1920;
 const CANVAS_HEIGHT: i64 = 1080;
 
-/// `osd-overlay` ids. Distinct from the idle clock's 9000/9001; mpv draws
-/// higher ids above lower ones, so the fade rect (9100) covers the idle
-/// clock and video, and the spinner (9101) sits on top of the fade rect.
+/// `osd-overlay` ids. Distinct from the idle clock's 9000/9001. Note that
+/// mpv does **not** order overlays by id: whichever overlay was most recently
+/// added/updated is drawn on top. That is fine for covering *video* (an
+/// overlay is always above video), but it means a cover rect cannot be used
+/// to reveal the idle clock, which is itself an overlay: the clock would be
+/// re-added above the rect. `Player` fades the clock in via its own alpha
+/// instead (`fade_in` + `IdleScreenController::render_at`).
 const OSD_OVERLAY_FADE_ID: i64 = 9100;
 const OSD_OVERLAY_SPINNER_ID: i64 = 9101;
 
-/// Fade-through-black: a fixed number of frames at a fixed cadence, so one
-/// direction is ~150ms -- a transition, not a presentation.
-const FADE_STEPS: u32 = 5;
-const FADE_STEP: Duration = Duration::from_millis(30);
+/// Fade-through-black: 20 frames at 20ms each, so one direction is ~400ms --
+/// long enough to read as a fade on a TV rather than a cut, with fine enough
+/// steps that the opacity ramp is smooth instead of a few visible jumps. Still
+/// a bounded transition that stops redrawing once settled.
+const FADE_STEPS: u32 = 20;
+const FADE_STEP: Duration = Duration::from_millis(20);
 
-/// Spinner cadence: 30 degrees every 100ms = one revolution per 1.2s, and a
-/// redraw rate (10/s) that is trivial next to video decode but still reads as
-/// motion.
-const SPINNER_STEP: Duration = Duration::from_millis(100);
-const SPINNER_DEGREES_PER_STEP: f64 = 30.0;
+/// Spinner cadence: 12 degrees every 33ms = ~30 redraws/s and one revolution
+/// per ~1s, smooth enough to read as continuous rotation while staying a
+/// bounded, load-only animation (it draws nothing once the load ends).
+const SPINNER_STEP: Duration = Duration::from_millis(33);
+const SPINNER_DEGREES_PER_STEP: f64 = 12.0;
+
+/// Environment variable that scales *both* animations for manual inspection or
+/// testing, e.g. `CASTOFF_ANIMATION_SLOWDOWN=10` makes the whole sequence ten
+/// times slower. Read once at startup. Deliberately an environment variable
+/// rather than a control-protocol opcode: it is an operator/testing
+/// affordance, not a user setting, so it stays out of the FCast surface.
+/// Unset, empty, malformed, non-finite, or below `1` all fall back to `1.0`
+/// (exactly the shipping behavior); values are clamped to
+/// `MAX_ANIMATION_SLOWDOWN` so a typo can't produce an absurd sleep. See
+/// `parse_slowdown`.
+pub(crate) const ANIMATION_SLOWDOWN_ENV: &str = "CASTOFF_ANIMATION_SLOWDOWN";
+const MAX_ANIMATION_SLOWDOWN: f64 = 1000.0;
 
 #[derive(Default)]
 struct State {
@@ -61,6 +98,9 @@ struct State {
 pub(crate) struct PlaybackOverlay {
     mpv: Arc<Mpv>,
     state: Arc<Mutex<State>>,
+    /// Multiplier on every animation duration, read once from the environment
+    /// at startup (see `parse_slowdown`). `1.0` is the shipping behavior.
+    slowdown: f64,
 }
 
 impl PlaybackOverlay {
@@ -68,6 +108,7 @@ impl PlaybackOverlay {
         Self {
             mpv,
             state: Arc::new(Mutex::new(State::default())),
+            slowdown: animation_slowdown_from_env(),
         }
     }
 
@@ -109,7 +150,7 @@ impl PlaybackOverlay {
     /// Fade whatever is on screen to opaque black. Used at the start of a
     /// Play (so the old content or idle clock disappears behind the spinner)
     /// and at the start of a Stop (so the old video disappears before the
-    /// idle clock takes its place). Blocking but bounded (~150ms).
+    /// idle clock takes its place). Blocking but bounded (~400ms).
     pub(crate) fn conceal(&self) -> Result<()> {
         let generation = self.begin();
         let start = self.state.lock().unwrap().opacity;
@@ -123,7 +164,7 @@ impl PlaybackOverlay {
                     return Err(e);
                 }
             }
-            std::thread::sleep(FADE_STEP);
+            std::thread::sleep(scale_duration(FADE_STEP, self.slowdown));
         }
         let mut state = self.state.lock().unwrap();
         if state.generation == generation {
@@ -155,16 +196,33 @@ impl PlaybackOverlay {
 
         let mpv = Arc::clone(&self.mpv);
         let state = Arc::clone(&self.state);
+        let step = scale_duration(SPINNER_STEP, self.slowdown);
         std::thread::spawn(move || {
             let mut angle = 0.0;
+            // Schedule against an absolute deadline rather than sleeping a
+            // fixed `step` each turn: `thread::sleep` overshoots by scheduler
+            // granularity, so a naive loop runs measurably slower than 30
+            // redraws/s. Charging one `step` per tick keeps the *average*
+            // rate at the intended ~30/s (and exactly `1/slowdown` of that
+            // for a slowed run) even when individual sleeps are late.
+            let mut next = Instant::now() + step;
             loop {
-                std::thread::sleep(SPINNER_STEP);
+                let now = Instant::now();
+                if next > now {
+                    std::thread::sleep(next - now);
+                }
+                next += step;
+                // Hold the lock across the (single) spinner draw so it can
+                // never land after `clear_if_current` has torn the overlays
+                // down; only the spinner layer is re-issued here -- the
+                // opaque fade rect it sits on is unchanged, so there is no
+                // reason to redraw it every frame.
                 let state = state.lock().unwrap();
                 if state.generation != generation {
                     return;
                 }
                 angle = (angle + SPINNER_DEGREES_PER_STEP) % 360.0;
-                let _ = draw_overlay(&mpv, 255, Some(angle));
+                let _ = draw_spinner(&mpv, angle);
             }
         });
         Ok(())
@@ -189,9 +247,37 @@ impl PlaybackOverlay {
                     return Err(e);
                 }
             }
-            std::thread::sleep(FADE_STEP);
+            std::thread::sleep(scale_duration(FADE_STEP, self.slowdown));
         }
         self.clear_if_current(Some(generation))
+    }
+
+    /// Fade `render` in from transparent to opaque over one fade duration,
+    /// calling it once per opacity step. Used to bring the idle clock back on
+    /// a Stop or a failed load: the clock is itself an OSD overlay, so it
+    /// cannot be revealed by removing a cover rect that was stacked above it
+    /// (`mpv` stacks overlays by recency); fading its own alpha in is the
+    /// crossfade. Bounded like every other animation here: a fixed number of
+    /// steps, then it returns and stops drawing.
+    pub(crate) fn fade_in(&self, mut render: impl FnMut(u8) -> Result<()>) -> Result<()> {
+        for step in 1..=FADE_STEPS {
+            render(lerp_u8(0, 255, step, FADE_STEPS))?;
+            std::thread::sleep(scale_duration(FADE_STEP, self.slowdown));
+        }
+        Ok(())
+    }
+
+    /// Stop the spinner (cancelling its redraw thread) and remove just the
+    /// spinner layer, leaving the opaque fade rect in place. Used while
+    /// fading the idle clock in: the rect is the black backdrop that keeps a
+    /// not-yet-cleared video frame from flashing through, while the spinner
+    /// must not keep turning underneath the clock.
+    pub(crate) fn stop_spinner(&self) -> Result<()> {
+        {
+            let mut state = self.state.lock().unwrap();
+            state.generation += 1;
+        }
+        clear_spinner(&self.mpv)
     }
 
     /// Remove both overlays immediately (no fade) and mark the overlay
@@ -223,12 +309,19 @@ impl PlaybackOverlay {
 /// Draw one frame of the overlay: the black fade rect at `opacity`, plus the
 /// spinner at `spinner_deg` (or no spinner when `None`, clearing that layer).
 fn draw_overlay(mpv: &Mpv, opacity: u8, spinner_deg: Option<f64>) -> Result<()> {
+    draw_fade_rect(mpv, opacity)?;
+    match spinner_deg {
+        Some(deg) => draw_spinner(mpv, deg),
+        None => clear_spinner(mpv),
+    }
+}
+
+/// Draw the full-canvas black rectangle at `opacity` (0 = transparent, 255 =
+/// opaque) into the fade overlay id. Drawn as an ASS vector rect, faded with
+/// `\1a` (inverted alpha).
+fn draw_fade_rect(mpv: &Mpv, opacity: u8) -> Result<()> {
     // ASS alpha is inverted from opacity: 00 is opaque, FF is transparent.
     let alpha = 255 - opacity;
-    // A full-canvas black rectangle, faded by `\1a`. Drawn in the same two
-    // separate `osd-overlay` calls as the idle clock (`idle_screen.rs`): one
-    // layer for the background, one for the foreground, because libass only
-    // honors one `\pos`/`\an` override per event.
     let fade = format!(
         "{{\\an7\\pos(0,0)\\1c&H000000&\\1a&H{alpha:02X}&\\bord0\\shad0\\p1}}\
          m 0 0 l {w} 0 l {w} {h} l 0 {h}{{\\p0}}",
@@ -246,32 +339,35 @@ fn draw_overlay(mpv: &Mpv, opacity: u8, spinner_deg: Option<f64>) -> Result<()> 
         ],
     )
     .map_err(|e| anyhow::anyhow!("osd-overlay (fade) failed: {e:?}"))?;
+    Ok(())
+}
 
-    match spinner_deg {
-        Some(deg) => {
-            let spinner = spinner_ass(deg);
-            mpv.command(
-                "osd-overlay",
-                &[
-                    &OSD_OVERLAY_SPINNER_ID.to_string(),
-                    "ass-events",
-                    &spinner,
-                    &CANVAS_WIDTH.to_string(),
-                    &CANVAS_HEIGHT.to_string(),
-                ],
-            )
-            .map_err(|e| anyhow::anyhow!("osd-overlay (spinner) failed: {e:?}"))?;
-        }
-        None => {
-            // Clear the spinner layer only; `format=none` removes the
-            // overlay outright rather than replacing it with empty content.
-            mpv.command(
-                "osd-overlay",
-                &[&OSD_OVERLAY_SPINNER_ID.to_string(), "none", ""],
-            )
-            .map_err(|e| anyhow::anyhow!("osd-overlay (spinner clear) failed: {e:?}"))?;
-        }
-    }
+/// Draw the rotating spinner into the spinner overlay id. One `osd-overlay`
+/// command per frame, on top of the already-opaque fade rect.
+fn draw_spinner(mpv: &Mpv, deg: f64) -> Result<()> {
+    let spinner = spinner_ass(deg);
+    mpv.command(
+        "osd-overlay",
+        &[
+            &OSD_OVERLAY_SPINNER_ID.to_string(),
+            "ass-events",
+            &spinner,
+            &CANVAS_WIDTH.to_string(),
+            &CANVAS_HEIGHT.to_string(),
+        ],
+    )
+    .map_err(|e| anyhow::anyhow!("osd-overlay (spinner) failed: {e:?}"))?;
+    Ok(())
+}
+
+/// Remove the spinner layer only; `format=none` removes the overlay outright
+/// rather than replacing it with empty content.
+fn clear_spinner(mpv: &Mpv) -> Result<()> {
+    mpv.command(
+        "osd-overlay",
+        &[&OSD_OVERLAY_SPINNER_ID.to_string(), "none", ""],
+    )
+    .map_err(|e| anyhow::anyhow!("osd-overlay (spinner clear) failed: {e:?}"))?;
     Ok(())
 }
 
@@ -334,4 +430,61 @@ fn lerp_u8(from: u8, to: u8, step: u32, steps: u32) -> u8 {
     let from = from as i32;
     let to = to as i32;
     (from + (to - from) * step as i32 / steps as i32) as u8
+}
+
+/// Scale a base animation duration by the runtime slowdown multiplier. Only
+/// ever called with a `slowdown` already normalized to `>= 1` and `<= MAX`
+/// by `parse_slowdown`, so the result can't be zero, negative, or absurd.
+fn scale_duration(base: Duration, slowdown: f64) -> Duration {
+    Duration::from_secs_f64(base.as_secs_f64() * slowdown)
+}
+
+fn animation_slowdown_from_env() -> f64 {
+    parse_slowdown(std::env::var(ANIMATION_SLOWDOWN_ENV).ok().as_deref())
+}
+
+/// Parse `CASTOFF_ANIMATION_SLOWDOWN`. Anything unusable -- unset, empty,
+/// unparseable, non-finite, or below `1` (which would *speed up* the
+/// animation, not slow it) -- yields the shipping default of `1.0`; a valid
+/// multiplier above 1 is clamped to `MAX_ANIMATION_SLOWDOWN`.
+fn parse_slowdown(raw: Option<&str>) -> f64 {
+    raw.map(str::trim)
+        .filter(|value| !value.is_empty())
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value >= 1.0)
+        .map(|value| value.min(MAX_ANIMATION_SLOWDOWN))
+        .unwrap_or(1.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_slowdown, MAX_ANIMATION_SLOWDOWN};
+
+    /// The shipping experience must be untouched: every unusable value (and
+    /// in particular *unset*) means exactly 1x, with no panic.
+    #[test]
+    fn slowdown_defaults_to_one_for_unset_empty_or_unusable_values() {
+        for raw in [
+            None,
+            Some(""),
+            Some("   "),
+            Some("abc"),
+            Some("0"),
+            Some("-10"),
+            Some("NaN"),
+            Some("inf"),
+            Some("-inf"),
+            Some("0.5"),
+        ] {
+            assert_eq!(parse_slowdown(raw), 1.0, "raw={raw:?} must fall back to 1x");
+        }
+    }
+
+    #[test]
+    fn slowdown_accepts_multipliers_at_or_above_one_and_clamps_absurd_ones() {
+        assert_eq!(parse_slowdown(Some("1")), 1.0);
+        assert_eq!(parse_slowdown(Some("10")), 10.0);
+        assert_eq!(parse_slowdown(Some(" 2.5 ")), 2.5);
+        assert_eq!(parse_slowdown(Some("99999")), MAX_ANIMATION_SLOWDOWN);
+    }
 }

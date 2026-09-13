@@ -45,17 +45,30 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   end-to-end; it needs a display, so it stays a manual evidence step, not a test.
 - The loading spinner and start/stop fade live in `daemon/src/overlay.rs`, drawing through the same
   `osd-overlay` ASS path as the idle clock (not a second rendering stack). It owns overlay ids
-  9100 (fade rect) / 9101 (spinner); the idle clock keeps 9000/9001, and mpv draws higher ids on
-  top, so don't reuse those. The spinner is an ASS vector annular sector rotated in place via
+  9100 (fade rect) / 9101 (spinner); the idle clock keeps 9000/9001, so don't reuse those.
+  IMPORTANT: mpv stacks `osd-overlay` layers by **recency, not by id** (empirically verified) --
+  the most recently added/updated overlay is on top. That's fine for covering video (an overlay is
+  always above video), but it means a cover rect can't reveal the idle clock: the re-created clock
+  is stacked above the rect and pops in. `Player::fade_in_idle_clock` therefore ramps the clock's
+  own `\1a` alpha up (`IdleScreenController::render_at`) over the still-opaque rect, then drops the
+  rect once the clock's opaque background covers the canvas. Do NOT reintroduce a remove+re-add of
+  the rect to force z-order: mpv can render between the remove and the add, flashing the video.
+  The spinner is an ASS vector annular sector rotated in place via
   `\an7\pos` + `\org` + `\frz` (no font dependency; `\an5` would make the arc orbit the canvas --
   see `spinner_ass`'s comment before touching the anchor). Every animation is a bounded
-  loop that stops on a generation-counter bump; the spinner thread redraws only while a Play is in
-  flight. Overlay draws hold the state mutex across their `osd-overlay` command and `clear()` holds
+  loop that stops on a generation-counter bump; the spinner thread is deadline-scheduled to
+  redraw at ~30/s (measured 30.3/s; 12 degrees/frame, ~1s revolution) and only while a Play is in
+  flight. Overlay draws hold the state
+  mutex across their `osd-overlay` command and `clear()` holds
   it across its teardown, so a draw that passed the staleness check can never land after the
-  overlays were removed (the stale-spinner-draw race). `Player::play`/`stop` block ~150ms per fade,
-  but a superseding command aborts the old animation at its next frame, so the concurrent-`play`
-  test stays fast; every error path in `play`/`stop` calls `abort_loading_to_idle` so a partial
-  setup can't leave the opaque fade covering the screen.
+  overlays were removed (the stale-spinner-draw race). `Player::play`/`stop` block ~400ms per fade
+  (20 opacity steps at 20ms), but a superseding command aborts the old animation at its next frame,
+  so the concurrent-`play` test stays fast; every error path in `play`/`stop` calls
+  `abort_loading_to_idle` so a partial setup can't leave the opaque fade covering the screen.
+  `CASTOFF_ANIMATION_SLOWDOWN` (read once in `PlaybackOverlay::new`, parsed by `parse_slowdown`)
+  multiplies both step durations for manual inspection (measured 30.3/s -> 3.03/s at 10x);
+  unset/unusable -> 1 (shipping), clamped at
+  1000, and it never makes an animation always-on.
 - YouTube playback needs no daemon-side code: mpv's built-in `ytdl_hook` Lua script (same core in
   both CLI mpv and `libmpv2`) auto-detects non-direct-media URLs and shells out to `yt-dlp` on
   `PATH`, unconditionally, with no libmpv init tweaks required — see README's "How YouTube
