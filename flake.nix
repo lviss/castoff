@@ -3,12 +3,28 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
+    # Second nixpkgs, used for exactly one package: `yt-dlp`. See `yt-dlp`
+    # below for why the stable pin isn't good enough. Nothing else here is
+    # imported from this input.
+    nixpkgs-unstable.url = "github:NixOS/nixpkgs/nixos-unstable";
   };
 
-  outputs = { self, nixpkgs }:
+  outputs = { self, nixpkgs, nixpkgs-unstable }:
     let
       system = "x86_64-linux";
       pkgs = import nixpkgs { inherit system; };
+
+      # yt-dlp is deliberately the one package taken from nixos-unstable
+      # rather than the nixos-25.11 pin above. nixos-25.11 ships
+      # yt-dlp 2026.06.09, whose default YouTube player-client selection for
+      # some videos is `android_vr`; YouTube's CDN answers those signed
+      # stream URLs with HTTP 403, so playback fails with `Raw(-16)` /
+      # "Failed to open" even though extraction succeeded. nixos-unstable
+      # ships 2026.08.19, which selects the working `visionos` client for the
+      # same video. This is a yt-dlp-extractor/client-selection issue, not a
+      # castoff or mpv one -- see AGENTS.md. Everything else stays on
+      # nixos-25.11, including mpv/libmpv and the Rust toolchain.
+      yt-dlp = (import nixpkgs-unstable { inherit system; }).yt-dlp;
 
       castoff-daemon = pkgs.rustPlatform.buildRustPackage {
         pname = "castoff-daemon";
@@ -37,7 +53,7 @@
         # appliance).
         postFixup = ''
           wrapProgram $out/bin/castoff-daemon \
-            --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.yt-dlp ]}
+            --prefix PATH : ${pkgs.lib.makeBinPath [ yt-dlp ]}
         '';
 
         meta = {
@@ -91,12 +107,14 @@
         inputsFrom = [ castoff-daemon ];
         # `inputsFrom` only pulls in `castoff-daemon`'s buildInputs/nativeBuildInputs
         # (mpv-unwrapped, makeWrapper); it does NOT carry over that package's
-        # `postFixup` PATH wrapping. Without `pkgs.yt-dlp` listed here too,
+        # `postFixup` PATH wrapping. Without `yt-dlp` listed here too,
         # `cargo build`/`cargo run` inside this dev shell produces an
         # unwrapped binary with no `yt-dlp` on `PATH`, so YouTube playback
         # silently fails (mpv's ytdl_hook has nothing to shell out to) even
-        # though `nix build` (which does apply the wrapper) works fine.
-        packages = [ pkgs.cargo pkgs.rustc pkgs.rust-analyzer pkgs.clippy pkgs.yt-dlp ];
+        # though `nix build` (which does apply the wrapper) works fine. Uses
+        # the same nixos-unstable `yt-dlp` as the package wrapper (see above),
+        # so tests run against the version the appliance actually ships.
+        packages = [ pkgs.cargo pkgs.rustc pkgs.rust-analyzer pkgs.clippy yt-dlp ];
       };
     };
 }
