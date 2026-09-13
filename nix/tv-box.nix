@@ -49,10 +49,10 @@
     };
   };
 
-  # Boat power, not mains: this box should sit at a black screen drawing as
-  # little as possible until something is cast to it, so anything that
-  # spins the disk, polls hardware, or exists only for desktop-workstation
-  # ergonomics is trimmed, matching nixos-kiosk's "shrink closure" approach.
+  # Boat power, not mains: this box should sit idle drawing as little power
+  # as possible until something is cast to it, so anything that spins the
+  # disk, polls hardware, or exists only for desktop-workstation ergonomics
+  # is trimmed, matching nixos-kiosk's "shrink closure" approach.
   services.udisks2.enable = false;
   documentation.enable = false;
   documentation.nixos.enable = false;
