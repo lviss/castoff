@@ -850,7 +850,10 @@ mod tests {
         // still not `idle-active` at this point, so the old
         // `was_playing = !idle-active` check did take the blink path.
         assert!(
-            !player.mpv.get_property::<bool>("idle-active").unwrap_or(true),
+            !player
+                .mpv
+                .get_property::<bool>("idle-active")
+                .unwrap_or(true),
             "sanity: keep-open leaves mpv non-idle at eof, which caused the blink"
         );
 

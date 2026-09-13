@@ -63,8 +63,14 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   it across its teardown, so a draw that passed the staleness check can never land after the
   overlays were removed (the stale-spinner-draw race). `Player::play`/`stop` block ~400ms per fade
   (20 opacity steps at 20ms), but a superseding command aborts the old animation at its next frame,
-  so the concurrent-`play` test stays fast; every error path in `play`/`stop` calls
-  `abort_loading_to_idle` so a partial setup can't leave the opaque fade covering the screen.
+  so the concurrent-`play` test stays fast; `play`/`stop` overlay error paths fall back through
+  `abort_loading_to_idle` -> `fade_in_idle_clock`, which rolls the overlay back to a visible clock
+  if any of its own steps fail, so a partial setup can't leave the opaque fade covering the screen.
+  `stop` decides "already idle" from the idle clock being on screen, not mpv's `idle-active`: with
+  `keep-open=yes` a clip that reached EOF is not `idle-active` though the clock is already back, so
+  keying off that would conceal the visible clock and blink it (regression test
+  `stop_after_end_of_file_does_not_blink_the_idle_clock`); `fade_in_idle_clock` skips its alpha
+  ramp in that case, since `render_at` must not run alongside `show`'s refresh thread.
   `CASTOFF_ANIMATION_SLOWDOWN` (read once in `PlaybackOverlay::new`, parsed by `parse_slowdown`)
   multiplies both step durations for manual inspection (measured 30.3/s -> 3.03/s at 10x);
   unset/unusable -> 1 (shipping), clamped at

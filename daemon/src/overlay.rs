@@ -228,9 +228,12 @@ impl PlaybackOverlay {
         Ok(())
     }
 
-    /// Playback has genuinely started rendering, or a failed load is being
-    /// handed back to the idle clock: stop the spinner, fade the black away,
-    /// and remove the overlays entirely. No-op when nothing is showing.
+    /// Playback has genuinely started rendering (`PlaybackRestart`): stop
+    /// the spinner, fade the black away, and remove the overlays entirely.
+    /// No-op when nothing is showing. A load that fails or never starts is
+    /// handed back to the idle clock instead, through `restore_idle_clock` /
+    /// `Player::fade_in_idle_clock`, which fades the clock's own alpha in
+    /// rather than revealing video.
     pub(crate) fn reveal(&self) -> Result<()> {
         if !self.is_active() {
             return Ok(());
