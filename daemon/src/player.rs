@@ -222,16 +222,12 @@ impl Player {
     }
 
     /// A load ended without ever starting playback: cancel the spinner (if
-    /// it's up) and fade back to the idle clock, so a failed Play ends on the
+    /// it's up) and return to the idle clock, so a failed Play ends on the
     /// idle screen with the console error report rather than an endless
-    /// spinner. Shared by the async error path (`spawn_lifecycle_watcher`) and
-    /// the synchronous error paths in `play`/`stop`. Clearing the overlay is
-    /// attempted even when showing the clock fails -- otherwise a draw error
-    /// would leave the opaque fade covering the screen.
+    /// spinner. Used by the synchronous error paths in `play`/`stop`; showing
+    /// the clock and clearing the overlay are both idempotent, so it is safe
+    /// to call even when the overlay has already cleared itself.
     fn abort_loading_to_idle(&self) -> Result<()> {
-        if !self.overlay.is_active() {
-            return Ok(());
-        }
         let _ = self.show_idle_screen(IdleScreen::Clock);
         self.overlay.reveal()
     }
@@ -1014,6 +1010,40 @@ mod tests {
             player.idle_screen(),
             Some(IdleScreen::Clock),
             "the idle clock must return"
+        );
+    }
+
+    /// Regression test for the failed-setup path where the loading overlay has
+    /// *already* cleared itself (e.g. `spawn_spinner`'s draw failed and its
+    /// error path called `clear()`) after `hide_idle_screen()` removed the
+    /// clock. `abort_loading_to_idle` must still put the clock back; otherwise
+    /// `play()` returns Err with no overlay up and no clock, leaving an
+    /// unadorned black screen until the next command.
+    #[test]
+    fn abort_restores_idle_clock_when_overlay_already_cleared() {
+        let player = headless_player();
+        assert_eq!(player.idle_screen(), Some(IdleScreen::Clock));
+
+        player.overlay.conceal().expect("conceal");
+        player.hide_idle_screen().expect("hide idle clock");
+        // Exactly what `spawn_spinner`'s error path does when its draw fails.
+        player.overlay.clear().expect("clear overlay");
+        assert!(
+            !player.loading_overlay_active(),
+            "precondition: the overlay has already cleared itself"
+        );
+        assert_eq!(
+            player.idle_screen(),
+            None,
+            "precondition: clock hidden and overlay gone -- screen would be black"
+        );
+
+        player.abort_loading_to_idle().expect("abort back to the idle clock");
+
+        assert_eq!(
+            player.idle_screen(),
+            Some(IdleScreen::Clock),
+            "the idle clock must be restored even when the overlay had already cleared"
         );
     }
 }
