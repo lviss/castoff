@@ -35,7 +35,22 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   loaded) even with `force-window=yes` — confirmed empirically, there's no headless (no
   GPU/display) way to assert on rendered idle-screen pixels. Tests covering idle-screen-type
   behavior (`daemon/src/player.rs`'s idle-screen test) instead assert on real mpv command
-  success/failure plus real state transitions (e.g. `eof-reached`), not pixels.
+  success/failure plus real state transitions (e.g. `eof-reached`), not pixels. For a one-off
+  *visual* check there is a path: run the daemon/mpv under `Xvfb` with a real `vo`
+  (`--gpu-context=x11egl`, `LIBGL_ALWAYS_SOFTWARE=1`) and capture the X root window
+  (`import -window root`, or `x11grab` from `nixpkgs#ffmpeg-full` — the default `nixpkgs#ffmpeg`
+  is built `--disable-libxcb` and has no x11grab). `screenshot-to-file` does *not* include
+  `osd-overlay` overlays, and `vo=null` cannot screenshot at all, which is why the automated tests
+  stay headless. That Xvfb capture is how the loading spinner and start/stop fades were verified
+  end-to-end; it needs a display, so it stays a manual evidence step, not a test.
+- The loading spinner and start/stop fade live in `daemon/src/overlay.rs`, drawing through the same
+  `osd-overlay` ASS path as the idle clock (not a second rendering stack). It owns overlay ids
+  9100 (fade rect) / 9101 (spinner); the idle clock keeps 9000/9001, and mpv draws higher ids on
+  top, so don't reuse those. The spinner is an ASS vector annular sector rotated via `\org`+`\frz`
+  (no font dependency; rotating a bbox-centered drawing wobbles). Every animation is a bounded
+  loop that stops on a generation-counter bump; the spinner thread redraws only while a Play is in
+  flight. `Player::play`/`stop` block ~150ms per fade, but a superseding command aborts the old
+  animation at its next frame, so the concurrent-`play` test stays fast.
 - YouTube playback needs no daemon-side code: mpv's built-in `ytdl_hook` Lua script (same core in
   both CLI mpv and `libmpv2`) auto-detects non-direct-media URLs and shells out to `yt-dlp` on
   `PATH`, unconditionally, with no libmpv init tweaks required — see README's "How YouTube
@@ -62,6 +77,14 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   `MPV_ERROR_NOTHING_TO_PLAY`), so `spawn_error_logger` pairs it with
   `describe_playback_error`'s plain-language reason; keep new async-error paths going through that
   logging rather than adding a second mechanism.
+- "Playback actually started rendering" is mpv's `PlaybackRestart` event, not the `loadfile` call
+  returning (that only queues the load). A third `Mpv` client (`spawn_lifecycle_watcher`) consumes
+  it and takes the spinner down; a fresh client must `enable_event` it (`libmpv2`'s
+  `mpv_event_id::PlaybackRestart`/`EndFile`). A *failed* load reaches `wait_event` as
+  `Some(Err(..))` (mpv `END_FILE` with an error code), while a normal EOF or a superseding
+  `loadfile` arrives as `Ok(Event::EndFile(reason))` and must be ignored — only `Err` means
+  failure. Each mpv event consumer (idle-screen eof watcher on the main handle, error logger,
+  lifecycle watcher) has its own client/queue to avoid contention.
 
 ## Maintaining this file
 

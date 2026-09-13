@@ -11,10 +11,14 @@ use tracing::error;
 
 use crate::fcast::{PlayMessage, PlaybackState, PlaybackUpdateMessage};
 use crate::idle_screen::{IdleScreen, IdleScreenController};
+use crate::overlay::PlaybackOverlay;
 
 pub struct Player {
     mpv: Arc<Mpv>,
     idle: Arc<IdleScreenController>,
+    /// Loading spinner and start/stop fade drawn on top of whatever mpv is
+    /// showing (see `overlay.rs`).
+    overlay: Arc<PlaybackOverlay>,
     /// The most recently requested Play `url`, kept only so the background
     /// error listener (`spawn_error_logger`) can name which target a later
     /// async mpv error most likely belongs to. Attribution is best-effort
@@ -62,19 +66,22 @@ impl Player {
         let mpv = Arc::new(mpv);
         let last_target = Arc::new(Mutex::new(String::new()));
         spawn_error_logger(&mpv, Arc::clone(&last_target))?;
-        let player = Self::from_mpv(mpv, last_target);
+        let player = Self::from_mpv(mpv, last_target)?;
         player.show_idle_screen(IdleScreen::Clock)?;
         Ok(player)
     }
 
-    fn from_mpv(mpv: Arc<Mpv>, last_target: Arc<Mutex<String>>) -> Self {
+    fn from_mpv(mpv: Arc<Mpv>, last_target: Arc<Mutex<String>>) -> Result<Self> {
         let idle = Arc::new(IdleScreenController::new(Arc::clone(&mpv)));
+        let overlay = Arc::new(PlaybackOverlay::new(Arc::clone(&mpv)));
         idle.spawn_eof_watcher();
-        Self {
+        spawn_lifecycle_watcher(&mpv, Arc::clone(&idle), Arc::clone(&overlay))?;
+        Ok(Self {
             mpv,
             idle,
+            overlay,
             last_target,
-        }
+        })
     }
 
     /// Show `screen` (currently only `IdleScreen::Clock`) until the next
@@ -96,6 +103,13 @@ impl Player {
         self.idle.current()
     }
 
+    /// Whether the loading spinner is currently up. Not read by the daemon
+    /// itself; exists so tests can observe loading state directly.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn loading_overlay_active(&self) -> bool {
+        self.overlay.is_active()
+    }
+
     pub fn play(&self, msg: &PlayMessage) -> Result<()> {
         let target = match (msg.url.as_deref(), msg.content.as_deref()) {
             (Some(url), _) => url,
@@ -105,7 +119,15 @@ impl Player {
             ),
             (None, None) => anyhow::bail!("Play message has neither `url` nor `content`"),
         };
+        // Fade the old content (previous video or the idle clock) out to
+        // black, then put the spinner up over it, *before* submitting the
+        // load: the spinner must be visible for the whole wait, so it can't
+        // be raced by an instant `PlaybackRestart` from a fast load. It
+        // stays up until `spawn_lifecycle_watcher` sees playback genuinely
+        // restart (or the load fail), and redraws only until then.
+        self.overlay.conceal()?;
         self.hide_idle_screen()?;
+        self.overlay.spawn_spinner()?;
         // Held across both the write and the `loadfile` submission so two
         // concurrent `play()` calls (one per FCast connection, see main.rs)
         // can't interleave: without this, connection B could set
@@ -119,9 +141,13 @@ impl Player {
         // `ytdl_hook`/`yt-dlp` YouTube lookup).
         let mut last_target = self.last_target.lock().unwrap();
         *last_target = target.to_string();
-        self.mpv
-            .command("loadfile", &[target, "replace"])
-            .map_err(|e| anyhow::anyhow!("loadfile failed for url {target:?}: {e:?}"))?;
+        if let Err(e) = self.mpv.command("loadfile", &[target, "replace"]) {
+            drop(last_target);
+            // Nothing will load, so no async error/restart is coming to take
+            // the spinner down; do it here and fall back to the idle clock.
+            self.abort_loading_to_idle()?;
+            return Err(anyhow::anyhow!("loadfile failed for url {target:?}: {e:?}"));
+        }
         drop(last_target);
         // `keep-open=yes` (see `new()`) leaves `pause` set to `true` once a
         // previous file hits EOF, and mpv does not reset that property on the
@@ -156,12 +182,35 @@ impl Player {
     }
 
     /// Stop playback and return to mpv's idle state (no decode pipeline
-    /// running), showing the idle screen in place of the old black screen.
+    /// running), fading the old video out and the idle clock in rather than
+    /// cutting straight to it. A Stop while already idle is a no-op transition
+    /// (just re-asserts the clock), so it doesn't blink the screen.
     pub fn stop(&self) -> Result<()> {
+        let was_playing = !self.mpv.get_property::<bool>("idle-active").unwrap_or(true);
+        if was_playing {
+            self.overlay.conceal()?;
+        }
         self.mpv
             .command("stop", &[])
             .map_err(|e| anyhow::anyhow!("stop failed: {e:?}"))?;
-        self.show_idle_screen(IdleScreen::Clock)
+        // Draw the clock underneath the still-opaque fade rect, then reveal
+        // it. `reveal` is a no-op when no overlay is up (the already-idle
+        // case), so this stays cheap there.
+        self.show_idle_screen(IdleScreen::Clock)?;
+        self.overlay.reveal()
+    }
+
+    /// A load ended without ever starting playback: cancel the spinner (if
+    /// it's up) and fade back to the idle clock, so a failed Play ends on the
+    /// idle screen with the console error report rather than an endless
+    /// spinner. Shared by the async error path (`spawn_lifecycle_watcher`) and
+    /// the synchronous `loadfile`-rejected path in `play`.
+    fn abort_loading_to_idle(&self) -> Result<()> {
+        if !self.overlay.is_active() {
+            return Ok(());
+        }
+        self.show_idle_screen(IdleScreen::Clock)?;
+        self.overlay.reveal()
     }
 
     pub fn seek(&self, time: f64) -> Result<()> {
@@ -264,6 +313,60 @@ fn spawn_error_logger(mpv: &Mpv, last_target: Arc<Mutex<String>>) -> Result<()> 
     Ok(())
 }
 
+/// Spawn the background thread that tracks *playback lifecycle* on a second
+/// mpv client handle: it takes the loading spinner down the moment mpv
+/// reports that playback actually restarted (`PlaybackRestart` -- the first
+/// frame is ready and rendering, not merely that `loadfile` was queued), and
+/// hands the screen back to the idle clock if the load fails instead.
+///
+/// Like `spawn_error_logger`, this blocks on `wait_event(-1.0)` with no
+/// polling, and uses its own client so it doesn't contend with the idle
+/// clock's eof watcher (which owns the main handle's event queue) or with
+/// the error logger. A failed load surfaces here as `Some(Err(..))` (mpv's
+/// `END_FILE` with an error code); a plain end-of-file or a superseding
+/// `loadfile` produces `Ok(EndFile(..))` and is ignored, so only real
+/// failures return to idle.
+fn spawn_lifecycle_watcher(
+    mpv: &Mpv,
+    idle: Arc<IdleScreenController>,
+    overlay: Arc<PlaybackOverlay>,
+) -> Result<()> {
+    let events = mpv
+        .create_client(Some("castoff-lifecycle"))
+        .map_err(|e| anyhow::anyhow!("failed to create mpv lifecycle client: {e:?}"))?;
+    // A fresh client doesn't necessarily have these enabled; ask explicitly
+    // for the two this watcher depends on.
+    for event in [
+        libmpv2::events::mpv_event_id::PlaybackRestart,
+        libmpv2::events::mpv_event_id::EndFile,
+    ] {
+        events
+            .enable_event(event)
+            .map_err(|e| anyhow::anyhow!("failed to enable mpv event: {e:?}"))?;
+    }
+    std::thread::spawn(move || loop {
+        match events.wait_event(-1.0) {
+            Some(Ok(Event::PlaybackRestart)) => {
+                // First frame is ready: stop spinning and fade the black
+                // overlay away to reveal playback.
+                let _ = overlay.reveal();
+            }
+            Some(Err(_)) => {
+                // The concrete reason is already logged by
+                // `spawn_error_logger`; here we only make sure a failed load
+                // never leaves the spinner up forever.
+                if overlay.is_active() {
+                    let _ = idle.show(IdleScreen::Clock);
+                    let _ = overlay.reveal();
+                }
+            }
+            Some(Ok(Event::Shutdown)) => return,
+            _ => {}
+        }
+    });
+    Ok(())
+}
+
 fn describe_playback_error(e: &libmpv2::Error) -> &'static str {
     use libmpv2::mpv_error;
     // Only the codes a failed network/media load actually produces are named
@@ -308,7 +411,8 @@ mod tests {
             Ok(())
         })
         .expect("failed to initialize headless mpv for test");
-        let player = Player::from_mpv(Arc::new(mpv), Arc::new(Mutex::new(String::new())));
+        let player = Player::from_mpv(Arc::new(mpv), Arc::new(Mutex::new(String::new())))
+            .expect("create player");
         player
             .show_idle_screen(IdleScreen::Clock)
             .expect("show initial idle screen");
@@ -333,6 +437,79 @@ mod tests {
     /// stuck test fails fast instead of hanging.
     fn wait_until(mpv: &Mpv, pred: impl FnMut(&Mpv) -> bool, what: &str) {
         wait_until_timeout(mpv, Duration::from_secs(5), pred, what)
+    }
+
+    /// Poll `player`'s loading overlay for up to 30s until it is down; panics
+    /// on timeout. The generous window covers a genuinely failing network
+    /// load (`MPV_ERROR_NOTHING_TO_PLAY` after DNS/connect failure) in a
+    /// sandbox with no network, which can take a while to give up.
+    fn wait_until_loading_cleared(player: &Player, what: &str) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline {
+            if !player.loading_overlay_active() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!("timed out waiting for: {what}");
+    }
+
+    /// A minimal, valid 8kHz mono PCM WAV of `seconds` seconds of silence,
+    /// built by hand so the tests need no media fixture on disk or encoder on
+    /// `PATH`.
+    fn silent_wav(seconds: u32) -> Vec<u8> {
+        const SAMPLE_RATE: u32 = 8000;
+        const CHANNELS: u16 = 1;
+        const BITS: u16 = 16;
+        let data_len = SAMPLE_RATE * seconds * CHANNELS as u32 * (BITS as u32 / 8);
+        let mut wav = Vec::with_capacity(44 + data_len as usize);
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36 + data_len).to_le_bytes());
+        wav.extend_from_slice(b"WAVE");
+        wav.extend_from_slice(b"fmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        wav.extend_from_slice(&CHANNELS.to_le_bytes());
+        wav.extend_from_slice(&SAMPLE_RATE.to_le_bytes());
+        wav.extend_from_slice(&(SAMPLE_RATE * CHANNELS as u32 * (BITS as u32 / 8)).to_le_bytes());
+        wav.extend_from_slice(&(CHANNELS * BITS / 8).to_le_bytes()); // block align
+        wav.extend_from_slice(&BITS.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&data_len.to_le_bytes());
+        wav.resize(44 + data_len as usize, 0);
+        wav
+    }
+
+    /// Serve `body` over HTTP on a loopback port, waiting `delay` after
+    /// reading the request before sending any response bytes. That delay is
+    /// what makes the load slow enough to observe the loading indicator in a
+    /// test; the daemon reaches mpv's async load path and then waits on the
+    /// network, exactly as it would for a cold `yt-dlp` resolution. Returns
+    /// the `http://` URL to hand to `Play`.
+    fn spawn_delayed_http_source(delay: Duration, body: Vec<u8>) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test http server");
+        let addr = listener.local_addr().expect("local addr");
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let body = body.clone();
+                std::thread::spawn(move || {
+                    use std::io::{Read, Write};
+                    let mut request = [0u8; 4096];
+                    let _ = stream.read(&mut request);
+                    std::thread::sleep(delay);
+                    let header = format!(
+                        "HTTP/1.0 200 OK\r\nContent-Type: audio/wav\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(header.as_bytes());
+                    let _ = stream.write_all(&body);
+                    let _ = stream.flush();
+                });
+            }
+        });
+        format!("http://{addr}/test.wav")
     }
 
     /// Like `wait_until`, but with a caller-chosen timeout -- for cases (e.g.
@@ -609,5 +786,81 @@ mod tests {
                 "round {round}: last_target must always name whatever mpv actually loaded"
             );
         }
+    }
+
+    /// The spinner must be up for the *whole* wait of a slow load and gone as
+    /// soon as playback actually starts rendering. The load is made slow on
+    /// purpose (a loopback HTTP server that sleeps before its first response
+    /// byte), so the intermediate state is genuinely observable rather than
+    /// a race against an instant `lavfi` load: right after `play()` returns
+    /// the spinner is up, and only the real mpv `PlaybackRestart` event takes
+    /// it down.
+    #[test]
+    fn loading_overlay_shows_during_slow_load_and_clears_when_playback_starts() {
+        let player = headless_player();
+        let url = spawn_delayed_http_source(Duration::from_millis(1500), silent_wav(5));
+        assert!(
+            !player.loading_overlay_active(),
+            "no spinner before any Play"
+        );
+
+        let msg = PlayMessage {
+            url: Some(url),
+            ..Default::default()
+        };
+        player
+            .play(&msg)
+            .expect("play with a slow url must be accepted");
+
+        assert!(
+            player.loading_overlay_active(),
+            "spinner must be up once the slow load is in flight"
+        );
+        assert_eq!(
+            player.idle_screen(),
+            None,
+            "the idle clock is hidden behind the loading overlay"
+        );
+
+        wait_until_loading_cleared(&player, "spinner to clear once playback restarts");
+        assert!(
+            !player.loading_overlay_active(),
+            "spinner must stay cleared after playback starts"
+        );
+        // Playback really did start (not merely the overlay timing out): the
+        // slow WAV is playing and its clock advances.
+        wait_until_timeout(
+            &player.mpv,
+            Duration::from_secs(10),
+            |mpv| mpv.get_property::<f64>("time-pos").unwrap_or(0.0) > 0.0,
+            "slow source to actually start playing",
+        );
+    }
+
+    /// A load that fails must not leave the spinner up (the console error
+    /// report is the real feedback for failure): the overlay clears and the
+    /// idle clock comes back. Uses an unresolvable host so the load fails
+    /// asynchronously, which is the path this daemon's own error logger covers.
+    #[test]
+    fn failed_load_clears_loading_overlay_and_returns_to_idle_clock() {
+        let player = headless_player();
+        let msg = PlayMessage {
+            url: Some("https://example.invalid/does-not-exist.mp4".to_string()),
+            ..Default::default()
+        };
+        player
+            .play(&msg)
+            .expect("play is accepted; the load fails asynchronously");
+        assert!(
+            player.loading_overlay_active(),
+            "spinner is up while the failing load is in flight"
+        );
+
+        wait_until_loading_cleared(&player, "spinner to clear after the load fails");
+        wait_until_idle_screen(
+            &player,
+            Some(IdleScreen::Clock),
+            "idle clock to return after the load fails",
+        );
     }
 }

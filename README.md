@@ -11,9 +11,11 @@ scaffold: the TV-box daemon and its NixOS packaging. Nothing else exists yet -- 
 Right now the supported playback sources are a direct media URL and YouTube: send the daemon an
 FCast `Play` command with a remote (`http(s)://`) or local (`file://`) URL to a media file -- e.g.
 an mp4 -- or a `youtube.com`/`youtu.be` watch URL, and it loads and plays it via mpv (see
-[How YouTube playback works](#how-youtube-playback-works)). That's it: no Jellyfin, no images, no
-casting a webpage. See [Not yet implemented](#not-yet-implemented-follow-up-work) below for what's
-planned but not built.
+[How YouTube playback works](#how-youtube-playback-works)). A Play that is still loading shows an
+on-screen spinner, and starts/stops are wrapped in a short fade (see
+[On-screen feedback](#on-screen-feedback-loading-indicator-and-startstop-fade)). That's it: no
+Jellyfin, no images, no casting a webpage. See
+[Not yet implemented](#not-yet-implemented-follow-up-work) below for what's planned but not built.
 
 ## What's here
 
@@ -103,6 +105,27 @@ That URL attribution is best-effort: if a newer Play replaces an in-flight one b
 error event is drained, the logged URL may name the newer request rather than the one that
 actually failed.
 
+### On-screen feedback: loading indicator and start/stop fade
+
+A `Play` that has been accepted but has not started rendering yet does not leave the screen
+unchanged: the daemon fades whatever is on screen to black and shows a rotating spinner over it,
+so a slow network or a cold `yt-dlp` resolution reads as "working on it" instead of "nothing
+happened". Both are drawn through mpv's own OSD (`osd-overlay` ASS events) -- the same surface as
+the idle clock, in `daemon/src/overlay.rs`, not a compositor or a second window. The spinner goes
+up *before* `loadfile` is submitted and comes down the moment mpv reports `PlaybackRestart` (the
+first frame is actually rendering), not merely when the load was queued. If the load fails, the
+spinner is torn down and the idle clock returns; the failure itself is still reported on the
+console by the error logger described above, never hidden behind the spinner.
+
+Starts and stops are wrapped in a short fade through black (~150ms each way): a `Play` fades the
+old content out and the new content in, and a `Stop` fades the video out to the idle clock. A
+fade through black was chosen over a crossfade between the new and old content because it is one
+mechanism that covers every combination -- idle clock to video and video to video, in both
+directions -- whereas a true crossfade would require compositing two decode/render pipelines at
+once, i.e. the second rendering stack and extra power draw the design principles rule out. Both
+the spinner and the fades are bounded animations that stop redrawing once settled; see
+[Design principles](#design-principles).
+
 ## Building and running
 
 ### Build the daemon on its own
@@ -182,7 +205,11 @@ this scaffold yet, but they should carry forward into every later task on this c
   an on-screen clock via mpv's own OSD instead of a black screen, redrawn on a ~1s
   `std::thread::sleep` timer rather than a busy loop or a second rendering stack. `IdleScreen` is
   a small seam (`Clock` is the only variant today) meant to grow a static-wallpaper or
-  cast-a-webpage variant later without restructuring.
+  cast-a-webpage variant later without restructuring. The loading spinner and the start/stop
+  fade live in `daemon/src/overlay.rs` and follow the same rule: the spinner redraws only while
+  a `Play` is genuinely in flight and stops the moment playback starts or the load fails, and the
+  fade is a fixed handful of frames that then stops redrawing -- no always-on animation and no
+  per-frame redraw once settled.
 - **Data efficiency.** Avoid needless re-fetching over the network. This isn't exercised by the
   scaffold (there's no Immich integration yet), but it constrains that future work: when the
   Immich slideshow integration is built, it must cache each displayed image locally and only
