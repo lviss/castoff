@@ -6,6 +6,14 @@ boots straight into a fullscreen player, eventually paired with a native Android
 scaffold: the TV-box daemon and its NixOS packaging. Nothing else exists yet -- see
 [Not yet implemented](#not-yet-implemented-follow-up-work) below.
 
+## What works today
+
+Right now the only supported playback source is a direct media URL: send the daemon an FCast
+`Play` command with a remote (`http(s)://`) or local (`file://`) URL to a media file -- e.g. an
+mp4 -- and it loads and plays that file via mpv. That's it: no YouTube, no Jellyfin, no images, no
+casting a webpage. See [Not yet implemented](#not-yet-implemented-follow-up-work) below for what's
+planned but not built.
+
 ## What's here
 
 - **`flake.nix` / `nix/tv-box.nix`** -- a NixOS configuration (`nixosConfigurations.tv-box`, for
@@ -146,7 +154,8 @@ Out of scope for this scaffold, deliberately:
 
 - Playback sources: YouTube (via `yt-dlp`, no Google login for public videos), Jellyfin
   (authenticated via Jellyfin's Quick Connect flow -- never a typed password), images from
-  Immich or a local folder, and a Grafana dashboard view.
+  Immich or a local folder, and casting/displaying an arbitrary webpage (e.g. a Grafana
+  dashboard).
 - The native Android control app, including handling Android `Share` intents.
 - Appliance disk-image generation (e.g. via `nixos-generators`/`disko`) for a flashable image;
   today's `tv-box` configuration needs a real `fileSystems."/"` and bootloader target to install
