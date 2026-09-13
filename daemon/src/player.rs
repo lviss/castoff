@@ -1,11 +1,13 @@
 //! Thin wrapper around libmpv2 that maps FCast-shaped requests onto mpv
 //! commands/properties, and reads back mpv state as an FCast PlaybackUpdate.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
+use libmpv2::events::Event;
 use libmpv2::Mpv;
+use tracing::error;
 
 use crate::fcast::{PlayMessage, PlaybackState, PlaybackUpdateMessage};
 use crate::idle_screen::{IdleScreen, IdleScreenController};
@@ -13,6 +15,14 @@ use crate::idle_screen::{IdleScreen, IdleScreenController};
 pub struct Player {
     mpv: Arc<Mpv>,
     idle: Arc<IdleScreenController>,
+    /// The most recently requested Play `url`, kept only so the background
+    /// error listener (`spawn_error_logger`) can name which target a later
+    /// async mpv error most likely belongs to. Attribution is best-effort
+    /// toward the most recently submitted URL: an error already queued by
+    /// mpv can be drained after a newer `play()` has replaced the slot, so
+    /// the logged URL may be the newer request rather than the one that
+    /// actually failed.
+    last_target: Arc<Mutex<String>>,
 }
 
 impl Player {
@@ -35,18 +45,36 @@ impl Player {
             init.set_property("input-default-bindings", "no")?;
             init.set_property("input-vo-keyboard", "no")?;
             init.set_property("osc", "no")?;
+            // Print mpv's own warning/error log lines to the daemon's stderr
+            // (journald/console on the appliance). libmpv defaults to
+            // `terminal=no`, so without this a failed asynchronous load --
+            // e.g. `[ffmpeg] https: HTTP error 403 Forbidden` from a YouTube
+            // stream URL yt-dlp resolved, or a `ytdl_hook`/`yt-dlp`
+            // resolution failure -- was only visible to mpv's internal log
+            // and never reached the console, leaving a silent black screen.
+            // `all=warn` keeps this to actionable lines rather than
+            // info-level chatter on every load.
+            init.set_property("terminal", "yes")?;
+            init.set_property("msg-level", "all=warn")?;
             Ok(())
         })
         .map_err(|e| anyhow::anyhow!("failed to initialize mpv: {e:?}"))?;
-        let player = Self::from_mpv(Arc::new(mpv));
+        let mpv = Arc::new(mpv);
+        let last_target = Arc::new(Mutex::new(String::new()));
+        spawn_error_logger(&mpv, Arc::clone(&last_target))?;
+        let player = Self::from_mpv(mpv, last_target);
         player.show_idle_screen(IdleScreen::Clock)?;
         Ok(player)
     }
 
-    fn from_mpv(mpv: Arc<Mpv>) -> Self {
+    fn from_mpv(mpv: Arc<Mpv>, last_target: Arc<Mutex<String>>) -> Self {
         let idle = Arc::new(IdleScreenController::new(Arc::clone(&mpv)));
         idle.spawn_eof_watcher();
-        Self { mpv, idle }
+        Self {
+            mpv,
+            idle,
+            last_target,
+        }
     }
 
     /// Show `screen` (currently only `IdleScreen::Clock`) until the next
@@ -78,9 +106,23 @@ impl Player {
             (None, None) => anyhow::bail!("Play message has neither `url` nor `content`"),
         };
         self.hide_idle_screen()?;
+        // Held across both the write and the `loadfile` submission so two
+        // concurrent `play()` calls (one per FCast connection, see main.rs)
+        // can't interleave: without this, connection B could set
+        // `last_target` between connection A's write and A's `loadfile`
+        // call, so an async error later attributed to A's in-flight load
+        // would wrongly blame B's url. Serializing the pair keeps
+        // `last_target` in the same order as submission to mpv, which is
+        // what the background error listener (see `spawn_error_logger`)
+        // relies on to attribute an error that arrives while
+        // resolution/opening is still in flight (e.g. a slow or failing
+        // `ytdl_hook`/`yt-dlp` YouTube lookup).
+        let mut last_target = self.last_target.lock().unwrap();
+        *last_target = target.to_string();
         self.mpv
             .command("loadfile", &[target, "replace"])
-            .map_err(|e| anyhow::anyhow!("loadfile failed: {e:?}"))?;
+            .map_err(|e| anyhow::anyhow!("loadfile failed for url {target:?}: {e:?}"))?;
+        drop(last_target);
         // `keep-open=yes` (see `new()`) leaves `pause` set to `true` once a
         // previous file hits EOF, and mpv does not reset that property on the
         // next `loadfile`. Without this, a second Play call loads the new
@@ -176,6 +218,68 @@ fn to_mpv_volume(fcast_volume: f64) -> f64 {
     (fcast_volume.clamp(0.0, 1.0)) * 100.0
 }
 
+/// Spawn a background thread that logs mpv's *asynchronous* playback
+/// errors -- the ones `Player::play`'s immediate `loadfile` call can't see,
+/// because `loadfile` only queues the load; mpv resolves/opens the target
+/// (including running `ytdl_hook`'s `yt-dlp` subprocess for a YouTube URL)
+/// afterwards, off of that call stack. Without this, a `ytdl_hook`/`yt-dlp`
+/// failure or timeout is a silent black screen with nothing in the log to
+/// diagnose it from.
+///
+/// This blocks on mpv's event queue (`wait_event(-1.0)`) rather than
+/// polling, so it costs nothing until mpv actually has something to report,
+/// consistent with the daemon's power-efficiency design principle. It uses
+/// a second client handle from `Mpv::create_client` (its own independent
+/// event queue onto the same player core) so it never contends with the
+/// `Player` methods' direct use of `mpv` from other threads.
+fn spawn_error_logger(mpv: &Mpv, last_target: Arc<Mutex<String>>) -> Result<()> {
+    let events = mpv
+        .create_client(Some("castoff-error-logger"))
+        .map_err(|e| anyhow::anyhow!("failed to create mpv event client: {e:?}"))?;
+    std::thread::spawn(move || {
+        loop {
+            match events.wait_event(-1.0) {
+                Some(Err(e)) => {
+                    let url = last_target.lock().unwrap().clone();
+                    // `describe_playback_error` gives the mpv error code a
+                    // plain-language meaning (libmpv2's own `Display` is just
+                    // `Raw(<int>)`); mpv's own log line -- printed because
+                    // `terminal=yes`, see `new()` -- carries the concrete
+                    // cause, e.g. an HTTP 403 from the media/CDN host.
+                    error!(
+                        url,
+                        error = ?e,
+                        reason = describe_playback_error(&e),
+                        "mpv reported an async playback error -- playback did not start; \
+                         see the mpv log line(s) above for the underlying cause (e.g. a \
+                         ytdl_hook/yt-dlp resolution failure or an HTTP error from the \
+                         media/CDN host)"
+                    );
+                }
+                Some(Ok(Event::Shutdown)) => break,
+                _ => {}
+            }
+        }
+    });
+    Ok(())
+}
+
+fn describe_playback_error(e: &libmpv2::Error) -> &'static str {
+    use libmpv2::mpv_error;
+    // Only the codes a failed network/media load actually produces are named
+    // specially; anything else falls back to pointing at mpv's own log line.
+    match e {
+        libmpv2::Error::Raw(mpv_error::NothingToPlay) => {
+            "nothing to play: mpv could not open any stream the URL resolved to \
+             (the mpv log line above has the concrete cause, e.g. an HTTP 403)"
+        }
+        libmpv2::Error::Raw(mpv_error::LoadingFailed) => {
+            "loading failed: mpv could not load/open this URL"
+        }
+        _ => "see the mpv log line above for the concrete cause",
+    }
+}
+
 pub(crate) fn now_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -204,7 +308,7 @@ mod tests {
             Ok(())
         })
         .expect("failed to initialize headless mpv for test");
-        let player = Player::from_mpv(Arc::new(mpv));
+        let player = Player::from_mpv(Arc::new(mpv), Arc::new(Mutex::new(String::new())));
         player
             .show_idle_screen(IdleScreen::Clock)
             .expect("show initial idle screen");
@@ -227,8 +331,19 @@ mod tests {
 
     /// Poll `mpv` for up to 5s until `pred` is true; panics on timeout so a
     /// stuck test fails fast instead of hanging.
-    fn wait_until(mpv: &Mpv, mut pred: impl FnMut(&Mpv) -> bool, what: &str) {
-        let deadline = Instant::now() + Duration::from_secs(5);
+    fn wait_until(mpv: &Mpv, pred: impl FnMut(&Mpv) -> bool, what: &str) {
+        wait_until_timeout(mpv, Duration::from_secs(5), pred, what)
+    }
+
+    /// Like `wait_until`, but with a caller-chosen timeout -- for cases (e.g.
+    /// a real network `yt-dlp` resolution) where 5s can be too tight.
+    fn wait_until_timeout(
+        mpv: &Mpv,
+        timeout: Duration,
+        mut pred: impl FnMut(&Mpv) -> bool,
+        what: &str,
+    ) {
+        let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
             if pred(mpv) {
                 return;
@@ -374,5 +489,125 @@ mod tests {
             Some(IdleScreen::Clock),
             "clock must return after an explicit Stop"
         );
+    }
+
+    /// Verifies real YouTube playback end-to-end through mpv's built-in
+    /// `ytdl_hook` (see README's "How YouTube playback works"): no daemon
+    /// code shells out to `yt-dlp` itself, mpv's bundled Lua script does,
+    /// automatically, for any URL it doesn't recognize as directly playable.
+    /// Requires network access and `yt-dlp` on `PATH` (already the case in
+    /// `nix develop`'s dev shell -- see `devShells.default` in flake.nix),
+    /// so this is `#[ignore]`d by default: the sandboxed `nix build`/
+    /// `nix flake check` checkPhase has no network access, and `yt-dlp` is a
+    /// runtime-only dependency (see flake.nix), not a build input. Run with
+    /// `nix develop -c cargo test -- --ignored`.
+    #[test]
+    #[ignore = "requires network access and yt-dlp on PATH; run with `cargo test -- --ignored`"]
+    fn real_youtube_url_resolves_and_plays_via_ytdl_hook() {
+        let player = headless_player();
+        let msg = PlayMessage {
+            // "Me at the zoo", the first video ever uploaded to YouTube:
+            // short (19s), extremely unlikely to ever be removed -- a stable
+            // target for this test.
+            url: Some("https://www.youtube.com/watch?v=jNQXAC9IVRw".to_string()),
+            ..Default::default()
+        };
+
+        player
+            .play(&msg)
+            .expect("play with a youtube url must be accepted");
+
+        // `duration` is only known once ytdl_hook has resolved a real,
+        // direct media URL via `yt-dlp` and mpv has opened it -- a bare
+        // subprocess spawn with no real resolution wouldn't produce this.
+        wait_until_timeout(
+            &player.mpv,
+            Duration::from_secs(30),
+            |mpv| mpv.get_property::<f64>("duration").unwrap_or(0.0) > 0.0,
+            "duration to be known (ytdl_hook resolved a real stream)",
+        );
+        let duration: f64 = player.mpv.get_property("duration").unwrap();
+        assert!(
+            (15.0..25.0).contains(&duration),
+            "expected ~19s duration for the known test video, got {duration}"
+        );
+
+        wait_until_timeout(
+            &player.mpv,
+            Duration::from_secs(15),
+            |mpv| mpv.get_property::<f64>("time-pos").unwrap_or(0.0) > 0.5,
+            "playback time-pos to advance",
+        );
+    }
+
+    /// Regression test for a race between concurrent `play()` calls (one per
+    /// FCast connection, see `main.rs`'s per-connection `spawn_blocking`):
+    /// without holding `last_target`'s lock across both the write and the
+    /// `loadfile` submission, one thread's write and its `loadfile` call
+    /// could straddle another thread's write/`loadfile` pair, so the URL
+    /// mpv ends up actually loading and the URL recorded in `last_target`
+    /// (what `spawn_error_logger` blames for a later async error) could
+    /// disagree. Hammers `play()` from many threads at once, releasing them
+    /// together via a `Barrier` to maximize interleaving, and asserts that
+    /// whatever mpv actually loaded always matches what `last_target` says
+    /// it loaded.
+    #[test]
+    fn concurrent_plays_keep_last_target_consistent_with_mpv() {
+        let player = headless_player();
+        const THREADS: usize = 8;
+        const ROUNDS: usize = 30;
+
+        for round in 0..ROUNDS {
+            let barrier = std::sync::Barrier::new(THREADS);
+            std::thread::scope(|scope| {
+                for i in 0..THREADS {
+                    let barrier = &barrier;
+                    let player = &player;
+                    scope.spawn(move || {
+                        // The `duration` decimal encodes `(round, i)` uniquely
+                        // (just to make each url distinguishable to mpv/us);
+                        // it plays no role in the race being tested.
+                        let uid = round * THREADS + i;
+                        let msg = PlayMessage {
+                            url: Some(format!(
+                                "av://lavfi:testsrc=size=64x64:rate=10:duration={:.3}",
+                                5.0 + uid as f64 * 0.001
+                            )),
+                            ..Default::default()
+                        };
+                        barrier.wait();
+                        player.play(&msg).expect("play");
+                    });
+                }
+            });
+
+            // Let mpv's command queue settle so its `path` property reflects
+            // the most recently submitted `loadfile`.
+            wait_until(
+                &player.mpv,
+                {
+                    let mut last_seen = String::new();
+                    let mut stable_polls = 0;
+                    move |mpv| {
+                        let path: String = mpv.get_property("path").unwrap_or_default();
+                        if path == last_seen {
+                            stable_polls += 1;
+                        } else {
+                            stable_polls = 0;
+                            last_seen = path;
+                        }
+                        stable_polls >= 3
+                    }
+                },
+                "mpv path property to settle",
+            );
+
+            let mpv_path: String = player.mpv.get_property("path").unwrap_or_default();
+            let recorded = player.last_target.lock().unwrap().clone();
+            assert_eq!(
+                mpv_path, recorded,
+                "round {round}: last_target must always name whatever mpv actually loaded"
+            );
+        }
     }
 }

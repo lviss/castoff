@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use tokio::net::{TcpListener, TcpStream};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use fcast::{
     Opcode, PlayMessage, PlaybackErrorMessage, SeekMessage, SetSpeedMessage, SetVolumeMessage,
@@ -63,44 +63,56 @@ async fn dispatch(socket: &mut TcpStream, player: &Arc<Player>, frame: fcast::Fr
     match frame.opcode {
         Opcode::Play => {
             let msg: PlayMessage = serde_json::from_slice(&frame.body)?;
+            info!(
+                url = msg.url.as_deref().unwrap_or(""),
+                has_content = msg.content.is_some(),
+                "received Play"
+            );
             let p = Arc::clone(player);
             tokio::task::spawn_blocking(move || p.play(&msg)).await??;
             send_status(socket, player).await
         }
         Opcode::Pause => {
+            info!("received Pause");
             let p = Arc::clone(player);
             tokio::task::spawn_blocking(move || p.pause()).await??;
             send_status(socket, player).await
         }
         Opcode::Resume => {
+            info!("received Resume");
             let p = Arc::clone(player);
             tokio::task::spawn_blocking(move || p.resume()).await??;
             send_status(socket, player).await
         }
         Opcode::Stop => {
+            info!("received Stop");
             let p = Arc::clone(player);
             tokio::task::spawn_blocking(move || p.stop()).await??;
             send_status(socket, player).await
         }
         Opcode::Seek => {
             let msg: SeekMessage = serde_json::from_slice(&frame.body)?;
+            info!(time = msg.time, "received Seek");
             let p = Arc::clone(player);
             tokio::task::spawn_blocking(move || p.seek(msg.time)).await??;
             send_status(socket, player).await
         }
         Opcode::SetVolume => {
             let msg: SetVolumeMessage = serde_json::from_slice(&frame.body)?;
+            info!(volume = msg.volume, "received SetVolume");
             let p = Arc::clone(player);
             tokio::task::spawn_blocking(move || p.set_volume(msg.volume)).await??;
             send_volume(socket, player).await
         }
         Opcode::SetSpeed => {
             let msg: SetSpeedMessage = serde_json::from_slice(&frame.body)?;
+            info!(speed = msg.speed, "received SetSpeed");
             let p = Arc::clone(player);
             tokio::task::spawn_blocking(move || p.set_speed(msg.speed)).await??;
             send_status(socket, player).await
         }
         Opcode::Version => {
+            debug!("received Version");
             let reply = VersionMessage {
                 version: fcast::PROTOCOL_VERSION,
             };
@@ -108,6 +120,10 @@ async fn dispatch(socket: &mut TcpStream, player: &Arc<Player>, frame: fcast::Fr
             Ok(())
         }
         Opcode::Ping => {
+            // Debug, not info: a sender may ping on a short heartbeat-like
+            // cadence, and that traffic isn't itself a diagnostically
+            // interesting "request" the way Play/Seek/etc. are.
+            debug!("received Ping");
             fcast::write_empty(socket, Opcode::Pong).await?;
             Ok(())
         }

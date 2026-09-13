@@ -8,9 +8,10 @@ scaffold: the TV-box daemon and its NixOS packaging. Nothing else exists yet -- 
 
 ## What works today
 
-Right now the only supported playback source is a direct media URL: send the daemon an FCast
-`Play` command with a remote (`http(s)://`) or local (`file://`) URL to a media file -- e.g. an
-mp4 -- and it loads and plays that file via mpv. That's it: no YouTube, no Jellyfin, no images, no
+Right now the supported playback sources are a direct media URL and YouTube: send the daemon an
+FCast `Play` command with a remote (`http(s)://`) or local (`file://`) URL to a media file -- e.g.
+an mp4 -- or a `youtube.com`/`youtu.be` watch URL, and it loads and plays it via mpv (see
+[How YouTube playback works](#how-youtube-playback-works)). That's it: no Jellyfin, no images, no
 casting a webpage. See [Not yet implemented](#not-yet-implemented-follow-up-work) below for what's
 planned but not built.
 
@@ -62,6 +63,45 @@ Implemented opcodes (all of FCast v2's playback-control surface):
 
 `PlaybackUpdate`/`VolumeUpdate` are sent as an immediate reply to a command, not on a polling
 timer -- see [Design principles](#design-principles).
+
+### How YouTube playback works
+
+A `Play` message's `url` can be a `youtube.com`/`youtu.be` watch URL, not just a direct media
+URL -- no new opcode or protocol change, and no bespoke YouTube API integration or Cast-protocol
+emulation. This works because mpv (and therefore `libmpv2`, since it's the same core) ships a
+built-in `ytdl_hook` Lua script that automatically shells out to
+[`yt-dlp`](https://github.com/yt-dlp/yt-dlp) to resolve a direct, playable stream URL whenever it's
+given a URL it doesn't recognize as directly playable media. This is unconditional: no
+daemon-side code detects YouTube URLs, spawns `yt-dlp`, or parses its output -- `Player::play`
+(`daemon/src/player.rs`) just hands `url` to mpv's `loadfile` exactly as it already did for a
+direct remote mp4, and mpv/`ytdl_hook` do the rest, as verified by a real (non-mocked) test against
+a real public YouTube URL (`real_youtube_url_resolves_and_plays_via_ytdl_hook`, gated `#[ignore]`
+since it needs network access and `yt-dlp` on `PATH` -- see that test's doc comment to run it).
+No Google login is needed for public videos, matching `yt-dlp`'s own no-auth-required default for
+public content. `yt-dlp` is declared as a runtime dependency of the `castoff-daemon` Nix package
+(`flake.nix`): the built binary is wrapped (`makeWrapper`) to prepend `yt-dlp`'s Nix store path to
+`PATH`, so this works regardless of the caller's environment (e.g. the `cage` kiosk session, which
+execs the binary directly with no shell) -- not merely assumed present on some machine's `PATH`.
+`devShells.default` also lists `yt-dlp` directly (see [Dev shell](#dev-shell)): `inputsFrom` alone
+doesn't carry over that wrapping, so a plain `cargo build`/`cargo run` in `nix develop` would
+otherwise silently lack `yt-dlp` on `PATH`.
+
+`yt-dlp` is deliberately taken from the flake's `nixpkgs-unstable` input rather than the
+`nixos-25.11` pin used for everything else: the stable pin's yt-dlp (2026.06.09) auto-selects
+YouTube's `android_vr` player client for some videos and the CDN then answers the resolved stream
+URL with HTTP 403 (mpv reports "nothing to play"), while unstable's (2026.08.19) selects the
+working `visionos` client. Everything else -- mpv/`libmpv2` and the Rust toolchain -- stays on
+`nixos-25.11`.
+
+If playback still fails (private or removed video, an extractor regression, a CDN rejection), the
+daemon does not fail silently: it turns on mpv's own `terminal` logging (`msg-level=all=warn`), so
+mpv's concrete error line (e.g. `[ffmpeg] https: HTTP error 403 Forbidden` or
+`[ytdl_hook] youtube-dl failed: ...`) is written to the daemon's stderr/journal, and the
+async-error listener (`daemon/src/player.rs`) logs the URL most recently submitted to mpv
+together with a plain-language reason (libmpv2's own error display is only `Raw(<int>)`).
+That URL attribution is best-effort: if a newer Play replaces an in-flight one before mpv's
+error event is drained, the logged URL may name the newer request rather than the one that
+actually failed.
 
 ## Building and running
 
@@ -121,7 +161,7 @@ nix build .#tv-box-vm
 ### Dev shell
 
 ```sh
-nix develop   # cargo, rustc, rust-analyzer, clippy, with mpv already wired up for linking
+nix develop   # cargo, rustc, rust-analyzer, clippy, yt-dlp, with mpv already wired up for linking
 cd daemon && cargo build && cargo clippy
 ```
 
@@ -158,10 +198,10 @@ this scaffold yet, but they should carry forward into every later task on this c
 
 Out of scope for this scaffold, deliberately:
 
-- Playback sources: YouTube (via `yt-dlp`, no Google login for public videos), Jellyfin
-  (authenticated via Jellyfin's Quick Connect flow -- never a typed password), images from
-  Immich or a local folder, and casting/displaying an arbitrary webpage (e.g. a Grafana
-  dashboard).
+- Playback sources: Jellyfin (authenticated via Jellyfin's Quick Connect flow -- never a typed
+  password), images from Immich or a local folder, and casting/displaying an arbitrary webpage
+  (e.g. a Grafana dashboard). (YouTube is implemented -- see
+  [How YouTube playback works](#how-youtube-playback-works).)
 - The native Android control app, including handling Android `Share` intents.
 - Appliance disk-image generation (e.g. via `nixos-generators`/`disko`) for a flashable image;
   today's `tv-box` configuration needs a real `fileSystems."/"` and bootloader target to install
