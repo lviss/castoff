@@ -19,10 +19,18 @@ use libmpv2::{Format, Mpv};
 /// property is ever observed on a given `Mpv`, so any id works.
 const EOF_WATCH_ID: u64 = 1;
 
-/// `osd-overlay` id the currently-shown idle screen draws into. Only one
-/// idle screen is ever shown at a time, so every variant sharing this one id
-/// is enough for `IdleScreenController::hide` to clear it generically.
-const OSD_OVERLAY_ID: i64 = 9000;
+/// `osd-overlay` id the currently-shown idle screen's background rect draws
+/// into. Only one idle screen is ever shown at a time, so every variant
+/// sharing these two ids is enough for `IdleScreenController::hide` to clear
+/// them generically.
+///
+/// ASS/libass only honors one `\pos`/`\an` override per event, so the
+/// background rect and the foreground content (e.g. the clock text) must be
+/// two separate `osd-overlay` calls with distinct ids -- combining them into
+/// one ASS event makes the second `\pos`/`\an` block (and everything
+/// positioned by it) fail to render.
+const OSD_OVERLAY_BG_ID: i64 = 9000;
+const OSD_OVERLAY_FG_ID: i64 = 9001;
 
 /// Virtual ASS canvas the clock is drawn on; mpv scales this to whatever the
 /// real output resolution is, so positions/sizes below are resolution
@@ -59,30 +67,44 @@ impl IdleScreen {
                 let text = local_time_hh_mm();
                 let cx = CANVAS_WIDTH / 2;
                 let cy = CANVAS_HEIGHT / 2;
-                // Two ASS override blocks in one event: an opaque black
-                // rectangle covering the whole canvas -- so the last video
-                // frame doesn't linger behind the clock -- followed by the
-                // time, centered (`\an5`) on top of it at a large font size.
-                let data = format!(
+                // An opaque black rectangle covering the whole canvas -- so
+                // the last video frame doesn't linger behind the clock --
+                // and the time, centered (`\an5`) at a large font size, are
+                // sent as two separate ASS events/overlays: see
+                // `OSD_OVERLAY_BG_ID`'s doc comment for why they can't share
+                // one event.
+                let bg = format!(
                     "{{\\an7\\pos(0,0)\\1c&H000000&\\1a&H00&\\bord0\\shad0\\p1}}\
-                     m 0 0 l {w} 0 l {w} {h} l 0 {h}\
-                     {{\\p0}}\
-                     {{\\an5\\pos({cx},{cy})\\1c&HFFFFFF&\\1a&H00&\\fs{fs}\\bord0\\shad0}}{text}",
+                     m 0 0 l {w} 0 l {w} {h} l 0 {h}{{\\p0}}",
                     w = CANVAS_WIDTH,
                     h = CANVAS_HEIGHT,
+                );
+                let fg = format!(
+                    "{{\\an5\\pos({cx},{cy})\\1c&HFFFFFF&\\1a&H00&\\fs{fs}\\bord0\\shad0}}{text}",
                     fs = CLOCK_FONT_SIZE,
                 );
                 mpv.command(
                     "osd-overlay",
                     &[
-                        &OSD_OVERLAY_ID.to_string(),
+                        &OSD_OVERLAY_BG_ID.to_string(),
                         "ass-events",
-                        &data,
+                        &bg,
                         &CANVAS_WIDTH.to_string(),
                         &CANVAS_HEIGHT.to_string(),
                     ],
                 )
-                .map_err(|e| anyhow::anyhow!("osd-overlay failed: {e:?}"))
+                .map_err(|e| anyhow::anyhow!("osd-overlay (background) failed: {e:?}"))?;
+                mpv.command(
+                    "osd-overlay",
+                    &[
+                        &OSD_OVERLAY_FG_ID.to_string(),
+                        "ass-events",
+                        &fg,
+                        &CANVAS_WIDTH.to_string(),
+                        &CANVAS_HEIGHT.to_string(),
+                    ],
+                )
+                .map_err(|e| anyhow::anyhow!("osd-overlay (foreground) failed: {e:?}"))
             }
         }
     }
@@ -171,12 +193,12 @@ impl IdleScreenController {
         }
         // format="none" removes the overlay outright, rather than replacing
         // it with empty content.
-        self.mpv
-            .command(
-                "osd-overlay",
-                &[&OSD_OVERLAY_ID.to_string(), "none", ""],
-            )
-            .map_err(|e| anyhow::anyhow!("osd-overlay (clear) failed: {e:?}"))
+        for id in [OSD_OVERLAY_BG_ID, OSD_OVERLAY_FG_ID] {
+            self.mpv
+                .command("osd-overlay", &[&id.to_string(), "none", ""])
+                .map_err(|e| anyhow::anyhow!("osd-overlay (clear) failed: {e:?}"))?;
+        }
+        Ok(())
     }
 
     /// Spawn the background thread that watches for mpv reaching
