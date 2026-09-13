@@ -53,7 +53,8 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   `Player::play`'s `loadfile` call — that only queues the load; mpv resolves/opens it later, off
   that call stack. `player.rs`'s `spawn_error_logger` catches these via a second `Mpv` client
   handle (`Mpv::create_client`) dedicated to blocking on `wait_event(-1.0)`, logging any `Err` at
-  `error!` with the failing url — event-driven, not a polling loop.
+  `error!` with the most recently submitted url (attribution is best-effort — see README's "How
+  YouTube playback works") — event-driven, not a polling loop.
 - libmpv disables its own log output by default, so a failed load used to be a silent black
   screen; `Player::new` sets `terminal=yes`/`msg-level=all=warn` so mpv's concrete error line
   (e.g. `[ffmpeg] https: HTTP error 403 Forbidden`, `[ytdl_hook] ... failed`) reaches the daemon's
