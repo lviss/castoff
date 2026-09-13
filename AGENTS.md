@@ -49,8 +49,12 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   top, so don't reuse those. The spinner is an ASS vector annular sector rotated via `\org`+`\frz`
   (no font dependency; rotating a bbox-centered drawing wobbles). Every animation is a bounded
   loop that stops on a generation-counter bump; the spinner thread redraws only while a Play is in
-  flight. `Player::play`/`stop` block ~150ms per fade, but a superseding command aborts the old
-  animation at its next frame, so the concurrent-`play` test stays fast.
+  flight. Overlay draws hold the state mutex across their `osd-overlay` command and `clear()` holds
+  it across its teardown, so a draw that passed the staleness check can never land after the
+  overlays were removed (the stale-spinner-draw race). `Player::play`/`stop` block ~150ms per fade,
+  but a superseding command aborts the old animation at its next frame, so the concurrent-`play`
+  test stays fast; every error path in `play`/`stop` calls `abort_loading_to_idle` so a partial
+  setup can't leave the opaque fade covering the screen.
 - YouTube playback needs no daemon-side code: mpv's built-in `ytdl_hook` Lua script (same core in
   both CLI mpv and `libmpv2`) auto-detects non-direct-media URLs and shells out to `yt-dlp` on
   `PATH`, unconditionally, with no libmpv init tweaks required — see README's "How YouTube
@@ -80,11 +84,17 @@ This file is the project's committed home for project-intrinsic agent knowledge:
 - "Playback actually started rendering" is mpv's `PlaybackRestart` event, not the `loadfile` call
   returning (that only queues the load). A third `Mpv` client (`spawn_lifecycle_watcher`) consumes
   it and takes the spinner down; a fresh client must `enable_event` it (`libmpv2`'s
-  `mpv_event_id::PlaybackRestart`/`EndFile`). A *failed* load reaches `wait_event` as
-  `Some(Err(..))` (mpv `END_FILE` with an error code), while a normal EOF or a superseding
-  `loadfile` arrives as `Ok(Event::EndFile(reason))` and must be ignored — only `Err` means
-  failure. Each mpv event consumer (idle-screen eof watcher on the main handle, error logger,
-  lifecycle watcher) has its own client/queue to avoid contention.
+  `mpv_event_id::PlaybackRestart`/`EndFile`). `wait_event` returns `Some(Err(..))` for an `END_FILE`
+  with a nonzero error code, and `Ok(Event::EndFile(reason))` otherwise: `EndFileReason::Eof` while
+  the spinner is still up is treated as a load that never started and returns to the idle clock,
+  while the STOP/REDIRECT a superseding `loadfile` produces are ignored so a rapid re-Play keeps
+  its spinner (see `player.rs`'s `handle_lifecycle_event`). With the shipped `keep-open=yes`, a
+  normal EOF emits no `END_FILE` at all (mpv pauses at `eof-reached` and the idle clock returns via
+  that property watcher), so the EOF arm is defensive; it could not be produced end-to-end in
+  tests, so `end_of_file_without_playback_restart_returns_to_idle_clock` drives
+  `handle_lifecycle_event` directly with the real event. Each mpv event consumer (idle-screen eof
+  watcher on the main handle, error logger, lifecycle watcher) has its own client/queue to avoid
+  contention.
 
 ## Maintaining this file
 

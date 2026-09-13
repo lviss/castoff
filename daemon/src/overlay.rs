@@ -87,8 +87,23 @@ impl PlaybackOverlay {
         state.generation
     }
 
-    fn stale(&self, generation: u64) -> bool {
-        self.state.lock().unwrap().generation != generation
+    /// Draw one overlay frame, but only while `generation` is still current,
+    /// holding the state lock across the draw. `clear_if_current` holds that
+    /// same lock across its OSD teardown, so a draw that passed the staleness
+    /// check can never land after the overlays have been removed. Returns
+    /// `false` when the sequence has been superseded.
+    fn draw_if_current(
+        &self,
+        generation: u64,
+        opacity: u8,
+        spinner_deg: Option<f64>,
+    ) -> Result<bool> {
+        let state = self.state.lock().unwrap();
+        if state.generation != generation {
+            return Ok(false);
+        }
+        draw_overlay(&self.mpv, opacity, spinner_deg)?;
+        Ok(true)
     }
 
     /// Fade whatever is on screen to opaque black. Used at the start of a
@@ -99,14 +114,21 @@ impl PlaybackOverlay {
         let generation = self.begin();
         let start = self.state.lock().unwrap().opacity;
         for step in 1..=FADE_STEPS {
-            if self.stale(generation) {
-                return Ok(());
-            }
             let opacity = lerp_u8(start, 255, step, FADE_STEPS);
-            draw_overlay(&self.mpv, opacity, None)?;
+            match self.draw_if_current(generation, opacity, None) {
+                Ok(true) => {}
+                Ok(false) => return Ok(()),
+                Err(e) => {
+                    let _ = self.clear();
+                    return Err(e);
+                }
+            }
             std::thread::sleep(FADE_STEP);
         }
-        self.state.lock().unwrap().opacity = 255;
+        let mut state = self.state.lock().unwrap();
+        if state.generation == generation {
+            state.opacity = 255;
+        }
         Ok(())
     }
 
@@ -116,8 +138,20 @@ impl PlaybackOverlay {
     /// loop runs on its own thread and idles otherwise.
     pub(crate) fn spawn_spinner(&self) -> Result<()> {
         let generation = self.begin();
-        self.state.lock().unwrap().opacity = 255;
-        draw_overlay(&self.mpv, 255, Some(0.0))?;
+        match self.draw_if_current(generation, 255, Some(0.0)) {
+            Ok(true) => {}
+            Ok(false) => return Ok(()),
+            Err(e) => {
+                let _ = self.clear();
+                return Err(e);
+            }
+        }
+        {
+            let mut state = self.state.lock().unwrap();
+            if state.generation == generation {
+                state.opacity = 255;
+            }
+        }
 
         let mpv = Arc::clone(&self.mpv);
         let state = Arc::clone(&self.state);
@@ -125,7 +159,8 @@ impl PlaybackOverlay {
             let mut angle = 0.0;
             loop {
                 std::thread::sleep(SPINNER_STEP);
-                if state.lock().unwrap().generation != generation {
+                let state = state.lock().unwrap();
+                if state.generation != generation {
                     return;
                 }
                 angle = (angle + SPINNER_DEGREES_PER_STEP) % 360.0;
@@ -145,26 +180,42 @@ impl PlaybackOverlay {
         let generation = self.begin();
         let start = self.state.lock().unwrap().opacity;
         for step in 1..=FADE_STEPS {
-            if self.stale(generation) {
-                return Ok(());
-            }
             let opacity = lerp_u8(start, 0, step, FADE_STEPS);
-            draw_overlay(&self.mpv, opacity, None)?;
+            match self.draw_if_current(generation, opacity, None) {
+                Ok(true) => {}
+                Ok(false) => return Ok(()),
+                Err(e) => {
+                    let _ = self.clear();
+                    return Err(e);
+                }
+            }
             std::thread::sleep(FADE_STEP);
         }
-        self.clear()
+        self.clear_if_current(Some(generation))
     }
 
     /// Remove both overlays immediately (no fade) and mark the overlay
     /// inactive. Used when a synchronous error means there is nothing worth
     /// fading.
     pub(crate) fn clear(&self) -> Result<()> {
-        {
-            let mut state = self.state.lock().unwrap();
-            state.generation += 1;
-            state.active = false;
-            state.opacity = 0;
+        self.clear_if_current(None)
+    }
+
+    /// Teardown shared by `clear` and `reveal`: when `expected` is `Some`,
+    /// only act if that generation is still current, so a fading `reveal`
+    /// can't tear down a newer command's overlay. Holds the state lock across
+    /// `clear_overlay` so a concurrent draw (which holds the same lock) can
+    /// never land after the OSD overlays have been removed.
+    fn clear_if_current(&self, expected: Option<u64>) -> Result<()> {
+        let mut state = self.state.lock().unwrap();
+        if let Some(generation) = expected {
+            if state.generation != generation {
+                return Ok(());
+            }
         }
+        state.generation += 1;
+        state.active = false;
+        state.opacity = 0;
         clear_overlay(&self.mpv)
     }
 }
