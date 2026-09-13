@@ -1,4 +1,5 @@
 mod fcast;
+mod idle_screen;
 mod player;
 
 use std::net::SocketAddr;
