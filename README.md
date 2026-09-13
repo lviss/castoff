@@ -127,7 +127,9 @@ never hidden behind the spinner.
   spinner is removed and the black fades away to the new video.
 - **Stop.** (1) The video fades to black. (2) The idle clock fades in over that black while the
   black backdrop stays up (so a not-yet-cleared video frame can't flash through). (3) The backdrop
-  is dropped once the clock's own opaque background covers the canvas.
+  is dropped once the clock's own opaque background covers the canvas. A `Stop` that arrives after
+  a clip already ended on its own is a no-op instead: the eof watcher has already restored the
+  clock, so there is nothing to fade and the screen does not blink.
 
 So a fade runs on *both* boundaries of a Play (old content to black, black to new video) and
 *both* boundaries of a Stop (video to black, black to idle clock). The spinner does not mask

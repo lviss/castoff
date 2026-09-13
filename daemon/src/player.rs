@@ -199,10 +199,22 @@ impl Player {
     /// cutting straight to it. A Stop while already idle and not loading is a
     /// no-op transition (just re-asserts the clock), so it doesn't blink the
     /// screen.
+    ///
+    /// "Already idle" is signalled by the idle clock being on screen, not by
+    /// mpv's `idle-active`: with `keep-open=yes` (see `new()`) a clip that
+    /// reached end-of-file on its own is not `idle-active` -- mpv stays paused
+    /// on the last frame -- even though the eof watcher has already brought
+    /// the clock back. Keying off `idle-active` there would conceal the
+    /// visible clock to black and fade it straight back in: an ~800ms blink
+    /// for a Stop that changes nothing. `fade_in_idle_clock` also cannot be
+    /// used while the clock is already shown -- its `render_at` contract
+    /// forbids running alongside `show`'s refresh thread -- so taking the
+    /// no-op branch here is what keeps that path structurally out of reach.
     pub fn stop(&self) -> Result<()> {
-        let was_playing = !self.mpv.get_property::<bool>("idle-active").unwrap_or(true);
+        let clock_showing = self.idle.current().is_some();
         let was_loading = self.overlay.is_active();
-        if was_playing {
+        let already_idle = clock_showing && !was_loading;
+        if !already_idle && !was_loading {
             if let Err(e) = self.overlay.conceal() {
                 let _ = self.abort_loading_to_idle();
                 return Err(e);
@@ -212,10 +224,10 @@ impl Player {
             let _ = self.abort_loading_to_idle();
             return Err(anyhow::anyhow!("stop failed: {e:?}"));
         }
-        if was_playing || was_loading {
-            self.fade_in_idle_clock()
-        } else {
+        if already_idle {
             self.show_idle_screen(IdleScreen::Clock)
+        } else {
+            self.fade_in_idle_clock()
         }
     }
 
@@ -226,17 +238,41 @@ impl Player {
     /// stacks overlays by recency, so a clock re-created after the rect would
     /// sit above it and pop in instead of fading.
     fn fade_in_idle_clock(&self) -> Result<()> {
+        // The clock is already the current screen, so `show`'s refresh thread
+        // is running and `render_at` must not be used alongside it (see its
+        // contract); there is also nothing to fade. Drop any overlay and
+        // re-assert the clock. This is the case a Stop after a clip reached
+        // end-of-file, or a `conceal` failure before `hide_idle_screen`, lands
+        // in -- keeping the alpha-fade path structurally out of reach rather
+        // than relying on a timing assumption.
+        if self.idle.current().is_some() {
+            self.overlay.clear()?;
+            return self.show_idle_screen(IdleScreen::Clock);
+        }
         // Cancel/remove only the spinner; the opaque fade rect stays as the
         // black backdrop (a not-yet-cleared video frame must not flash
         // through). Draw the clock above it at zero opacity, ramp that alpha
         // up, and only then drop the rect -- by then the clock's own opaque
         // background covers the canvas, so removing the rect is invisible.
-        self.overlay.stop_spinner()?;
-        self.idle.render_at(IdleScreen::Clock, 0)?;
-        self.overlay
-            .fade_in(|opacity| self.idle.render_at(IdleScreen::Clock, opacity))?;
-        self.overlay.clear()?;
-        self.show_idle_screen(IdleScreen::Clock)
+        let fade = || -> Result<()> {
+            self.overlay.stop_spinner()?;
+            self.idle.render_at(IdleScreen::Clock, 0)?;
+            self.overlay
+                .fade_in(|opacity| self.idle.render_at(IdleScreen::Clock, opacity))?;
+            self.overlay.clear()?;
+            self.show_idle_screen(IdleScreen::Clock)
+        };
+        if let Err(e) = fade() {
+            // A failure partway through (spinner teardown, an OSD alpha draw,
+            // or dropping the opaque rect) would otherwise leave the overlay
+            // active with the black rect up and no watcher event coming to
+            // clear it: the screen stays opaque black until the next command.
+            // Roll back to a visible clock, best-effort.
+            let _ = self.overlay.clear();
+            let _ = self.show_idle_screen(IdleScreen::Clock);
+            return Err(e);
+        }
+        Ok(())
     }
 
     /// A load ended without ever starting playback: cancel the spinner (if
@@ -748,6 +784,117 @@ mod tests {
             player.idle_screen(),
             Some(IdleScreen::Clock),
             "clock must return after an explicit Stop"
+        );
+    }
+
+    /// Run `action` while sampling `player.loading_overlay_active()` at high
+    /// frequency, and report whether the loading/fade overlay ever came up.
+    /// The overlay only exists *during* a blocking `stop()` (it is torn down
+    /// before the call returns), so whether a Stop took the fade path is not
+    /// observable afterwards; this samples the real state while it runs.
+    fn overlay_came_up_during(player: &Player, action: impl FnOnce()) -> bool {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc::TryRecvError;
+
+        let saw = AtomicBool::new(false);
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        std::thread::scope(|scope| {
+            let saw = &saw;
+            scope.spawn(move || loop {
+                if player.loading_overlay_active() {
+                    saw.store(true, Ordering::SeqCst);
+                }
+                match done_rx.try_recv() {
+                    Ok(()) | Err(TryRecvError::Disconnected) => {
+                        if player.loading_overlay_active() {
+                            saw.store(true, Ordering::SeqCst);
+                        }
+                        return;
+                    }
+                    Err(TryRecvError::Empty) => {}
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            });
+            action();
+            let _ = done_tx.send(());
+        });
+        saw.load(Ordering::SeqCst)
+    }
+
+    /// Regression test: a Stop after a clip has already ended must not blink
+    /// the screen. `keep-open=yes` leaves mpv paused at the last frame (so
+    /// `idle-active` is still false) while the eof watcher has already put the
+    /// idle clock back; the old `was_playing = !idle-active` check therefore
+    /// concealed the visible clock to black and faded it straight back in. The
+    /// fade/loading overlay is the only thing that blacks the screen on a
+    /// Stop, so it must never become active here, and the clock must stay up.
+    #[test]
+    fn stop_after_end_of_file_does_not_blink_the_idle_clock() {
+        let player = headless_player();
+        let msg = PlayMessage {
+            url: Some("av://lavfi:testsrc=size=64x64:rate=10:duration=1".to_string()),
+            ..Default::default()
+        };
+        player.play(&msg).expect("play");
+        wait_until(
+            &player.mpv,
+            |mpv| mpv.get_property("eof-reached").unwrap_or(false),
+            "clip to reach eof",
+        );
+        wait_until_idle_screen(
+            &player,
+            Some(IdleScreen::Clock),
+            "clock to return after end-of-file",
+        );
+        // Sanity check on the test's own premise: with `keep-open=yes` mpv is
+        // still not `idle-active` at this point, so the old
+        // `was_playing = !idle-active` check did take the blink path.
+        assert!(
+            !player.mpv.get_property::<bool>("idle-active").unwrap_or(true),
+            "sanity: keep-open leaves mpv non-idle at eof, which caused the blink"
+        );
+
+        assert!(
+            !overlay_came_up_during(&player, || player.stop().expect("stop")),
+            "a Stop after end-of-file must not conceal the clock to black"
+        );
+        assert_eq!(
+            player.idle_screen(),
+            Some(IdleScreen::Clock),
+            "the clock must stay up across a no-op Stop"
+        );
+    }
+
+    /// The other direction of the no-op rule: a Stop while playback is
+    /// genuinely on screen must still take the fade path (video out through
+    /// black, clock in) and land on the idle clock.
+    #[test]
+    fn stop_while_playing_fades_out_to_the_idle_clock() {
+        let player = headless_player();
+        let msg = PlayMessage {
+            url: Some("av://lavfi:testsrc=size=64x64:rate=10:duration=30".to_string()),
+            ..Default::default()
+        };
+        player.play(&msg).expect("play");
+        wait_until(
+            &player.mpv,
+            |mpv| mpv.get_property::<f64>("time-pos").unwrap_or(0.0) > 0.1,
+            "playback to start",
+        );
+        assert_eq!(
+            player.idle_screen(),
+            None,
+            "the clock is hidden while the video plays"
+        );
+
+        assert!(
+            overlay_came_up_during(&player, || player.stop().expect("stop")),
+            "a Stop during playback must fade through the overlay"
+        );
+        assert_eq!(
+            player.idle_screen(),
+            Some(IdleScreen::Clock),
+            "the clock must return after the fade"
         );
     }
 
