@@ -40,6 +40,11 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   `#[ignore]`d — the `nix build`/`nix flake check` sandbox has no network. Run it manually with
   `nix shell nixpkgs#yt-dlp -c cargo test -- --ignored` (from `nix develop`, or with cargo/rustc
   otherwise on `PATH`).
+- Async mpv playback errors (e.g. `ytdl_hook`/`yt-dlp` failing to resolve a URL) don't surface from
+  `Player::play`'s `loadfile` call — that only queues the load; mpv resolves/opens it later, off
+  that call stack. `player.rs`'s `spawn_error_logger` catches these via a second `Mpv` client
+  handle (`Mpv::create_client`) dedicated to blocking on `wait_event(-1.0)`, logging any `Err` at
+  `error!` with the failing url — event-driven, not a polling loop.
 
 ## Maintaining this file
 

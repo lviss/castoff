@@ -1,11 +1,13 @@
 //! Thin wrapper around libmpv2 that maps FCast-shaped requests onto mpv
 //! commands/properties, and reads back mpv state as an FCast PlaybackUpdate.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
+use libmpv2::events::Event;
 use libmpv2::Mpv;
+use tracing::error;
 
 use crate::fcast::{PlayMessage, PlaybackState, PlaybackUpdateMessage};
 use crate::idle_screen::{IdleScreen, IdleScreenController};
@@ -13,6 +15,11 @@ use crate::idle_screen::{IdleScreen, IdleScreenController};
 pub struct Player {
     mpv: Arc<Mpv>,
     idle: Arc<IdleScreenController>,
+    /// The most recently requested Play `url`, kept only so the background
+    /// error listener (`spawn_error_logger`) can name which target a later
+    /// async mpv error belongs to; mpv plays one file at a time, so "most
+    /// recent" is always the right one to blame.
+    last_target: Arc<Mutex<String>>,
 }
 
 impl Player {
@@ -38,15 +45,22 @@ impl Player {
             Ok(())
         })
         .map_err(|e| anyhow::anyhow!("failed to initialize mpv: {e:?}"))?;
-        let player = Self::from_mpv(Arc::new(mpv));
+        let mpv = Arc::new(mpv);
+        let last_target = Arc::new(Mutex::new(String::new()));
+        spawn_error_logger(&mpv, Arc::clone(&last_target))?;
+        let player = Self::from_mpv(mpv, last_target);
         player.show_idle_screen(IdleScreen::Clock)?;
         Ok(player)
     }
 
-    fn from_mpv(mpv: Arc<Mpv>) -> Self {
+    fn from_mpv(mpv: Arc<Mpv>, last_target: Arc<Mutex<String>>) -> Self {
         let idle = Arc::new(IdleScreenController::new(Arc::clone(&mpv)));
         idle.spawn_eof_watcher();
-        Self { mpv, idle }
+        Self {
+            mpv,
+            idle,
+            last_target,
+        }
     }
 
     /// Show `screen` (currently only `IdleScreen::Clock`) until the next
@@ -78,9 +92,14 @@ impl Player {
             (None, None) => anyhow::bail!("Play message has neither `url` nor `content`"),
         };
         self.hide_idle_screen()?;
+        // Recorded before `loadfile` so the background error listener (see
+        // `spawn_error_logger`) can already attribute an error that arrives
+        // while resolution/opening is still in flight (e.g. a slow or
+        // failing `ytdl_hook`/`yt-dlp` YouTube lookup).
+        *self.last_target.lock().unwrap() = target.to_string();
         self.mpv
             .command("loadfile", &[target, "replace"])
-            .map_err(|e| anyhow::anyhow!("loadfile failed: {e:?}"))?;
+            .map_err(|e| anyhow::anyhow!("loadfile failed for url {target:?}: {e:?}"))?;
         // `keep-open=yes` (see `new()`) leaves `pause` set to `true` once a
         // previous file hits EOF, and mpv does not reset that property on the
         // next `loadfile`. Without this, a second Play call loads the new
@@ -176,6 +195,44 @@ fn to_mpv_volume(fcast_volume: f64) -> f64 {
     (fcast_volume.clamp(0.0, 1.0)) * 100.0
 }
 
+/// Spawn a background thread that logs mpv's *asynchronous* playback
+/// errors -- the ones `Player::play`'s immediate `loadfile` call can't see,
+/// because `loadfile` only queues the load; mpv resolves/opens the target
+/// (including running `ytdl_hook`'s `yt-dlp` subprocess for a YouTube URL)
+/// afterwards, off of that call stack. Without this, a `ytdl_hook`/`yt-dlp`
+/// failure or timeout is a silent black screen with nothing in the log to
+/// diagnose it from.
+///
+/// This blocks on mpv's event queue (`wait_event(-1.0)`) rather than
+/// polling, so it costs nothing until mpv actually has something to report,
+/// consistent with the daemon's power-efficiency design principle. It uses
+/// a second client handle from `Mpv::create_client` (its own independent
+/// event queue onto the same player core) so it never contends with the
+/// `Player` methods' direct use of `mpv` from other threads.
+fn spawn_error_logger(mpv: &Mpv, last_target: Arc<Mutex<String>>) -> Result<()> {
+    let events = mpv
+        .create_client(Some("castoff-error-logger"))
+        .map_err(|e| anyhow::anyhow!("failed to create mpv event client: {e:?}"))?;
+    std::thread::spawn(move || {
+        loop {
+            match events.wait_event(-1.0) {
+                Some(Err(e)) => {
+                    let url = last_target.lock().unwrap().clone();
+                    error!(
+                        url,
+                        error = ?e,
+                        "mpv reported an async playback error -- possibly ytdl_hook/yt-dlp \
+                         failing or timing out to resolve this url, or mpv failing to open it"
+                    );
+                }
+                Some(Ok(Event::Shutdown)) => break,
+                _ => {}
+            }
+        }
+    });
+    Ok(())
+}
+
 pub(crate) fn now_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -204,7 +261,7 @@ mod tests {
             Ok(())
         })
         .expect("failed to initialize headless mpv for test");
-        let player = Player::from_mpv(Arc::new(mpv));
+        let player = Player::from_mpv(Arc::new(mpv), Arc::new(Mutex::new(String::new())));
         player
             .show_idle_screen(IdleScreen::Clock)
             .expect("show initial idle screen");
