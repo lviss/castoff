@@ -1,22 +1,26 @@
 //! Thin wrapper around libmpv2 that maps FCast-shaped requests onto mpv
 //! commands/properties, and reads back mpv state as an FCast PlaybackUpdate.
 
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use libmpv2::Mpv;
 
 use crate::fcast::{PlayMessage, PlaybackState, PlaybackUpdateMessage};
+use crate::idle_screen::{IdleScreen, IdleScreenController};
 
 pub struct Player {
-    mpv: Mpv,
+    mpv: Arc<Mpv>,
+    idle: Arc<IdleScreenController>,
 }
 
 impl Player {
     /// Create the mpv core. No window is opened and no decoding happens until
     /// the first `play()` call: mpv's `idle` mode holds an empty, otherwise
     /// dormant window that Cage can still fullscreen, without spinning up a
-    /// decode pipeline for nothing on boat power.
+    /// decode pipeline for nothing on boat power. Shows the idle screen
+    /// (see `idle_screen`) immediately, since there is no playback yet.
     pub fn new() -> Result<Self> {
         let mpv = Mpv::with_initializer(|init| {
             init.set_property("vo", "gpu")?;
@@ -34,7 +38,34 @@ impl Player {
             Ok(())
         })
         .map_err(|e| anyhow::anyhow!("failed to initialize mpv: {e:?}"))?;
-        Ok(Self { mpv })
+        let player = Self::from_mpv(Arc::new(mpv));
+        player.show_idle_screen(IdleScreen::Clock)?;
+        Ok(player)
+    }
+
+    fn from_mpv(mpv: Arc<Mpv>) -> Self {
+        let idle = Arc::new(IdleScreenController::new(Arc::clone(&mpv)));
+        idle.spawn_eof_watcher();
+        Self { mpv, idle }
+    }
+
+    /// Show `screen` (currently only `IdleScreen::Clock`) until the next
+    /// `hide_idle_screen`/`show_idle_screen` call.
+    pub fn show_idle_screen(&self, screen: IdleScreen) -> Result<()> {
+        self.idle.show(screen)
+    }
+
+    /// Clear whatever idle screen is currently shown, if any.
+    pub fn hide_idle_screen(&self) -> Result<()> {
+        self.idle.hide()
+    }
+
+    /// The idle screen currently shown, or `None` while actively playing.
+    /// Not read anywhere in the daemon itself today; exists so tests can
+    /// observe idle-screen state without inferring it from mpv properties.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn idle_screen(&self) -> Option<IdleScreen> {
+        self.idle.current()
     }
 
     pub fn play(&self, msg: &PlayMessage) -> Result<()> {
@@ -46,6 +77,7 @@ impl Player {
             ),
             (None, None) => anyhow::bail!("Play message has neither `url` nor `content`"),
         };
+        self.hide_idle_screen()?;
         self.mpv
             .command("loadfile", &[target, "replace"])
             .map_err(|e| anyhow::anyhow!("loadfile failed: {e:?}"))?;
@@ -82,11 +114,12 @@ impl Player {
     }
 
     /// Stop playback and return to mpv's idle state (no decode pipeline
-    /// running, screen left black rather than a busy renderer).
+    /// running), showing the idle screen in place of the old black screen.
     pub fn stop(&self) -> Result<()> {
         self.mpv
             .command("stop", &[])
-            .map_err(|e| anyhow::anyhow!("stop failed: {e:?}"))
+            .map_err(|e| anyhow::anyhow!("stop failed: {e:?}"))?;
+        self.show_idle_screen(IdleScreen::Clock)
     }
 
     pub fn seek(&self, time: f64) -> Result<()> {
@@ -159,8 +192,9 @@ mod tests {
     /// A `Player` around a headless (`vo=null`/`ao=null`, no window or audio
     /// device) mpv core, sufficient to drive real `Player::play` behavior in
     /// a sandbox with no display or sound hardware. Mirrors `Player::new`'s
-    /// `keep-open` setting, since that's what the double-play regression test
-    /// below needs to reproduce.
+    /// `keep-open` setting (needed for the double-play regression test
+    /// below) and its initial idle-screen setup (needed for the idle-screen
+    /// test below).
     fn headless_player() -> Player {
         let mpv = Mpv::with_initializer(|init| {
             init.set_property("vo", "null")?;
@@ -170,7 +204,25 @@ mod tests {
             Ok(())
         })
         .expect("failed to initialize headless mpv for test");
-        Player { mpv }
+        let player = Player::from_mpv(Arc::new(mpv));
+        player
+            .show_idle_screen(IdleScreen::Clock)
+            .expect("show initial idle screen");
+        player
+    }
+
+    /// Poll `player`'s idle screen for up to 5s until it equals `expected`;
+    /// panics on timeout. Needed because the eof-watch thread that brings
+    /// the idle screen back after a natural end-of-file runs asynchronously.
+    fn wait_until_idle_screen(player: &Player, expected: Option<IdleScreen>, what: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if player.idle_screen() == expected {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!("timed out waiting for: {what}");
     }
 
     /// Poll `mpv` for up to 5s until `pred` is true; panics on timeout so a
@@ -259,6 +311,68 @@ mod tests {
             &player.mpv,
             |mpv| mpv.get_property::<f64>("time-pos").unwrap_or(0.0) > 0.05,
             "second clip's playback time to advance past its first frame",
+        );
+    }
+
+    /// Exercises the idle screen through all three triggers the spec calls
+    /// for -- startup, natural end-of-file with nothing queued, and Stop --
+    /// plus the one place it must disappear (a real Play). `show`/`hide`
+    /// each round-trip through a real `mpv.command("show-text", ...)` call
+    /// (propagating any mpv error via `?`), and the eof case is driven by
+    /// mpv's own `eof-reached` property flipping on a real synthetic clip
+    /// rather than the test calling `show_idle_screen` itself, so this is
+    /// checking that the real wiring fires at the right moments, not just
+    /// that some function was called. (A headless `vo=null`/`ao=null` mpv
+    /// core never produces a paintable frame -- confirmed empirically:
+    /// `screenshot-to-file` errors out even while idle with `force-window`
+    /// -- so there is no way to also assert on rendered pixels here.)
+    #[test]
+    fn idle_screen_appears_when_idle_and_disappears_once_playback_starts() {
+        let player = headless_player();
+
+        assert_eq!(
+            player.idle_screen(),
+            Some(IdleScreen::Clock),
+            "clock must be showing at startup, before any Play"
+        );
+
+        let msg = PlayMessage {
+            url: Some("av://lavfi:testsrc=size=64x64:rate=10:duration=1".to_string()),
+            ..Default::default()
+        };
+        player.play(&msg).expect("first play");
+        assert_eq!(
+            player.idle_screen(),
+            None,
+            "idle screen must be hidden once playback actually starts"
+        );
+
+        // Let the clip run to completion. `keep-open=yes` pauses mpv at eof
+        // instead of unloading it, and nothing else queues a next file, so
+        // the eof-watch thread should bring the clock back on its own.
+        wait_until(
+            &player.mpv,
+            |mpv| mpv.get_property("eof-reached").unwrap_or(false),
+            "clip to reach eof",
+        );
+        wait_until_idle_screen(
+            &player,
+            Some(IdleScreen::Clock),
+            "idle screen to return after end-of-file with nothing queued next",
+        );
+
+        player.play(&msg).expect("second play");
+        assert_eq!(
+            player.idle_screen(),
+            None,
+            "idle screen must be hidden again once replay starts"
+        );
+
+        player.stop().expect("stop");
+        assert_eq!(
+            player.idle_screen(),
+            Some(IdleScreen::Clock),
+            "clock must return after an explicit Stop"
         );
     }
 }

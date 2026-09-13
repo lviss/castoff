@@ -19,6 +19,7 @@ name = "castoff-daemon"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "libc",
  "libmpv2",
  "serde",
  "serde_json",

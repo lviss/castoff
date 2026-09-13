@@ -135,8 +135,14 @@ this scaffold yet, but they should carry forward into every later task on this c
   pipeline active when nothing is playing. Concretely so far: the FCast TCP server is
   event-driven (`tokio`, no polling loop); `PlaybackUpdate`/`VolumeUpdate` replies are sent only
   in response to a command, never on a timer; mpv is configured with `hwdec=auto-safe` so decode
-  uses hardware acceleration when available; and `stop`/idle leaves mpv's decode pipeline
-  dormant rather than rendering.
+  uses hardware acceleration when available; and `stop`/idle leaves mpv's *decode* pipeline
+  dormant rather than rendering a video. Idle is no longer fully dark, though: whenever there's
+  no active playback (at startup, after `Stop`, or after a clip reaches end-of-file with nothing
+  queued next -- see [`daemon/src/idle_screen.rs`](daemon/src/idle_screen.rs)), the daemon shows
+  an on-screen clock via mpv's own OSD instead of a black screen, redrawn on a ~1s
+  `std::thread::sleep` timer rather than a busy loop or a second rendering stack. `IdleScreen` is
+  a small seam (`Clock` is the only variant today) meant to grow a static-wallpaper or
+  cast-a-webpage variant later without restructuring.
 - **Data efficiency.** Avoid needless re-fetching over the network. This isn't exercised by the
   scaffold (there's no Immich integration yet), but it constrains that future work: when the
   Immich slideshow integration is built, it must cache each displayed image locally and only

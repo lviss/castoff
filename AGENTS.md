@@ -14,6 +14,22 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   with `curl: (22) ... 403` on a `crate-*.tar.gz.drv`, just retry the same `nix build` — it
   resumes from whatever already fetched successfully and has always succeeded within a few
   retries. This is a `crates.io`-side bot-mitigation quirk, not a broken lockfile.
+- `nix build`/`nix flake check` see only *git-tracked* files (via the flake's `self` source
+  filter) — a new source file left untracked compiles fine under a plain `cargo build` in
+  `nix develop` but fails the flake build with a "file not found for module" error. `git add` new
+  files (staging is enough, no need to commit) before trusting a flake build/check result.
+- `libmpv2::Mpv::wait_event(-1.0)` (infinite timeout) can still return `None` (its "no event"
+  sentinel) as a spurious wakeup with nothing actually queued — this is normal/documented mpv
+  client-API behavior, not a signal that the core shut down. Any event-watcher loop built on
+  `wait_event` must treat `None` as "loop and wait again," and only stop on an explicit
+  `Event::Shutdown`; treating `None` as shutdown makes the watcher silently exit after its first
+  spurious wakeup (see `daemon/src/idle_screen.rs`'s eof-watcher).
+- mpv's OSD (`show-text`/`osd-overlay`) has no read-back property to confirm what's currently
+  displayed, and `screenshot`/`screenshot-to-file` fail outright while mpv is idle (no file
+  loaded) even with `force-window=yes` — confirmed empirically, there's no headless (no
+  GPU/display) way to assert on rendered idle-screen pixels. Tests covering idle-screen-type
+  behavior (`daemon/src/player.rs`'s idle-screen test) instead assert on real mpv command
+  success/failure plus real state transitions (e.g. `eof-reached`), not pixels.
 
 ## Maintaining this file
 
