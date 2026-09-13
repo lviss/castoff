@@ -22,6 +22,24 @@
         # buildInputs.
         buildInputs = [ pkgs.mpv-unwrapped ];
 
+        # `cargo test` (in the default checkPhase) has no network access in
+        # the Nix build sandbox, which is fine: the one test that needs the
+        # network (real YouTube playback, daemon/src/player.rs) is `#[ignore]`d
+        # and run manually instead -- see README.
+        nativeBuildInputs = [ pkgs.makeWrapper ];
+
+        # yt-dlp is a *runtime* dependency, not a build input: mpv's built-in
+        # ytdl_hook Lua script shells out to whatever `yt-dlp` it finds on
+        # `PATH` to resolve YouTube (and other non-direct-media) URLs -- see
+        # README's "How YouTube playback works". Wrap the binary so this is
+        # true regardless of the caller's environment (e.g. the `cage`
+        # session that execs this binary directly, no shell, on the real
+        # appliance).
+        postFixup = ''
+          wrapProgram $out/bin/castoff-daemon \
+            --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.yt-dlp ]}
+        '';
+
         meta = {
           description = "castoff TV-box daemon: drives mpv and exposes an FCast-based local control API";
           license = pkgs.lib.licenses.mit;

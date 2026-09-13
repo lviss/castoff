@@ -227,8 +227,19 @@ mod tests {
 
     /// Poll `mpv` for up to 5s until `pred` is true; panics on timeout so a
     /// stuck test fails fast instead of hanging.
-    fn wait_until(mpv: &Mpv, mut pred: impl FnMut(&Mpv) -> bool, what: &str) {
-        let deadline = Instant::now() + Duration::from_secs(5);
+    fn wait_until(mpv: &Mpv, pred: impl FnMut(&Mpv) -> bool, what: &str) {
+        wait_until_timeout(mpv, Duration::from_secs(5), pred, what)
+    }
+
+    /// Like `wait_until`, but with a caller-chosen timeout -- for cases (e.g.
+    /// a real network `yt-dlp` resolution) where 5s can be too tight.
+    fn wait_until_timeout(
+        mpv: &Mpv,
+        timeout: Duration,
+        mut pred: impl FnMut(&Mpv) -> bool,
+        what: &str,
+    ) {
+        let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
             if pred(mpv) {
                 return;
@@ -373,6 +384,55 @@ mod tests {
             player.idle_screen(),
             Some(IdleScreen::Clock),
             "clock must return after an explicit Stop"
+        );
+    }
+
+    /// Verifies real YouTube playback end-to-end through mpv's built-in
+    /// `ytdl_hook` (see README's "How YouTube playback works"): no daemon
+    /// code shells out to `yt-dlp` itself, mpv's bundled Lua script does,
+    /// automatically, for any URL it doesn't recognize as directly playable.
+    /// Requires network access and `yt-dlp` on `PATH` (the flake's dev shell
+    /// does not add `yt-dlp`; e.g. run
+    /// `nix shell nixpkgs#yt-dlp -c cargo test -- --ignored`), so this is
+    /// `#[ignore]`d by default: the sandboxed `nix build`/`nix flake check`
+    /// checkPhase has no network access, and `yt-dlp` is a runtime-only
+    /// dependency (see flake.nix), not a build input.
+    #[test]
+    #[ignore = "requires network access and yt-dlp on PATH; run with `cargo test -- --ignored`"]
+    fn real_youtube_url_resolves_and_plays_via_ytdl_hook() {
+        let player = headless_player();
+        let msg = PlayMessage {
+            // "Me at the zoo", the first video ever uploaded to YouTube:
+            // short (19s), extremely unlikely to ever be removed -- a stable
+            // target for this test.
+            url: Some("https://www.youtube.com/watch?v=jNQXAC9IVRw".to_string()),
+            ..Default::default()
+        };
+
+        player
+            .play(&msg)
+            .expect("play with a youtube url must be accepted");
+
+        // `duration` is only known once ytdl_hook has resolved a real,
+        // direct media URL via `yt-dlp` and mpv has opened it -- a bare
+        // subprocess spawn with no real resolution wouldn't produce this.
+        wait_until_timeout(
+            &player.mpv,
+            Duration::from_secs(30),
+            |mpv| mpv.get_property::<f64>("duration").unwrap_or(0.0) > 0.0,
+            "duration to be known (ytdl_hook resolved a real stream)",
+        );
+        let duration: f64 = player.mpv.get_property("duration").unwrap();
+        assert!(
+            (15.0..25.0).contains(&duration),
+            "expected ~19s duration for the known test video, got {duration}"
+        );
+
+        wait_until_timeout(
+            &player.mpv,
+            Duration::from_secs(15),
+            |mpv| mpv.get_property::<f64>("time-pos").unwrap_or(0.0) > 0.5,
+            "playback time-pos to advance",
         );
     }
 }
