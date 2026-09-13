@@ -287,10 +287,16 @@ fn clear_overlay(mpv: &Mpv) -> Result<()> {
 /// `angle_deg`. Built as an ASS vector drawing so it needs no particular font
 /// to be present on the appliance, unlike a spinner glyph.
 ///
-/// The drawing's coordinates are centered on the origin; `\org` pins rotation
-/// to the same point `\pos` places the origin, so `\frz` spins the arc in
-/// place without the wobble that centering the arc's (rotating) bounding box
-/// would cause.
+/// The drawing's coordinates are centered on the origin, and `\an7` (top-left)
+/// makes libass map that origin directly to `\pos(cx,cy)`, so the arc's own
+/// center sits on the canvas center. `\org(cx,cy)` then pins the `\frz`
+/// rotation pivot to that same screen point, spinning the arc in place. Do NOT
+/// switch this to `\an5` (center): for a vector drawing whose ink is not
+/// symmetric about its coordinate origin -- this 270-degree arc is missing a
+/// quadrant -- libass does not place the coordinate origin at `\pos`, so the
+/// arc and its rotation pivot are both displaced and `\frz` orbits the arc
+/// around the canvas instead of spinning it. Verified against a libass render
+/// (see the commit that fixed the orbit).
 fn spinner_ass(angle_deg: f64) -> String {
     let cx = CANVAS_WIDTH as f64 / 2.0;
     let cy = CANVAS_HEIGHT as f64 / 2.0;
@@ -319,7 +325,7 @@ fn spinner_ass(angle_deg: f64) -> String {
     }
 
     format!(
-        "{{\\an5\\pos({cx:.0},{cy:.0})\\org({cx:.0},{cy:.0})\\frz{angle_deg:.0}\
+        "{{\\an7\\pos({cx:.0},{cy:.0})\\org({cx:.0},{cy:.0})\\frz{angle_deg:.0}\
          \\1c&HFFFFFF&\\1a&H00&\\bord0\\shad0\\p1}}{path}{{\\p0}}"
     )
 }
