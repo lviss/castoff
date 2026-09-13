@@ -501,4 +501,75 @@ mod tests {
             "playback time-pos to advance",
         );
     }
+
+    /// Regression test for a race between concurrent `play()` calls (one per
+    /// FCast connection, see `main.rs`'s per-connection `spawn_blocking`):
+    /// without holding `last_target`'s lock across both the write and the
+    /// `loadfile` submission, one thread's write and its `loadfile` call
+    /// could straddle another thread's write/`loadfile` pair, so the URL
+    /// mpv ends up actually loading and the URL recorded in `last_target`
+    /// (what `spawn_error_logger` blames for a later async error) could
+    /// disagree. Hammers `play()` from many threads at once, releasing them
+    /// together via a `Barrier` to maximize interleaving, and asserts that
+    /// whatever mpv actually loaded always matches what `last_target` says
+    /// it loaded.
+    #[test]
+    fn concurrent_plays_keep_last_target_consistent_with_mpv() {
+        let player = headless_player();
+        const THREADS: usize = 8;
+        const ROUNDS: usize = 30;
+
+        for round in 0..ROUNDS {
+            let barrier = std::sync::Barrier::new(THREADS);
+            std::thread::scope(|scope| {
+                for i in 0..THREADS {
+                    let barrier = &barrier;
+                    let player = &player;
+                    scope.spawn(move || {
+                        // The `duration` decimal encodes `(round, i)` uniquely
+                        // (just to make each url distinguishable to mpv/us);
+                        // it plays no role in the race being tested.
+                        let uid = round * THREADS + i;
+                        let msg = PlayMessage {
+                            url: Some(format!(
+                                "av://lavfi:testsrc=size=64x64:rate=10:duration={:.3}",
+                                5.0 + uid as f64 * 0.001
+                            )),
+                            ..Default::default()
+                        };
+                        barrier.wait();
+                        player.play(&msg).expect("play");
+                    });
+                }
+            });
+
+            // Let mpv's command queue settle so its `path` property reflects
+            // the most recently submitted `loadfile`.
+            wait_until(
+                &player.mpv,
+                {
+                    let mut last_seen = String::new();
+                    let mut stable_polls = 0;
+                    move |mpv| {
+                        let path: String = mpv.get_property("path").unwrap_or_default();
+                        if path == last_seen {
+                            stable_polls += 1;
+                        } else {
+                            stable_polls = 0;
+                            last_seen = path;
+                        }
+                        stable_polls >= 3
+                    }
+                },
+                "mpv path property to settle",
+            );
+
+            let mpv_path: String = player.mpv.get_property("path").unwrap_or_default();
+            let recorded = player.last_target.lock().unwrap().clone();
+            assert_eq!(
+                mpv_path, recorded,
+                "round {round}: last_target must always name whatever mpv actually loaded"
+            );
+        }
+    }
 }
