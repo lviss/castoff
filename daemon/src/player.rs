@@ -42,6 +42,17 @@ impl Player {
             init.set_property("input-default-bindings", "no")?;
             init.set_property("input-vo-keyboard", "no")?;
             init.set_property("osc", "no")?;
+            // Print mpv's own warning/error log lines to the daemon's stderr
+            // (journald/console on the appliance). libmpv defaults to
+            // `terminal=no`, so without this a failed asynchronous load --
+            // e.g. `[ffmpeg] https: HTTP error 403 Forbidden` from a YouTube
+            // stream URL yt-dlp resolved, or a `ytdl_hook`/`yt-dlp`
+            // resolution failure -- was only visible to mpv's internal log
+            // and never reached the console, leaving a silent black screen.
+            // `all=warn` keeps this to actionable lines rather than
+            // info-level chatter on every load.
+            init.set_property("terminal", "yes")?;
+            init.set_property("msg-level", "all=warn")?;
             Ok(())
         })
         .map_err(|e| anyhow::anyhow!("failed to initialize mpv: {e:?}"))?;
@@ -227,11 +238,19 @@ fn spawn_error_logger(mpv: &Mpv, last_target: Arc<Mutex<String>>) -> Result<()> 
             match events.wait_event(-1.0) {
                 Some(Err(e)) => {
                     let url = last_target.lock().unwrap().clone();
+                    // `describe_playback_error` gives the mpv error code a
+                    // plain-language meaning (libmpv2's own `Display` is just
+                    // `Raw(<int>)`); mpv's own log line -- printed because
+                    // `terminal=yes`, see `new()` -- carries the concrete
+                    // cause, e.g. an HTTP 403 from the media/CDN host.
                     error!(
                         url,
                         error = ?e,
-                        "mpv reported an async playback error -- possibly ytdl_hook/yt-dlp \
-                         failing or timing out to resolve this url, or mpv failing to open it"
+                        reason = describe_playback_error(&e),
+                        "mpv reported an async playback error -- playback did not start; \
+                         see the mpv log line(s) above for the underlying cause (e.g. a \
+                         ytdl_hook/yt-dlp resolution failure or an HTTP error from the \
+                         media/CDN host)"
                     );
                 }
                 Some(Ok(Event::Shutdown)) => break,
@@ -240,6 +259,22 @@ fn spawn_error_logger(mpv: &Mpv, last_target: Arc<Mutex<String>>) -> Result<()> 
         }
     });
     Ok(())
+}
+
+fn describe_playback_error(e: &libmpv2::Error) -> &'static str {
+    use libmpv2::mpv_error;
+    // Only the codes a failed network/media load actually produces are named
+    // specially; anything else falls back to pointing at mpv's own log line.
+    match e {
+        libmpv2::Error::Raw(mpv_error::NothingToPlay) => {
+            "nothing to play: mpv could not open any stream the URL resolved to \
+             (the mpv log line above has the concrete cause, e.g. an HTTP 403)"
+        }
+        libmpv2::Error::Raw(mpv_error::LoadingFailed) => {
+            "loading failed: mpv could not load/open this URL"
+        }
+        _ => "see the mpv log line above for the concrete cause",
+    }
 }
 
 pub(crate) fn now_millis() -> u64 {

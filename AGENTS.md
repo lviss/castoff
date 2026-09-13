@@ -7,7 +7,13 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   are documented in `README.md` — read that first, it's the source of truth, not this file.
 - `flake.nix` pins `nixpkgs` to `nixos-25.11` deliberately: `libmpv2` requires Rust's
   `edition2024`, which needs Cargo/rustc >= 1.85; `nixos-24.11`'s toolchain is too old and fails
-  with "feature `edition2024` is required".
+  with "feature `edition2024` is required". It also has a `nixpkgs-unstable` input used for
+  exactly one package, `yt-dlp` (the daemon's runtime `PATH` wrapper and the dev shell). Reason:
+  `nixos-25.11`'s yt-dlp (2026.06.09) auto-selects YouTube's `android_vr` player client for some
+  videos, whose signed stream URLs the CDN answers with HTTP 403 → mpv reports
+  `MPV_ERROR_NOTHING_TO_PLAY`; `nixos-unstable`'s (2026.08.19) selects `visionos` and plays the
+  same video. That is a yt-dlp extractor/client-selection issue, not a castoff or mpv one. Keep
+  everything else on `nixos-25.11`; only `yt-dlp` comes from unstable.
 - `nix build`/`nix flake check` fetch crate sources straight from `crates.io` (no vendored
   `Cargo.lock` hashes beyond what `cargoLock.lockFile` gives). That endpoint occasionally 403s a
   plain-`curl` fetch (no User-Agent) with no pattern tied to a specific crate; if a build fails
@@ -34,8 +40,9 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   both CLI mpv and `libmpv2`) auto-detects non-direct-media URLs and shells out to `yt-dlp` on
   `PATH`, unconditionally, with no libmpv init tweaks required — see README's "How YouTube
   playback works". `yt-dlp` is a runtime-only dependency: the packaged `nix build` binary gets it
-  via `makeWrapper`/`wrapProgram` (not `buildInputs`, since it's invoked as a subprocess, not
-  linked), and `devShells.default` separately lists `pkgs.yt-dlp` in `packages` for the same
+  from the `nixpkgs-unstable` input via `makeWrapper`/`wrapProgram` (not `buildInputs`, since it's
+  invoked as a subprocess, not linked), and `devShells.default` separately lists that same
+  `yt-dlp` in `packages` for the same
   reason -- `inputsFrom` only pulls a package's buildInputs/nativeBuildInputs, never its
   `postFixup` wrapping, so the dev shell needs its own copy or `cargo build`/`cargo run` there
   silently lack `yt-dlp` on `PATH`. Its one real (non-mocked) test in `daemon/src/player.rs`
@@ -47,6 +54,13 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   that call stack. `player.rs`'s `spawn_error_logger` catches these via a second `Mpv` client
   handle (`Mpv::create_client`) dedicated to blocking on `wait_event(-1.0)`, logging any `Err` at
   `error!` with the failing url — event-driven, not a polling loop.
+- libmpv disables its own log output by default, so a failed load used to be a silent black
+  screen; `Player::new` sets `terminal=yes`/`msg-level=all=warn` so mpv's concrete error line
+  (e.g. `[ffmpeg] https: HTTP error 403 Forbidden`, `[ytdl_hook] ... failed`) reaches the daemon's
+  stderr/journal. libmpv2's `Error` `Display` is only `Raw(<int>)` (`-16` is
+  `MPV_ERROR_NOTHING_TO_PLAY`), so `spawn_error_logger` pairs it with
+  `describe_playback_error`'s plain-language reason; keep new async-error paths going through that
+  logging rather than adding a second mechanism.
 
 ## Maintaining this file
 

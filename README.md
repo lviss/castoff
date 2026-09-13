@@ -86,6 +86,20 @@ execs the binary directly with no shell) -- not merely assumed present on some m
 doesn't carry over that wrapping, so a plain `cargo build`/`cargo run` in `nix develop` would
 otherwise silently lack `yt-dlp` on `PATH`.
 
+`yt-dlp` is deliberately taken from the flake's `nixpkgs-unstable` input rather than the
+`nixos-25.11` pin used for everything else: the stable pin's yt-dlp (2026.06.09) auto-selects
+YouTube's `android_vr` player client for some videos and the CDN then answers the resolved stream
+URL with HTTP 403 (mpv reports "nothing to play"), while unstable's (2026.08.19) selects the
+working `visionos` client. Everything else -- mpv/`libmpv2` and the Rust toolchain -- stays on
+`nixos-25.11`.
+
+If playback still fails (private or removed video, an extractor regression, a CDN rejection), the
+daemon does not fail silently: it turns on mpv's own `terminal` logging (`msg-level=all=warn`), so
+mpv's concrete error line (e.g. `[ffmpeg] https: HTTP error 403 Forbidden` or
+`[ytdl_hook] youtube-dl failed: ...`) is written to the daemon's stderr/journal, and the
+async-error listener (`daemon/src/player.rs`) logs the failing URL together with a
+plain-language reason (libmpv2's own error display is only `Raw(<int>)`).
+
 ## Building and running
 
 ### Build the daemon on its own
