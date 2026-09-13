@@ -538,7 +538,11 @@ mod tests {
     #[allow(clippy::type_complexity)]
     fn spawn_gated_http_source(
         body: Vec<u8>,
-    ) -> (String, std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+    ) -> (
+        String,
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test http server");
         let addr = listener.local_addr().expect("local addr");
@@ -561,7 +565,11 @@ mod tests {
             let _ = stream.write_all(&body);
             let _ = stream.flush();
         });
-        (format!("http://{addr}/test.wav"), request_seen_rx, release_tx)
+        (
+            format!("http://{addr}/test.wav"),
+            request_seen_rx,
+            release_tx,
+        )
     }
 
     /// Like `wait_until`, but with a caller-chosen timeout -- for cases (e.g.
@@ -1038,7 +1046,9 @@ mod tests {
             "precondition: clock hidden and overlay gone -- screen would be black"
         );
 
-        player.abort_loading_to_idle().expect("abort back to the idle clock");
+        player
+            .abort_loading_to_idle()
+            .expect("abort back to the idle clock");
 
         assert_eq!(
             player.idle_screen(),

@@ -46,8 +46,9 @@ This file is the project's committed home for project-intrinsic agent knowledge:
 - The loading spinner and start/stop fade live in `daemon/src/overlay.rs`, drawing through the same
   `osd-overlay` ASS path as the idle clock (not a second rendering stack). It owns overlay ids
   9100 (fade rect) / 9101 (spinner); the idle clock keeps 9000/9001, and mpv draws higher ids on
-  top, so don't reuse those. The spinner is an ASS vector annular sector rotated via `\org`+`\frz`
-  (no font dependency; rotating a bbox-centered drawing wobbles). Every animation is a bounded
+  top, so don't reuse those. The spinner is an ASS vector annular sector rotated in place via
+  `\an7\pos` + `\org` + `\frz` (no font dependency; `\an5` would make the arc orbit the canvas --
+  see `spinner_ass`'s comment before touching the anchor). Every animation is a bounded
   loop that stops on a generation-counter bump; the spinner thread redraws only while a Play is in
   flight. Overlay draws hold the state mutex across their `osd-overlay` command and `clear()` holds
   it across its teardown, so a draw that passed the staleness check can never land after the
