@@ -33,13 +33,15 @@ This file is the project's committed home for project-intrinsic agent knowledge:
 - YouTube playback needs no daemon-side code: mpv's built-in `ytdl_hook` Lua script (same core in
   both CLI mpv and `libmpv2`) auto-detects non-direct-media URLs and shells out to `yt-dlp` on
   `PATH`, unconditionally, with no libmpv init tweaks required — see README's "How YouTube
-  playback works". `yt-dlp` is a runtime-only dependency, wired into `flake.nix` via
-  `makeWrapper`/`wrapProgram` rather than `buildInputs`, since it's invoked as a subprocess, not
-  linked. Its one real (non-mocked) test in `daemon/src/player.rs`
-  (`real_youtube_url_resolves_and_plays_via_ytdl_hook`) needs network + `yt-dlp` on `PATH`, so it's
-  `#[ignore]`d — the `nix build`/`nix flake check` sandbox has no network. Run it manually with
-  `nix shell nixpkgs#yt-dlp -c cargo test -- --ignored` (from `nix develop`, or with cargo/rustc
-  otherwise on `PATH`).
+  playback works". `yt-dlp` is a runtime-only dependency: the packaged `nix build` binary gets it
+  via `makeWrapper`/`wrapProgram` (not `buildInputs`, since it's invoked as a subprocess, not
+  linked), and `devShells.default` separately lists `pkgs.yt-dlp` in `packages` for the same
+  reason -- `inputsFrom` only pulls a package's buildInputs/nativeBuildInputs, never its
+  `postFixup` wrapping, so the dev shell needs its own copy or `cargo build`/`cargo run` there
+  silently lack `yt-dlp` on `PATH`. Its one real (non-mocked) test in `daemon/src/player.rs`
+  (`real_youtube_url_resolves_and_plays_via_ytdl_hook`) needs network, so it's `#[ignore]`d — the
+  `nix build`/`nix flake check` sandbox has no network. Run it manually with
+  `nix develop -c cargo test -- --ignored` (yt-dlp is already on `PATH` there).
 - Async mpv playback errors (e.g. `ytdl_hook`/`yt-dlp` failing to resolve a URL) don't surface from
   `Player::play`'s `loadfile` call — that only queues the load; mpv resolves/opens it later, off
   that call stack. `player.rs`'s `spawn_error_logger` catches these via a second `Mpv` client

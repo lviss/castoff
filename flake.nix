@@ -89,7 +89,14 @@
 
       devShells.${system}.default = pkgs.mkShell {
         inputsFrom = [ castoff-daemon ];
-        packages = [ pkgs.cargo pkgs.rustc pkgs.rust-analyzer pkgs.clippy ];
+        # `inputsFrom` only pulls in `castoff-daemon`'s buildInputs/nativeBuildInputs
+        # (mpv-unwrapped, makeWrapper); it does NOT carry over that package's
+        # `postFixup` PATH wrapping. Without `pkgs.yt-dlp` listed here too,
+        # `cargo build`/`cargo run` inside this dev shell produces an
+        # unwrapped binary with no `yt-dlp` on `PATH`, so YouTube playback
+        # silently fails (mpv's ytdl_hook has nothing to shell out to) even
+        # though `nix build` (which does apply the wrapper) works fine.
+        packages = [ pkgs.cargo pkgs.rustc pkgs.rust-analyzer pkgs.clippy pkgs.yt-dlp ];
       };
     };
 }

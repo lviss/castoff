@@ -82,6 +82,9 @@ public content. `yt-dlp` is declared as a runtime dependency of the `castoff-dae
 (`flake.nix`): the built binary is wrapped (`makeWrapper`) to prepend `yt-dlp`'s Nix store path to
 `PATH`, so this works regardless of the caller's environment (e.g. the `cage` kiosk session, which
 execs the binary directly with no shell) -- not merely assumed present on some machine's `PATH`.
+`devShells.default` also lists `yt-dlp` directly (see [Dev shell](#dev-shell)): `inputsFrom` alone
+doesn't carry over that wrapping, so a plain `cargo build`/`cargo run` in `nix develop` would
+otherwise silently lack `yt-dlp` on `PATH`.
 
 ## Building and running
 
@@ -141,7 +144,7 @@ nix build .#tv-box-vm
 ### Dev shell
 
 ```sh
-nix develop   # cargo, rustc, rust-analyzer, clippy, with mpv already wired up for linking
+nix develop   # cargo, rustc, rust-analyzer, clippy, yt-dlp, with mpv already wired up for linking
 cd daemon && cargo build && cargo clippy
 ```
 

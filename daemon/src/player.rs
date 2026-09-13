@@ -448,12 +448,12 @@ mod tests {
     /// `ytdl_hook` (see README's "How YouTube playback works"): no daemon
     /// code shells out to `yt-dlp` itself, mpv's bundled Lua script does,
     /// automatically, for any URL it doesn't recognize as directly playable.
-    /// Requires network access and `yt-dlp` on `PATH` (the flake's dev shell
-    /// does not add `yt-dlp`; e.g. run
-    /// `nix shell nixpkgs#yt-dlp -c cargo test -- --ignored`), so this is
-    /// `#[ignore]`d by default: the sandboxed `nix build`/`nix flake check`
-    /// checkPhase has no network access, and `yt-dlp` is a runtime-only
-    /// dependency (see flake.nix), not a build input.
+    /// Requires network access and `yt-dlp` on `PATH` (already the case in
+    /// `nix develop`'s dev shell -- see `devShells.default` in flake.nix),
+    /// so this is `#[ignore]`d by default: the sandboxed `nix build`/
+    /// `nix flake check` checkPhase has no network access, and `yt-dlp` is a
+    /// runtime-only dependency (see flake.nix), not a build input. Run with
+    /// `nix develop -c cargo test -- --ignored`.
     #[test]
     #[ignore = "requires network access and yt-dlp on PATH; run with `cargo test -- --ignored`"]
     fn real_youtube_url_resolves_and_plays_via_ytdl_hook() {
