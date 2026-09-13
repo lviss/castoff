@@ -19,10 +19,24 @@ use libmpv2::{Format, Mpv};
 /// property is ever observed on a given `Mpv`, so any id works.
 const EOF_WATCH_ID: u64 = 1;
 
+/// `osd-overlay` id the currently-shown idle screen draws into. Only one
+/// idle screen is ever shown at a time, so every variant sharing this one id
+/// is enough for `IdleScreenController::hide` to clear it generically.
+const OSD_OVERLAY_ID: i64 = 9000;
+
+/// Virtual ASS canvas the clock is drawn on; mpv scales this to whatever the
+/// real output resolution is, so positions/sizes below are resolution
+/// independent.
+const CANVAS_WIDTH: i64 = 1920;
+const CANVAS_HEIGHT: i64 = 1080;
+/// ~33% of the canvas height.
+const CLOCK_FONT_SIZE: i64 = 356;
+
 /// Content shown while nothing is playing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IdleScreen {
-    /// A simple on-screen clock (local time, `HH:MM:SS`).
+    /// A simple on-screen clock (local time, `HH:MM`), centered on a blank
+    /// background.
     Clock,
 }
 
@@ -36,23 +50,45 @@ impl IdleScreen {
         }
     }
 
-    /// Draw one frame of this idle screen using mpv's own OSD facilities,
-    /// rather than a second rendering stack or a second Cage-visible client.
+    /// Draw one frame of this idle screen using mpv's own OSD facilities
+    /// (an ASS overlay), rather than a second rendering stack or a second
+    /// Cage-visible client.
     fn render(self, mpv: &Mpv) -> Result<()> {
         match self {
             IdleScreen::Clock => {
-                let text = local_time_hh_mm_ss();
-                // A duration comfortably longer than the redraw tick below,
-                // so refreshing it every tick never lets it blink off in
-                // between.
-                mpv.command("show-text", &[&text, "1500"])
-                    .map_err(|e| anyhow::anyhow!("show-text failed: {e:?}"))
+                let text = local_time_hh_mm();
+                let cx = CANVAS_WIDTH / 2;
+                let cy = CANVAS_HEIGHT / 2;
+                // Two ASS override blocks in one event: an opaque black
+                // rectangle covering the whole canvas -- so the last video
+                // frame doesn't linger behind the clock -- followed by the
+                // time, centered (`\an5`) on top of it at a large font size.
+                let data = format!(
+                    "{{\\an7\\pos(0,0)\\1c&H000000&\\1a&H00&\\bord0\\shad0\\p1}}\
+                     m 0 0 l {w} 0 l {w} {h} l 0 {h}\
+                     {{\\p0}}\
+                     {{\\an5\\pos({cx},{cy})\\1c&HFFFFFF&\\1a&H00&\\fs{fs}\\bord0\\shad0}}{text}",
+                    w = CANVAS_WIDTH,
+                    h = CANVAS_HEIGHT,
+                    fs = CLOCK_FONT_SIZE,
+                );
+                mpv.command(
+                    "osd-overlay",
+                    &[
+                        &OSD_OVERLAY_ID.to_string(),
+                        "ass-events",
+                        &data,
+                        &CANVAS_WIDTH.to_string(),
+                        &CANVAS_HEIGHT.to_string(),
+                    ],
+                )
+                .map_err(|e| anyhow::anyhow!("osd-overlay failed: {e:?}"))
             }
         }
     }
 }
 
-fn local_time_hh_mm_ss() -> String {
+fn local_time_hh_mm() -> String {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -60,7 +96,7 @@ fn local_time_hh_mm_ss() -> String {
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     // SAFETY: `tm` is a plain-old-data struct `localtime_r` fully populates.
     unsafe { libc::localtime_r(&secs, &mut tm) };
-    format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec)
+    format!("{:02}:{:02}", tm.tm_hour, tm.tm_min)
 }
 
 #[derive(Default)]
@@ -133,12 +169,14 @@ impl IdleScreenController {
         if !hid {
             return Ok(());
         }
-        // Empty text with an effectively-instant duration: clears the OSD
-        // right away instead of waiting out whatever duration the last
-        // render() used.
+        // format="none" removes the overlay outright, rather than replacing
+        // it with empty content.
         self.mpv
-            .command("show-text", &["", "1"])
-            .map_err(|e| anyhow::anyhow!("show-text (clear) failed: {e:?}"))
+            .command(
+                "osd-overlay",
+                &[&OSD_OVERLAY_ID.to_string(), "none", ""],
+            )
+            .map_err(|e| anyhow::anyhow!("osd-overlay (clear) failed: {e:?}"))
     }
 
     /// Spawn the background thread that watches for mpv reaching

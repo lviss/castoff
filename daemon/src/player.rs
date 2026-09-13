@@ -317,7 +317,7 @@ mod tests {
     /// Exercises the idle screen through all three triggers the spec calls
     /// for -- startup, natural end-of-file with nothing queued, and Stop --
     /// plus the one place it must disappear (a real Play). `show`/`hide`
-    /// each round-trip through a real `mpv.command("show-text", ...)` call
+    /// each round-trip through a real `mpv.command("osd-overlay", ...)` call
     /// (propagating any mpv error via `?`), and the eof case is driven by
     /// mpv's own `eof-reached` property flipping on a real synthetic clip
     /// rather than the test calling `show_idle_screen` itself, so this is
