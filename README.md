@@ -97,8 +97,11 @@ If playback still fails (private or removed video, an extractor regression, a CD
 daemon does not fail silently: it turns on mpv's own `terminal` logging (`msg-level=all=warn`), so
 mpv's concrete error line (e.g. `[ffmpeg] https: HTTP error 403 Forbidden` or
 `[ytdl_hook] youtube-dl failed: ...`) is written to the daemon's stderr/journal, and the
-async-error listener (`daemon/src/player.rs`) logs the failing URL together with a
-plain-language reason (libmpv2's own error display is only `Raw(<int>)`).
+async-error listener (`daemon/src/player.rs`) logs the URL most recently submitted to mpv
+together with a plain-language reason (libmpv2's own error display is only `Raw(<int>)`).
+That URL attribution is best-effort: if a newer Play replaces an in-flight one before mpv's
+error event is drained, the logged URL may name the newer request rather than the one that
+actually failed.
 
 ## Building and running
 

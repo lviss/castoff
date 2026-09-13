@@ -17,8 +17,11 @@ pub struct Player {
     idle: Arc<IdleScreenController>,
     /// The most recently requested Play `url`, kept only so the background
     /// error listener (`spawn_error_logger`) can name which target a later
-    /// async mpv error belongs to; mpv plays one file at a time, so "most
-    /// recent" is always the right one to blame.
+    /// async mpv error most likely belongs to. Attribution is best-effort
+    /// toward the most recently submitted URL: an error already queued by
+    /// mpv can be drained after a newer `play()` has replaced the slot, so
+    /// the logged URL may be the newer request rather than the one that
+    /// actually failed.
     last_target: Arc<Mutex<String>>,
 }
 
