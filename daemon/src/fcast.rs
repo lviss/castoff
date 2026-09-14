@@ -133,6 +133,12 @@ pub async fn write_empty<W: AsyncWrite + Unpin>(stream: &mut W, opcode: Opcode) 
 /// `volume`/`speed` accommodate FCast's existing knobs; there is deliberately
 /// no `quality` field yet (see README roadmap: playback-quality selection is
 /// a later, additive field on this same message, not a breaking rework).
+///
+/// `container` is FCast's MIME-type field (docs.fcast.org/protocol/v2 calls
+/// it "The MIME type (video/mp4)"). castoff reuses it to route between its
+/// two content types -- mpv (media) and the browser engine (web pages) --
+/// exactly as a MIME type is meant to be routed on, so no new opcode, field
+/// or protocol version is needed (see `PlayMessage::explicit_target`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PlayMessage {
     #[serde(default)]
@@ -149,6 +155,52 @@ pub struct PlayMessage {
     pub speed: Option<f64>,
     #[serde(default)]
     pub headers: Option<HashMap<String, String>>,
+}
+
+/// `Play.container` MIME types that mean "render this URL as a web page in a
+/// browser engine" rather than "play this URL as media in mpv". Case
+/// insensitive; `text/html` is what a dashboard/document sender should use.
+const WEBPAGE_CONTAINERS: [&str; 2] = ["text/html", "application/xhtml+xml"];
+
+/// What a `Play` should be handed to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlayTarget {
+    /// mpv: a media file, stream, or a source `yt-dlp` can resolve (e.g. a
+    /// YouTube watch URL).
+    Media,
+    /// The browser engine: a web page.
+    Webpage,
+}
+
+impl PlayMessage {
+    /// The target the sender *explicitly* asked for through FCast's
+    /// `container` MIME-type field, or `None` when it did not say (no
+    /// `container`, an empty one, or only MIME parameters).
+    ///
+    /// `container` is FCast's own MIME field
+    /// ([docs.fcast.org/protocol/v2](https://docs.fcast.org/protocol/v2)
+    /// documents it as "The MIME type (video/mp4)"), so a sender that sets it
+    /// stays in control: a web MIME type ([`WEBPAGE_CONTAINERS`]) means the
+    /// browser, anything else means mpv. A `None` return means the daemon
+    /// decides for itself (see README's routing rules and `Player::play`) --
+    /// which is what lets a sender that only knows a URL cast media, YouTube
+    /// and web pages alike.
+    pub fn explicit_target(&self) -> Option<PlayTarget> {
+        // A MIME type may carry parameters (`text/html; charset=utf-8`), so
+        // route on the media type alone.
+        let media_type = self.container.as_deref()?.split(';').next()?.trim();
+        if media_type.is_empty() {
+            return None;
+        }
+        if WEBPAGE_CONTAINERS
+            .iter()
+            .any(|webpage| media_type.eq_ignore_ascii_case(webpage))
+        {
+            Some(PlayTarget::Webpage)
+        } else {
+            Some(PlayTarget::Media)
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -235,6 +287,66 @@ mod tests {
         ] {
             let decoded: PlaybackState = serde_json::from_str(raw).unwrap();
             assert_eq!(decoded, expected);
+        }
+    }
+
+    /// The `container` MIME type is what routes a `Play` between mpv (media)
+    /// and the browser engine (web pages); see `explicit_target`'s doc
+    /// comment. `None` means the daemon decides for itself.
+    #[test]
+    fn play_container_mime_type_is_an_explicit_target_override() {
+        for container in [
+            "text/html",
+            "TEXT/HTML",
+            " text/html ",
+            "application/xhtml+xml",
+            "text/html; charset=utf-8",
+            "text/html ;charset=UTF-8",
+            "application/xhtml+xml;charset=utf-8",
+        ] {
+            let msg = PlayMessage {
+                container: Some(container.to_string()),
+                url: Some("http://example.invalid/dashboard".to_string()),
+                ..Default::default()
+            };
+            assert_eq!(
+                msg.explicit_target(),
+                Some(PlayTarget::Webpage),
+                "container {container:?} must select a web page"
+            );
+        }
+
+        for container in [
+            "video/mp4",
+            "audio/mpeg",
+            "text/plain",
+            "video/mp4; codecs=\"avc1.42E01E\"",
+        ] {
+            let msg = PlayMessage {
+                container: Some(container.to_string()),
+                url: Some("https://example.invalid/watch.mp4".to_string()),
+                ..Default::default()
+            };
+            assert_eq!(
+                msg.explicit_target(),
+                Some(PlayTarget::Media),
+                "container {container:?} must stay on the media path"
+            );
+        }
+
+        // No `container`, an empty one, or nothing but MIME parameters: the
+        // sender did not say, so the daemon decides (see `Player::play`).
+        for container in [None, Some(""), Some("   "), Some("; charset=utf-8")] {
+            let msg = PlayMessage {
+                container: container.map(str::to_string),
+                url: Some("https://example.invalid/unknown".to_string()),
+                ..Default::default()
+            };
+            assert_eq!(
+                msg.explicit_target(),
+                None,
+                "container {container:?} must leave the decision to the daemon"
+            );
         }
     }
 }

@@ -88,19 +88,80 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   (`real_youtube_url_resolves_and_plays_via_ytdl_hook`) needs network, so it's `#[ignore]`d — the
   `nix build`/`nix flake check` sandbox has no network. Run it manually with
   `nix develop -c cargo test -- --ignored` (yt-dlp is already on `PATH` there).
+- That `yt-dlp` difference is exactly why a test must not poll mpv's `path` property to prove "mpv
+  was handed this URL": mpv clears `path` (it becomes `MPV_ERROR_PROPERTY_UNAVAILABLE`, and
+  `playlist-count` drops to 0) the moment a load fails. The dev shell's `yt-dlp` makes mpv's
+  `ytdl_hook` intercept the URL and delay the failure, so the poll wins there; the `nix flake
+  check` sandbox has no `yt-dlp`, the failure is immediate, and the poll never sees the property.
+  Hold the load open instead — a loopback server that waits for the test's go-ahead before
+  answering (`serve_gated_failure` in `player.rs`) makes the observation deterministic in both
+  environments.
 - Async mpv playback errors (e.g. `ytdl_hook`/`yt-dlp` failing to resolve a URL) don't surface from
   `Player::play`'s `loadfile` call — that only queues the load; mpv resolves/opens it later, off
-  that call stack. `player.rs`'s `spawn_error_logger` catches these via a second `Mpv` client
-  handle (`Mpv::create_client`) dedicated to blocking on `wait_event(-1.0)`, logging any `Err` at
-  `error!` with the most recently submitted url (attribution is best-effort — see README's "How
-  YouTube playback works") — event-driven, not a polling loop.
+  that call stack. `player.rs`'s `spawn_async_event_watcher` catches these via a second `Mpv` client
+  handle (`Mpv::create_client`) dedicated to blocking on `wait_event`, logging a tracked load's
+  error at `error!` — event-driven, not a polling loop. Attribution is by mpv's own
+  `playlist_entry_id`, not by submission order: `loadfile` creates a playlist entry whose id is
+  read back from `playlist/0/id`, and mpv reports that id on
+  `MPV_EVENT_END_FILE`/`MPV_EVENT_START_FILE`. The watcher therefore reads events through the
+  raw `libmpv2-sys` `mpv_wait_event` (with a direct
+  `libmpv2-sys` dependency), because libmpv2's safe `Event::EndFile` keeps only the reason and
+  error code and drops the id. Only the newest submission is tracked (`Routing`), and an event for
+  any other entry — a playlist mpv expanded the URL into, or a superseded `Play` — simply does not
+  match and is ignored, so it can neither clear nor consume a newer `Play`'s routing probe. Only a
+  probe that never loaded falls back to the browser; an error that matches no submission belongs to
+  no tracked load, so it is logged at `debug` by entry id alone and is never attributed to the URL
+  the daemon is now on (see README's "How YouTube playback works"). `FileLoaded` has no id of its
+  own, so it is attributed through the `StartFile` that precedes it.
 - libmpv disables its own log output by default, so a failed load used to be a silent black
   screen; `Player::new` sets `terminal=yes`/`msg-level=all=warn` so mpv's concrete error line
   (e.g. `[ffmpeg] https: HTTP error 403 Forbidden`, `[ytdl_hook] ... failed`) reaches the daemon's
   stderr/journal. libmpv2's `Error` `Display` is only `Raw(<int>)` (`-16` is
-  `MPV_ERROR_NOTHING_TO_PLAY`), so `spawn_error_logger` pairs it with
+  `MPV_ERROR_NOTHING_TO_PLAY`), so `spawn_async_event_watcher` pairs it with
   `describe_playback_error`'s plain-language reason; keep new async-error paths going through that
   logging rather than adding a second mechanism.
+- Web page display (`daemon/src/webpage.rs`) launches Chromium as a *second client of the same Cage
+  session*, never as a screenshot loop and never on a second compositor: Cage renders views in map
+  order (`cage/view.c` — `view_map` appends the new surface's scene node, `view_unmap` destroys
+  it), so the engine sits on top of mpv's window, and taking it down reveals mpv's idle clock
+  again — see README's "How webpage (dashboard) display works". `chromium` is therefore a second
+  runtime dependency of the packaged binary (`makeWrapper` PATH in `flake.nix`, plus
+  `devShells.default`), alongside `yt-dlp`. A `Play` is routed by FCast's `container` MIME field
+  (`PlayMessage::explicit_target` in `daemon/src/fcast.rs`), so no protocol change was needed.
+- Cage registers `wlr_screencopy_v1` (`cage.c`), so any Cage session can be screen-captured with
+  `grim`. `daemon/tests/webpage_display.rs` uses that for real (non-mocked) pixel assertions: it
+  starts Cage on wlroots' headless backend (`WLR_BACKENDS=headless` — no GPU, display or X server
+  needed) with the real daemon binary as its client, serves a page over loopback, and checks what
+  the compositor actually composites. It is `#[ignore]`d (needs `cage`, `chromium`, `grim`) and is
+  also run by the package's Nix build (`postCheck`, after the default `checkPhase` has skipped it).
+  Knobs: `CASTOFF_E2E_SKIP_MPV_PIXELS` (see two bullets down), `CASTOFF_E2E_BROWSER_FLAGS`
+  (test-only Chromium flags, e.g. `--no-sandbox --disable-gpu`), `CASTOFF_BROWSER` (browser
+  program; the unit tests point it at stub scripts).
+- mpv's `vo=gpu` needs a buffer-sharing path that a compositor only has with a GL renderer. In a
+  GL-less environment (the Nix build sandbox: no `/dev/dri`, so wlroots picks the pixman renderer)
+  mpv cannot present *and* aborts the whole daemon with an assertion inside its own context probing
+  (`vo_x11_init: Assertion '!vo->x11' failed`, still happens with `DISPLAY` unset). The end-to-end
+  test therefore runs the daemon with `CASTOFF_MPV_VO=null` there and skips only mpv's pixel
+  assertions — Chromium presents over shared memory, so the page pixels are still asserted. Keep
+  the `vo` default (`gpu`) for the appliance.
+- A `Play` whose sender did not set FCast's `container` MIME type is *decided by the daemon*, not
+  by the client: try the media path (mpv) first and hand the URL to the browser engine if mpv
+  reports the load failed before it loaded the file (`MPV_EVENT_END_FILE` with an error, which
+  libmpv2 surfaces as `Some(Err(_))` from `wait_event`; a *superseded* load ends with reason STOP
+  instead, verified against mpv 0.41, so the two are tellable apart in practice). That is what
+  keeps YouTube on the video path without any host list or Content-Type probe -- YouTube watch
+  URLs are `text/html`, which is exactly the trap -- see README's "How the daemon decides between
+  media and a web page" for the measurements and reasoning. `container`
+  (`PlayMessage::explicit_target`) remains an explicit override in both directions, and a load
+  that started playing is never re-routed: a load is marked as media as soon as mpv reports
+  `MPV_EVENT_FILE_LOADED`, so only a load that never loaded at all stays fallback-eligible.
+- The daemon's own log goes to **stderr** (`main.rs` uses `tracing_subscriber::fmt()
+  .with_writer(std::io::stderr)`), alongside mpv's, Cage's and Chromium's output. It used to go to
+  stdout, which the Nix build sandbox does not forward to a client's redirected fd: the e2e test's
+  console assertions silently saw only the other processes' stderr, and the daemon's own lines
+  were lost there. `start_session_with` now asserts the captured console contains the daemon's
+  startup line, so a harness that stops capturing fails loudly instead of weakening every console
+  assertion.
 - "Playback actually started rendering" is mpv's `PlaybackRestart` event, not the `loadfile` call
   returning (that only queues the load). A third `Mpv` client (`spawn_lifecycle_watcher`) consumes
   it and takes the spinner down; a fresh client must `enable_event` it (`libmpv2`'s
@@ -113,8 +174,20 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   that property watcher), so the EOF arm is defensive; it could not be produced end-to-end in
   tests, so `end_of_file_without_playback_restart_returns_to_idle_clock` drives
   `handle_lifecycle_event` directly with the real event. Each mpv event consumer (idle-screen eof
-  watcher on the main handle, error logger, lifecycle watcher) has its own client/queue to avoid
-  contention.
+  watcher on the main handle, the routing/error watcher `spawn_async_event_watcher`, and the
+  lifecycle watcher) has its own client/queue to avoid contention.
+
+- Chromium's process-singleton socket is created under the engine's **`TMPDIR`**
+  (`<TMPDIR>/org.chromium.Chromium.<random>/SingletonSocket`), *not* under `--user-data-dir`:
+  verified against the pinned Chromium -- a deep `TMPDIR` aborts with
+  `FATAL ... Socket path too long` (exit 133) even with a short profile, while a short `TMPDIR`
+  with a deep profile works. The captain's box had a generated nix-shell `TMPDIR` ~120 characters
+  deep, so the engine died before painting and the page never appeared. `daemon/src/webpage.rs`
+  therefore gives the engine a fixed short `TMPDIR` *and* profile root (`/tmp`,
+  `CASTOFF_BROWSER_PROFILE_DIR` to move it), checks both fit Chromium's 107-byte socket limit and
+  refuses with a plain-language console error otherwise, and `daemon/tests/webpage_display.rs`
+  runs every session's daemon under a deliberately deep `TMPDIR` so the page cases cover this.
+  Don't reintroduce `std::env::temp_dir()` for either path.
 
 ## Maintaining this file
 

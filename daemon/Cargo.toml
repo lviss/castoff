@@ -7,6 +7,11 @@ description = "TV-box daemon for castoff: drives mpv and exposes an FCast-based 
 
 [dependencies]
 libmpv2 = "6"
+# Raw client-API bindings, for the one thing libmpv2's safe event enum drops:
+# `mpv_event_end_file.playlist_entry_id`. The daemon attributes async mpv load
+# outcomes to the exact `loadfile` submission they belong to by that id (see
+# `daemon/src/player.rs`), which the safe `Event::EndFile` cannot express.
+libmpv2-sys = "4"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "sync"] }
 serde = { version = "1", features = ["derive"] }
 serde_repr = "0.1"
@@ -15,6 +20,11 @@ tracing = "0.1"
 tracing-subscriber = "0.3"
 anyhow = "1"
 libc = "0.2"
+
+[dev-dependencies]
+# Only used by `tests/webpage_display.rs`, which decodes the compositor's
+# `wlr-screencopy` output (`grim`, a PNG) to assert on real rendered pixels.
+png = "0.17"
 
 [[bin]]
 name = "castoff-daemon"

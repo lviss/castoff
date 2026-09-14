@@ -2,8 +2,11 @@
 
 # NixOS module for the castoff TV-box appliance: boots straight into Cage
 # (a wlroots-based single-app Wayland kiosk compositor, no desktop
-# environment or display manager) running exactly one client: the castoff
-# daemon, which itself embeds mpv and owns the whole screen.
+# environment or display manager) running the castoff daemon as its client.
+# The daemon embeds mpv to play media and spawns Chromium as a second client
+# of the same Cage session to display web pages; Cage stacks the newer
+# client on top, so a cast page covers mpv and taking it down reveals mpv's
+# idle clock again.
 #
 # Adapted from the kiosk pattern in matthewbauer/nixos-kiosk and
 # matthewbauer/nixiosk (both: NixOS + Cage, one dedicated "kiosk" user,
