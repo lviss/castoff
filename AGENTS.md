@@ -99,19 +99,20 @@ This file is the project's committed home for project-intrinsic agent knowledge:
 - Async mpv playback errors (e.g. `ytdl_hook`/`yt-dlp` failing to resolve a URL) don't surface from
   `Player::play`'s `loadfile` call — that only queues the load; mpv resolves/opens it later, off
   that call stack. `player.rs`'s `spawn_async_event_watcher` catches these via a second `Mpv` client
-  handle (`Mpv::create_client`) dedicated to blocking on `wait_event`, logging any error at
-  `error!` — event-driven, not a polling loop. Attribution is by mpv's own `playlist_entry_id`,
-  not by submission order: `loadfile` creates a playlist entry whose id is read back from
-  `playlist/0/id`, and mpv reports that id on `MPV_EVENT_END_FILE`/`MPV_EVENT_START_FILE`. The
-  watcher therefore reads events through the raw `libmpv2-sys` `mpv_wait_event` (with a direct
+  handle (`Mpv::create_client`) dedicated to blocking on `wait_event`, logging a tracked load's
+  error at `error!` — event-driven, not a polling loop. Attribution is by mpv's own
+  `playlist_entry_id`, not by submission order: `loadfile` creates a playlist entry whose id is
+  read back from `playlist/0/id`, and mpv reports that id on
+  `MPV_EVENT_END_FILE`/`MPV_EVENT_START_FILE`. The watcher therefore reads events through the
+  raw `libmpv2-sys` `mpv_wait_event` (with a direct
   `libmpv2-sys` dependency), because libmpv2's safe `Event::EndFile` keeps only the reason and
   error code and drops the id. Only the newest submission is tracked (`Routing`), and an event for
   any other entry — a playlist mpv expanded the URL into, or a superseded `Play` — simply does not
   match and is ignored, so it can neither clear nor consume a newer `Play`'s routing probe. Only a
-  probe that never loaded falls back to the browser; `last_target` is used only for an error that
-  matches no submission (attribution there stays best-effort — see README's "How YouTube playback
-  works"). `FileLoaded` has no id of its own, so it is attributed through the `StartFile` that
-  precedes it.
+  probe that never loaded falls back to the browser; an error that matches no submission belongs to
+  no tracked load, so it is logged at `debug` by entry id alone and is never attributed to the URL
+  the daemon is now on (see README's "How YouTube playback works"). `FileLoaded` has no id of its
+  own, so it is attributed through the `StartFile` that precedes it.
 - libmpv disables its own log output by default, so a failed load used to be a silent black
   screen; `Player::new` sets `terminal=yes`/`msg-level=all=warn` so mpv's concrete error line
   (e.g. `[ffmpeg] https: HTTP error 403 Forbidden`, `[ytdl_hook] ... failed`) reaches the daemon's

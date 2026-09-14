@@ -7,7 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::Result;
 use libmpv2::events::{mpv_event_id, Event};
 use libmpv2::Mpv;
-use tracing::{error, warn};
+use tracing::{debug, error, warn};
 
 use crate::fcast::{PlayMessage, PlayTarget, PlaybackState, PlaybackUpdateMessage};
 use crate::idle_screen::{IdleScreen, IdleScreenController};
@@ -23,21 +23,13 @@ pub struct Player {
     /// Loading spinner and start/stop fade drawn on top of whatever mpv is
     /// showing (see `overlay.rs`).
     overlay: Arc<PlaybackOverlay>,
-    /// The most recently submitted Play `url`. `spawn_async_event_watcher`
-    /// uses it only for an async mpv error that matches no `Routing`
-    /// submission (a playlist entry mpv expanded, or mpv's own idle state);
-    /// a submitted load's own error is attributed by that submission's
-    /// playlist entry id, not by this. For that unmatched case attribution
-    /// stays best-effort toward the most recently submitted URL.
-    last_target: Arc<Mutex<String>>,
     /// Serializes whole `play`/`stop` operations. The media path and the
     /// webpage path touch each other's state (a webpage `Play` stops mpv and
     /// raises the idle clock; a media `Play` takes the browser down and hides
     /// the clock), so without this a webpage `Play` on one FCast connection
     /// can interleave with a media `Play` on another and leave the clock
-    /// painted over playing video. `last_target` alone only ordered the
-    /// media path; this covers the cross-resource handoff. The asynchronous
-    /// fallback in `spawn_async_event_watcher` takes it too.
+    /// painted over playing video. The asynchronous fallback in
+    /// `spawn_async_event_watcher` takes it too.
     operation: Arc<Mutex<()>>,
     /// The in-flight `loadfile` submission and the daemon's own
     /// media-vs-web-page decision for it (`Play`s whose sender did not
@@ -217,14 +209,13 @@ impl Player {
         })
         .map_err(|e| anyhow::anyhow!("failed to initialize mpv: {e:?}"))?;
         let mpv = Arc::new(mpv);
-        let last_target = Arc::new(Mutex::new(String::new()));
-        let player = Self::from_mpv(mpv, last_target)?;
+        let player = Self::from_mpv(mpv)?;
         player.show_idle_screen(IdleScreen::Clock)?;
         Ok(player)
     }
 
-    fn from_mpv(mpv: Arc<Mpv>, last_target: Arc<Mutex<String>>) -> Result<Self> {
-        Self::build(mpv, last_target, Arc::new(WebpageController::from_env()))
+    fn from_mpv(mpv: Arc<Mpv>) -> Result<Self> {
+        Self::build(mpv, Arc::new(WebpageController::from_env()))
     }
 
     /// `from_mpv` with a caller-supplied browser program, so tests can drive
@@ -232,19 +223,11 @@ impl Player {
     /// spontaneous exit) without a compositor or a real engine -- the engine
     /// itself is covered end-to-end by `daemon/tests/webpage_display.rs`.
     #[cfg(test)]
-    fn with_browser(mpv: Arc<Mpv>, last_target: Arc<Mutex<String>>, program: &str) -> Result<Self> {
-        Self::build(
-            mpv,
-            last_target,
-            Arc::new(WebpageController::with_program(program)),
-        )
+    fn with_browser(mpv: Arc<Mpv>, program: &str) -> Result<Self> {
+        Self::build(mpv, Arc::new(WebpageController::with_program(program)))
     }
 
-    fn build(
-        mpv: Arc<Mpv>,
-        last_target: Arc<Mutex<String>>,
-        webpage: Arc<WebpageController>,
-    ) -> Result<Self> {
+    fn build(mpv: Arc<Mpv>, webpage: Arc<WebpageController>) -> Result<Self> {
         let idle = Arc::new(IdleScreenController::new(Arc::clone(&mpv)));
         let overlay = Arc::new(PlaybackOverlay::new(Arc::clone(&mpv)));
         idle.spawn_eof_watcher();
@@ -252,7 +235,6 @@ impl Player {
         let routing = Arc::new(Mutex::new(Routing::default()));
         spawn_async_event_watcher(
             &mpv,
-            Arc::clone(&last_target),
             Arc::clone(&idle),
             Arc::clone(&webpage),
             Arc::clone(&routing),
@@ -264,7 +246,6 @@ impl Player {
             idle,
             overlay,
             webpage,
-            last_target,
             operation,
             routing,
         })
@@ -375,23 +356,12 @@ impl Player {
             let _ = self.abort_loading_to_idle();
             return Err(e);
         }
-        // `last_target` is written before the `loadfile` submission: the
-        // background event watcher (see `spawn_async_event_watcher`) names the
-        // target of an async error that matches no `Routing` submission, and
-        // stale attribution there would be wrong. A submitted load's own
-        // error is attributed by that submission's playlist entry id instead
-        // (see `Routing`). `play` holds the operation lock for the whole call,
-        // so no two submissions can interleave.
-        let mut last_target = self.last_target.lock().unwrap();
-        *last_target = target.to_string();
         if let Err(e) = self.mpv.command("loadfile", &[target, "replace"]) {
-            drop(last_target);
             // Nothing will load, so no async error/restart is coming to take
             // the spinner down; do it here and fall back to the idle clock.
             let _ = self.abort_loading_to_idle();
             return Err(anyhow::anyhow!("loadfile failed for url {target:?}: {e:?}"));
         }
-        drop(last_target);
         // `loadfile` synchronously creates a playlist entry for the URL;
         // read back its id so the background event watcher can attribute this
         // load's `FileLoaded`/`EndFile` events to that exact entry instead of
@@ -654,12 +624,15 @@ fn to_mpv_volume(fcast_volume: f64) -> f64 {
 ///   loaded: it answers the daemon's own question -- this URL is not media --
 ///   so the URL is handed to the browser engine instead, logged at `warn`
 ///   because it is a normal outcome for a web page.
-/// - Otherwise (an explicit media `Play`, a load that had already loaded, or
-///   an error for an entry the daemon did not submit, such as a playlist mpv
-///   expanded) it is a genuine playback error, logged at `error`, with
+/// - Otherwise (an explicit media `Play`, or a load that had already loaded)
+///   it is a genuine playback error, logged at `error`, with
 ///   `describe_playback_error`'s plain-language reason next to mpv's own log
 ///   line (printed because `terminal=yes`, see `new()`), so the console
 ///   always says what went wrong instead of leaving a silent black screen.
+/// - An error for an entry the daemon did not submit -- a load a newer `Play`
+///   superseded, or an extra entry mpv expanded a playlist URL into -- belongs
+///   to no tracked submission, so it cannot be attributed to the URL the
+///   daemon is now on and is logged at `debug` by entry id alone.
 ///
 /// This blocks on mpv's event queue (`mpv_wait_event(-1.0)`) rather than
 /// polling, so it costs nothing until mpv actually has something to report,
@@ -674,7 +647,6 @@ fn to_mpv_volume(fcast_volume: f64) -> f64 {
 /// error code, and drops `playlist_entry_id`.
 fn spawn_async_event_watcher(
     mpv: &Mpv,
-    last_target: Arc<Mutex<String>>,
     idle: Arc<IdleScreenController>,
     webpage: Arc<WebpageController>,
     routing: Arc<Mutex<Routing>>,
@@ -746,22 +718,20 @@ fn spawn_async_event_watcher(
                              ytdl_hook/yt-dlp resolution failure or an HTTP error from the \
                              media/CDN host)"
                         ),
-                        // An error for an entry the daemon did not submit (a
-                        // playlist entry mpv expanded, or a superseded load):
-                        // nothing to route, so name the most recent target
-                        // best-effort for the log.
-                        None => {
-                            let url = last_target.lock().unwrap().clone();
-                            error!(
-                                url,
-                                error = ?error,
-                                reason = describe_playback_error(&error),
-                                "mpv reported an async playback error -- playback did not start; \
-                                 see the mpv log line(s) above for the underlying cause (e.g. a \
-                                 ytdl_hook/yt-dlp resolution failure or an HTTP error from the \
-                                 media/CDN host)"
-                            );
-                        }
+                        // An error for an entry the daemon did not submit
+                        // (a load a newer Play superseded, or an extra entry
+                        // mpv expanded a playlist URL into): it belongs to no
+                        // tracked submission, so it is not a playback error
+                        // for the URL the daemon is now on and must not be
+                        // logged as one.
+                        None => debug!(
+                            playlist_entry_id = end.playlist_entry_id,
+                            error = ?error,
+                            reason = describe_playback_error(&error),
+                            "mpv reported a load error for an entry the daemon is no longer \
+                             tracking (a superseded load or a playlist entry it expanded); see \
+                             the mpv log line(s) above for the underlying cause"
+                        ),
                     }
                 } else {
                     // The clean end (end-of-file, a playlist redirect, or a
@@ -958,7 +928,6 @@ mod tests {
         // watcher logs it) instead of launching a real Chromium.
         let player = Player::with_browser(
             headless_mpv(),
-            Arc::new(Mutex::new(String::new())),
             "/nonexistent/castoff-test-browser",
         )
         .expect("create player");
@@ -973,7 +942,6 @@ mod tests {
     fn headless_player_with_browser(program: &Path) -> Player {
         let player = Player::with_browser(
             headless_mpv(),
-            Arc::new(Mutex::new(String::new())),
             program.to_str().expect("stub browser path must be UTF-8"),
         )
         .expect("create player");
@@ -1383,23 +1351,35 @@ mod tests {
     #[test]
     fn play_with_url_hands_the_url_to_mpv_and_leaves_idle_state() {
         let player = headless_player();
+        // The loopback server holds its answer until released, so the load
+        // stays genuinely in flight (and mpv's `path` stays set) long enough
+        // to observe; a fast failure could clear the property first.
+        let (port, accepted, gate) = serve_gated_failure();
+        let url = format!("http://127.0.0.1:{port}/does-not-exist.mp4");
         let msg = PlayMessage {
             // An explicit media MIME type keeps this on the media path -- an
             // *unclassified* Play would instead be routed by the daemon, see
             // `unclassified_play_tries_media_before_falling_back_to_the_browser`.
             container: Some("video/mp4".to_string()),
-            url: Some("https://example.invalid/does-not-exist.mp4".to_string()),
+            url: Some(url.clone()),
             ..Default::default()
         };
 
         // A real (if unreachable) URL is accepted and queued for playback,
-        // unlike the `content`-only case above; mpv is the one that gets it
-        // (recorded under the same lock `loadfile` is submitted with).
+        // unlike the `content`-only case above; mpv is the one that gets it.
         player.play(&msg).expect("play with a url must be accepted");
+        accepted
+            .recv_timeout(Duration::from_secs(5))
+            .expect("mpv to reach the loopback server");
         assert_eq!(
-            player.last_target.lock().unwrap().clone(),
-            "https://example.invalid/does-not-exist.mp4"
+            player
+                .mpv
+                .get_property::<String>("path")
+                .unwrap_or_default(),
+            url,
+            "mpv must hold the URL as its in-flight media target"
         );
+        gate.release();
         // ... and it stays on the media path: an explicit media container
         // never falls back to the browser, however the load ends.
         std::thread::sleep(Duration::from_millis(200));
@@ -1674,19 +1654,16 @@ mod tests {
         );
     }
 
-    /// Regression test for a race between concurrent `play()` calls (one per
-    /// FCast connection, see `main.rs`'s per-connection `spawn_blocking`):
-    /// without holding `last_target`'s lock across both the write and the
-    /// `loadfile` submission, one thread's write and its `loadfile` call
-    /// could straddle another thread's write/`loadfile` pair, so the URL
-    /// mpv ends up actually loading and the URL recorded in `last_target`
-    /// (what `spawn_async_event_watcher` blames for a later async error) could
-    /// disagree. Hammers `play()` from many threads at once, releasing them
-    /// together via a `Barrier` to maximize interleaving, and asserts that
-    /// whatever mpv actually loaded always matches what `last_target` says
-    /// it loaded.
+    /// Regression test for ordering between concurrent `play()` calls (one
+    /// per FCast connection, see `main.rs`'s per-connection
+    /// `spawn_blocking`): the operation lock must serialize whole plays, so
+    /// whatever mpv ends up on is exactly the load `Routing` recorded last,
+    /// never an older submission's. Hammers `play()` from many threads at
+    /// once, releasing them together via a `Barrier` to maximize
+    /// interleaving, and asserts after every round that mpv's actual `path`
+    /// and playlist entry still match `Routing`'s newest submission.
     #[test]
-    fn concurrent_plays_keep_last_target_consistent_with_mpv() {
+    fn concurrent_plays_leave_mpv_on_the_last_submitted_load() {
         let player = headless_player();
         const THREADS: usize = 8;
         const ROUNDS: usize = 30;
@@ -1705,7 +1682,7 @@ mod tests {
                         let msg = PlayMessage {
                             url: Some(format!(
                                 "av://lavfi:testsrc=size=64x64:rate=10:duration={:.3}",
-                                5.0 + uid as f64 * 0.001
+                                600.0 + uid as f64 * 0.001
                             )),
                             ..Default::default()
                         };
@@ -1737,10 +1714,23 @@ mod tests {
             );
 
             let mpv_path: String = player.mpv.get_property("path").unwrap_or_default();
-            let recorded = player.last_target.lock().unwrap().clone();
+            let mpv_entry: i64 = player.mpv.get_property("playlist/0/id").unwrap_or_default();
+            let (url, entry_id) = {
+                let routing = player.routing.lock().unwrap();
+                let load = routing
+                    .current
+                    .as_ref()
+                    .expect("the last submitted load must still be tracked");
+                (load.url.clone(), load.entry_id)
+            };
             assert_eq!(
-                mpv_path, recorded,
-                "round {round}: last_target must always name whatever mpv actually loaded"
+                mpv_path, url,
+                "round {round}: mpv must be on the URL of the last submitted load"
+            );
+            assert_eq!(
+                Some(mpv_entry),
+                entry_id,
+                "round {round}: mpv's playlist entry must be the one Routing recorded"
             );
         }
     }
@@ -2074,6 +2064,32 @@ mod tests {
         assert_eq!(
             routing.resolve_error(3),
             Some(Resolution::FallBack(PAGE.to_string()))
+        );
+    }
+
+    /// A superseded probe's own error resolves no tracked submission, so it
+    /// can neither consume nor be blamed on the newer probe that replaced it:
+    /// the newer `Play` still falls back.
+    #[test]
+    fn superseded_load_error_does_not_resolve_the_newer_probe() {
+        const FIRST: &str = "http://127.0.0.1:1/media";
+        const SECOND: &str = "http://127.0.0.1:1/page";
+        let mut routing = Routing::default();
+
+        // Probe A (entry 1) is superseded by a newer probe B (entry 2)
+        // before A's error is drained.
+        routing.submit(FIRST, true, Some(1));
+        routing.submit(SECOND, true, Some(2));
+
+        // A's error matches no tracked submission (only B is tracked), so it
+        // is not a playback error for B.
+        assert_eq!(routing.resolve_error(1), None);
+
+        // B keeps its own probe and still reaches the browser.
+        assert_eq!(
+            routing.resolve_error(2),
+            Some(Resolution::FallBack(SECOND.to_string())),
+            "a superseded load's error must not consume or blame the newer probe"
         );
     }
 
