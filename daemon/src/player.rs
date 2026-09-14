@@ -796,14 +796,9 @@ fn spawn_async_event_watcher(
                     let _operation = operation.lock().unwrap();
                     let error = libmpv2::Error::Raw(end.error);
                     match routing.lock().unwrap().resolve_error(end.playlist_entry_id) {
-                        Some(Resolution::FallBack(url)) => fall_back_to_browser(
-                            &url,
-                            &error,
-                            &events,
-                            &idle,
-                            &webpage,
-                            &status_tx,
-                        ),
+                        Some(Resolution::FallBack(url)) => {
+                            fall_back_to_browser(&url, &error, &events, &idle, &webpage, &status_tx)
+                        }
                         Some(Resolution::PlaybackError(url)) => error!(
                             url,
                             error = ?error,

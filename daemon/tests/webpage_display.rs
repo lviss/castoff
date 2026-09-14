@@ -997,7 +997,9 @@ fn unclassified_playlist_then_page_displays_the_page() {
         "the browser engine must have fetched the page"
     );
     assert!(
-        session.console().contains("displaying it as a web page instead"),
+        session
+            .console()
+            .contains("displaying it as a web page instead"),
         "the console must say the page was handed to the browser; console tail:\n{}",
         console_tail(&session.console())
     );

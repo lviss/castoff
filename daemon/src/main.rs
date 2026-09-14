@@ -16,7 +16,7 @@ use tokio::time::MissedTickBehavior;
 use tracing::{debug, error, info, warn};
 
 use fcast::{
-    Opcode, PlaybackErrorMessage, PlaybackState, PlaybackUpdateMessage, PlayMessage, SeekMessage,
+    Opcode, PlayMessage, PlaybackErrorMessage, PlaybackState, PlaybackUpdateMessage, SeekMessage,
     SetSpeedMessage, SetVolumeMessage, VersionMessage,
 };
 use player::Player;
@@ -359,7 +359,11 @@ mod tests {
             .await
             .expect("read frame")
             .expect("frame present, not EOF");
-        assert_eq!(frame.opcode, Opcode::PlaybackUpdate, "expected PlaybackUpdate");
+        assert_eq!(
+            frame.opcode,
+            Opcode::PlaybackUpdate,
+            "expected PlaybackUpdate"
+        );
         serde_json::from_slice(&frame.body).expect("decode PlaybackUpdate body")
     }
 
@@ -373,7 +377,9 @@ mod tests {
         let player = Arc::new(headless_player());
         let addr = spawn_server(player).await;
 
-        let mut commander = ClientStream::connect(addr).await.expect("connect commander");
+        let mut commander = ClientStream::connect(addr)
+            .await
+            .expect("connect commander");
         let mut observer = ClientStream::connect(addr).await.expect("connect observer");
         // Give both connections' push tasks a moment to subscribe before the
         // state change below, so the observer can't miss it.
@@ -389,9 +395,10 @@ mod tests {
 
         // ...and the observer, which sent nothing, gets an unprompted push
         // for the same state change.
-        let observer_update = tokio::time::timeout(Duration::from_secs(5), read_update(&mut observer))
-            .await
-            .expect("observer should receive a pushed PlaybackUpdate");
+        let observer_update =
+            tokio::time::timeout(Duration::from_secs(5), read_update(&mut observer))
+                .await
+                .expect("observer should receive a pushed PlaybackUpdate");
         assert_eq!(observer_update.state, PlaybackState::Idle);
     }
 
@@ -407,7 +414,8 @@ mod tests {
 
         // Idle at connect time: no command was ever sent, so no synchronous
         // reply and no periodic tick should arrive either.
-        let idle_wait = tokio::time::timeout(Duration::from_millis(1500), read_update(&mut client)).await;
+        let idle_wait =
+            tokio::time::timeout(Duration::from_millis(1500), read_update(&mut client)).await;
         assert!(
             idle_wait.is_err(),
             "no PlaybackUpdate should be pushed while idle"
@@ -443,7 +451,10 @@ mod tests {
                 break;
             }
         }
-        assert!(saw_playing, "expected an update reporting Playing after Play");
+        assert!(
+            saw_playing,
+            "expected an update reporting Playing after Play"
+        );
 
         // Reaching Playing can itself produce a short burst of near-
         // simultaneous change-driven pushes (`play()`'s own publish plus the
@@ -530,7 +541,10 @@ mod tests {
                 break;
             }
         }
-        assert!(saw_playing, "expected an update reporting Playing after Play");
+        assert!(
+            saw_playing,
+            "expected an update reporting Playing after Play"
+        );
 
         // Now wait until some update reports something other than Playing:
         // that is the clip's end, reported by the eof watcher's idle-screen
@@ -547,7 +561,10 @@ mod tests {
             }
         }
         assert!(
-            matches!(ended, Some(PlaybackState::Idle) | Some(PlaybackState::Paused)),
+            matches!(
+                ended,
+                Some(PlaybackState::Idle) | Some(PlaybackState::Paused)
+            ),
             "the clip reaching end-of-file must be reported as no longer playing, got {ended:?}"
         );
 
