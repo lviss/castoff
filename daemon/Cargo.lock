@@ -33,6 +33,7 @@ dependencies = [
  "anyhow",
  "libc",
  "libmpv2",
+ "libmpv2-sys",
  "png",
  "serde",
  "serde_json",

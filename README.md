@@ -117,10 +117,12 @@ mpv's concrete error line (e.g. `[ffmpeg] https: HTTP error 403 Forbidden` or
 `[ytdl_hook] youtube-dl failed: ...`) is written to the daemon's stderr/journal, and the
 async-error listener (`daemon/src/player.rs`) logs the URL of the failed load together with a
 plain-language reason (libmpv2's own error display is only `Raw(<int>)`). Each `loadfile`
-submission is tracked in submission order, so an error is attributed to its own load: a stale
-event from a superseded Play names its own URL, never a newer request's. Only an error with no
-submitted load outstanding at all (mpv's own idle state) falls back to logging the most recently
-submitted URL, where attribution stays best-effort.
+submission is tracked by the `playlist_entry_id` mpv assigned it (read back from `playlist/0/id`),
+and mpv reports that same id on its `EndFile`/`StartFile` events, so an error is attributed to its
+own load: a stale event from a superseded Play -- or one mpv emitted for a playlist entry it
+expanded the URL into -- names its own entry and never a newer request's. Only an error that
+matches no submitted load at all (a playlist entry's own failure, or mpv's own idle state) falls
+back to logging the most recently submitted URL, where attribution stays best-effort.
 
 ### How the daemon decides between media and a web page
 

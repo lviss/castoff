@@ -1,14 +1,13 @@
 //! Thin wrapper around libmpv2 that maps FCast-shaped requests onto mpv
 //! commands/properties, and reads back mpv state as an FCast PlaybackUpdate.
 
-use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
-use libmpv2::events::Event;
+use libmpv2::events::{mpv_event_id, Event};
 use libmpv2::Mpv;
-use tracing::{debug, error, warn};
+use tracing::{error, warn};
 
 use crate::fcast::{PlayMessage, PlayTarget, PlaybackState, PlaybackUpdateMessage};
 use crate::idle_screen::{IdleScreen, IdleScreenController};
@@ -25,13 +24,11 @@ pub struct Player {
     /// showing (see `overlay.rs`).
     overlay: Arc<PlaybackOverlay>,
     /// The most recently submitted Play `url`. `spawn_async_event_watcher`
-    /// uses it only for an async mpv error with no outstanding entry in
-    /// `Routing`'s queue; a submitted load's own error is attributed by that
-    /// entry, not by this. For that fallback case attribution stays
-    /// best-effort toward the most recently submitted URL: an error already
-    /// queued by mpv can be drained after a newer `play()` has replaced the
-    /// slot, so the logged URL may be the newer request rather than the one
-    /// that actually failed.
+    /// uses it only for an async mpv error that matches no `Routing`
+    /// submission (a playlist entry mpv expanded, or mpv's own idle state);
+    /// a submitted load's own error is attributed by that submission's
+    /// playlist entry id, not by this. For that unmatched case attribution
+    /// stays best-effort toward the most recently submitted URL.
     last_target: Arc<Mutex<String>>,
     /// Serializes whole `play`/`stop` operations. The media path and the
     /// webpage path touch each other's state (a webpage `Play` stops mpv and
@@ -42,15 +39,16 @@ pub struct Player {
     /// media path; this covers the cross-resource handoff. The asynchronous
     /// fallback in `spawn_async_event_watcher` takes it too.
     operation: Arc<Mutex<()>>,
-    /// The in-flight `loadfile` submissions and the daemon's own
-    /// media-vs-web-page decisions for them (`Play`s whose sender did not
+    /// The in-flight `loadfile` submission and the daemon's own
+    /// media-vs-web-page decision for it (`Play`s whose sender did not
     /// classify the URL); see `Routing`.
     routing: Arc<Mutex<Routing>>,
 }
 
-/// One `loadfile` submitted to mpv, tracked so `spawn_async_event_watcher`
-/// can attribute mpv's `FileLoaded`/`EndFile` events to the submission they
-/// belong to instead of to whichever request happens to be newest.
+/// One `loadfile` submitted to mpv, tracked by the playlist entry mpv created
+/// for it so `spawn_async_event_watcher` can attribute mpv's
+/// `FileLoaded`/`EndFile` events to the submission they belong to instead of
+/// to whichever entry mpv happens to report next.
 struct Load {
     /// The URL handed to mpv.
     url: String,
@@ -61,97 +59,118 @@ struct Load {
     /// mpv has reported `FileLoaded` for this load. Once true the URL is
     /// media: a later failure is a playback error, never a fallback.
     loaded: bool,
+    /// mpv's `playlist_entry_id` for the playlist entry `loadfile` created,
+    /// read back from `playlist/0/id` (see `Routing::submit`). `None` when
+    /// that read failed, in which case no mpv event matches this load and it
+    /// is never re-routed.
+    entry_id: Option<i64>,
 }
 
-/// What the watcher should do with an mpv error that ended the oldest
-/// unresolved load.
+/// What the watcher should do with an mpv error that ended the submitted
+/// load.
 #[derive(Debug, PartialEq, Eq)]
 enum Resolution {
-    /// The load was the newest attempt, was a probe, and never loaded: hand
-    /// its URL to the browser engine instead.
+    /// The load was a probe that never loaded: hand its URL to the browser
+    /// engine instead.
     FallBack(String),
     /// The load had already loaded, or the sender classified it as media: a
     /// genuine playback error, never re-routed.
     PlaybackError(String),
-    /// A superseded probe failed after a newer `loadfile` had already been
-    /// submitted; the newer cast owns the screen, so there is nothing to do.
-    Superseded(String),
 }
 
-/// The daemon's in-flight media-vs-web-page decisions, in the order their
-/// `loadfile` submissions went to mpv. mpv reports `FileLoaded`/`EndFile` for
-/// those submissions in the same order, so each event is attributed to the
-/// *front* (oldest unresolved) entry, never to whichever `Play` is newest: a
-/// stale `FileLoaded` or error from a superseded load can only resolve its own
-/// entry, and can neither clear nor consume a newer attempt's probe. Only the
-/// newest unresolved entry may fall back to the browser, and only when it is a
-/// probe that never loaded; that is what keeps a superseded probe from opening
-/// the browser over a newer cast. `Stop`, and a direct webpage `Play`, cancel
-/// the outstanding entries (`cancel`): they are no longer fallback-eligible,
-/// but stay in the queue until their own mpv event resolves them.
+/// The daemon's media-vs-web-page decision in flight: the newest `loadfile`
+/// submission that mpv has not finished with.
 ///
-/// An entry is never removed except by its own mpv event. Dropping one early
-/// (e.g. on `Stop`) would let the `FileLoaded`/`EndFile` mpv already queued for
-/// it resolve whatever load is submitted next -- the exact stale-event
-/// misattribution this queue exists to prevent.
+/// Attribution is by mpv's own `playlist_entry_id`, never by submission
+/// order. `loadfile` creates a playlist entry, whose id is read back from
+/// `playlist/0/id` (see `Routing::submit`), and mpv reports that same id on
+/// `MPV_EVENT_END_FILE` (and `MPV_EVENT_START_FILE`). A submission's events
+/// therefore resolve only that submission: an `EndFile` for any other entry
+/// -- a playlist mpv expanded into entries of its own, or a superseded load
+/// -- does not match and is ignored, so it can neither clear nor consume a
+/// newer attempt's probe. `FileLoaded` carries no id of its own, so it is
+/// attributed through the `MPV_EVENT_START_FILE` that precedes it
+/// (`last_started`).
 ///
-/// This is structural rather than a timing assumption: correctness does not
-/// depend on the watcher draining an event before the next `Play` arrives.
-/// It therefore also closes the older best-effort race where a stale error
-/// could consume a newer probe and cause a spurious fallback -- a stale error
-/// now resolves its own load instead.
+/// Only the newest submission is tracked; an older one is dropped when a new
+/// `loadfile` is submitted, and its later events no longer match anything.
+/// Correctness does not depend on the watcher draining an event before the
+/// next `Play` arrives, because no decision is ever made from position.
+/// `Stop`, and a direct webpage `Play`, cancel the in-flight decision
+/// (`cancel`): it is no longer fallback-eligible, but its own events still
+/// resolve it.
 #[derive(Default)]
 struct Routing {
-    loads: VecDeque<Load>,
+    current: Option<Load>,
+    /// `playlist_entry_id` of the most recent `MPV_EVENT_START_FILE`, so the
+    /// `MPV_EVENT_FILE_LOADED` that follows it can be attributed without an
+    /// id of its own.
+    last_started: Option<i64>,
 }
 
 impl Routing {
-    /// Record a `loadfile` that has just been submitted to mpv. Called under
-    /// the `operation` lock, before the watcher can drain any event for it.
-    fn submit(&mut self, url: &str, probing: bool) {
-        self.loads.push_back(Load {
+    /// Record a `loadfile` that has just been submitted to mpv, together with
+    /// the `playlist_entry_id` mpv assigned it. Called under the `operation`
+    /// lock, before the watcher can drain any event for it.
+    fn submit(&mut self, url: &str, probing: bool, entry_id: Option<i64>) {
+        self.current = Some(Load {
             url: url.to_string(),
             probing,
             loaded: false,
+            entry_id,
         });
     }
 
-    /// mpv opened the oldest unresolved load.
+    /// mpv started a file; remember its id so the `FileLoaded` that follows
+    /// can be attributed to it.
+    fn start_file(&mut self, entry_id: i64) {
+        self.last_started = Some(entry_id);
+    }
+
+    /// mpv opened a file; if it is the submitted load, it is media from here
+    /// on.
     fn file_loaded(&mut self) {
-        if let Some(load) = self.loads.front_mut() {
-            load.loaded = true;
+        if let Some(load) = self.current.as_mut() {
+            if load.entry_id == self.last_started {
+                load.loaded = true;
+            }
         }
     }
 
-    /// The oldest unresolved load ended cleanly (end-of-file, or a later
-    /// `loadfile`/`stop` superseding it): it is over and never a fallback.
-    fn resolve_end(&mut self) {
-        self.loads.pop_front();
+    /// The submitted load ended cleanly (end-of-file, a playlist redirect, or
+    /// a later `loadfile`/`stop` superseding it): it is over and never a
+    /// fallback.
+    fn resolve_end(&mut self, entry_id: i64) {
+        if self
+            .current
+            .as_ref()
+            .is_some_and(|load| load.entry_id == Some(entry_id))
+        {
+            self.current = None;
+        }
     }
 
-    /// The oldest unresolved load ended with an error. Returns what the
-    /// watcher should do, or `None` when no submitted load was outstanding
-    /// (e.g. a failure of mpv's own idle state, which is not a routing
-    /// decision).
-    fn resolve_error(&mut self) -> Option<Resolution> {
-        let load = self.loads.pop_front()?;
+    /// The submitted load ended with an error. Returns what the watcher should
+    /// do, or `None` when the error belongs to no submitted load (a playlist
+    /// entry mpv expanded, a superseded submission, or mpv's own idle state).
+    fn resolve_error(&mut self, entry_id: i64) -> Option<Resolution> {
+        if self.current.as_ref()?.entry_id != Some(entry_id) {
+            return None;
+        }
+        let load = self.current.take()?;
         if load.probing && !load.loaded {
-            if self.loads.is_empty() {
-                Some(Resolution::FallBack(load.url))
-            } else {
-                Some(Resolution::Superseded(load.url))
-            }
+            Some(Resolution::FallBack(load.url))
         } else {
             Some(Resolution::PlaybackError(load.url))
         }
     }
 
-    /// Cancel every in-flight decision: the outstanding loads are no longer
-    /// fallback-eligible, but their entries stay in the queue so their own mpv
-    /// events still resolve them. Removing the entries here would let a stale
-    /// event resolve the next load instead -- see the type's doc comment.
+    /// Cancel the in-flight decision: it is no longer fallback-eligible, but
+    /// it is not dropped -- its own mpv events still resolve it (as a playback
+    /// error, since `probing` is now false), and until then a newer
+    /// submission simply replaces it.
     fn cancel(&mut self) {
-        for load in &mut self.loads {
+        if let Some(load) = self.current.as_mut() {
             load.probing = false;
         }
     }
@@ -356,14 +375,13 @@ impl Player {
             let _ = self.abort_loading_to_idle();
             return Err(e);
         }
-        // `last_target` is written in the same order as the `loadfile`
-        // submission: the background event watcher (see
-        // `spawn_async_event_watcher`) names the target of an async error
-        // that has no outstanding routing entry, and stale attribution there
-        // would be wrong. Loads that do have a queue entry are attributed by
-        // `Routing` instead, by the same submission order. `play` holds the
-        // operation lock for the whole call, so no two submissions can
-        // interleave.
+        // `last_target` is written before the `loadfile` submission: the
+        // background event watcher (see `spawn_async_event_watcher`) names the
+        // target of an async error that matches no `Routing` submission, and
+        // stale attribution there would be wrong. A submitted load's own
+        // error is attributed by that submission's playlist entry id instead
+        // (see `Routing`). `play` holds the operation lock for the whole call,
+        // so no two submissions can interleave.
         let mut last_target = self.last_target.lock().unwrap();
         *last_target = target.to_string();
         if let Err(e) = self.mpv.command("loadfile", &[target, "replace"]) {
@@ -374,11 +392,32 @@ impl Player {
             return Err(anyhow::anyhow!("loadfile failed for url {target:?}: {e:?}"));
         }
         drop(last_target);
-        // The load is now submitted, so record it for the background event
-        // watcher. `play` holds the operation lock across this and the
+        // `loadfile` synchronously creates a playlist entry for the URL;
+        // read back its id so the background event watcher can attribute this
+        // load's `FileLoaded`/`EndFile` events to that exact entry instead of
+        // to whichever entry mpv reports next. (A playlist URL may already
+        // have been expanded by the time this runs; the id read then belongs
+        // to the first expanded entry, which is still this cast's media, and
+        // mpv's events for the remaining entries no longer match this
+        // submission.) `play` holds the operation lock across this and the
         // `loadfile` call, so the watcher cannot drain an event for it before
         // the entry exists.
-        self.routing.lock().unwrap().submit(target, probing);
+        let entry_id = match self.mpv.get_property::<i64>("playlist/0/id") {
+            Ok(id) => Some(id),
+            Err(e) => {
+                warn!(
+                    error = ?e,
+                    url = target,
+                    "could not read mpv's playlist entry id for the submitted load; this URL \
+                     will not be eligible for the web-page fallback"
+                );
+                None
+            }
+        };
+        self.routing
+            .lock()
+            .unwrap()
+            .submit(target, probing, entry_id);
         // `keep-open=yes` (see `new()`) leaves `pause` set to `true` once a
         // previous file hits EOF, and mpv does not reset that property on the
         // next `loadfile`. Without this, a second Play call loads the new
@@ -606,28 +645,33 @@ fn to_mpv_volume(fcast_volume: f64) -> f64 {
 /// (including running `ytdl_hook`'s `yt-dlp` subprocess for a YouTube URL)
 /// afterwards, off of that call stack.
 ///
-/// What an error means is decided against `Routing`'s queue of submitted
-/// loads, attributed by submission order:
+/// What an error means is decided against `Routing`'s in-flight submission,
+/// attributed by mpv's `playlist_entry_id` (read from the raw
+/// `MPV_EVENT_END_FILE`; libmpv2's safe `Event::EndFile` drops the id):
 ///
-/// - The error belongs to the newest attempt, that attempt was a probe (a
-///   `Play` whose sender did not say what the URL is, see `Routing`), and it
-///   never loaded: it answers the daemon's own question -- this URL is not
-///   media -- so the URL is handed to the browser engine instead, logged at
-///   `warn` because it is a normal outcome for a web page.
+/// - The error belongs to the submitted load, that load was a probe (a `Play`
+///   whose sender did not say what the URL is, see `Routing`), and it never
+///   loaded: it answers the daemon's own question -- this URL is not media --
+///   so the URL is handed to the browser engine instead, logged at `warn`
+///   because it is a normal outcome for a web page.
 /// - Otherwise (an explicit media `Play`, a load that had already loaded, or
-///   a probe a newer `Play` has superseded) it is a genuine playback error,
-///   logged at `error`, with `describe_playback_error`'s plain-language
-///   reason next to mpv's own log line (printed because `terminal=yes`, see
-///   `new()`), so the console always says what went wrong instead of leaving
-///   a silent black screen.
+///   an error for an entry the daemon did not submit, such as a playlist mpv
+///   expanded) it is a genuine playback error, logged at `error`, with
+///   `describe_playback_error`'s plain-language reason next to mpv's own log
+///   line (printed because `terminal=yes`, see `new()`), so the console
+///   always says what went wrong instead of leaving a silent black screen.
 ///
-/// This blocks on mpv's event queue (`wait_event(-1.0)`) rather than
+/// This blocks on mpv's event queue (`mpv_wait_event(-1.0)`) rather than
 /// polling, so it costs nothing until mpv actually has something to report,
 /// consistent with the daemon's power-efficiency design principle. It uses
 /// a second client handle from `Mpv::create_client` (its own independent
 /// event queue onto the same player core, and therefore an independent
 /// handle commands can still be issued from) so it never contends with the
 /// `Player` methods' direct use of `mpv` from other threads.
+///
+/// The raw `mpv_wait_event` (rather than libmpv2's safe `wait_event`) is what
+/// makes the id available at all: the safe enum keeps only the end reason and
+/// error code, and drops `playlist_entry_id`.
 fn spawn_async_event_watcher(
     mpv: &Mpv,
     last_target: Arc<Mutex<String>>,
@@ -639,69 +683,95 @@ fn spawn_async_event_watcher(
     let events = mpv
         .create_client(Some("castoff-event-watcher"))
         .map_err(|e| anyhow::anyhow!("failed to create mpv event client: {e:?}"))?;
+    // A fresh client doesn't necessarily have these enabled; ask explicitly
+    // for the ones this watcher depends on.
+    for event in [
+        mpv_event_id::StartFile,
+        mpv_event_id::EndFile,
+        mpv_event_id::FileLoaded,
+    ] {
+        events
+            .enable_event(event)
+            .map_err(|e| anyhow::anyhow!("failed to enable mpv event: {e:?}"))?;
+    }
     std::thread::spawn(move || loop {
-        match events.wait_event(-1.0) {
-            Some(Err(e)) => {
-                // Hold the operation lock for the whole resolution: the
-                // queue the event is matched against is then the one that
-                // was current when the load was submitted, and a fallback
-                // cannot interleave with a newer `play`/`stop` (see
-                // `Player::operation`).
+        // SAFETY: `events` owns a live mpv handle. The returned pointer is
+        // valid until the next `mpv_wait_event` call on that handle, which
+        // cannot happen until this iteration has finished using it (one
+        // thread, one call per iteration).
+        let raw = unsafe { libmpv2_sys::mpv_wait_event(events.ctx.as_ptr(), -1.0) };
+        if raw.is_null() {
+            continue;
+        }
+        let event = unsafe { &*raw };
+        match event.event_id {
+            libmpv2_sys::mpv_event_id_MPV_EVENT_SHUTDOWN => break,
+            // A file is starting: remember its playlist entry id so the
+            // `FileLoaded` that follows (which carries no id of its own) can
+            // be attributed to it.
+            libmpv2_sys::mpv_event_id_MPV_EVENT_START_FILE => {
+                let start = unsafe { &*(event.data as *const libmpv2_sys::mpv_event_start_file) };
+                routing.lock().unwrap().start_file(start.playlist_entry_id);
+            }
+            // mpv opened a file: if it is the submitted load, it is media
+            // from here on. This is what makes "once mpv reports the file
+            // loaded, a failure later -- even before the first frame -- is a
+            // playback error, never re-routed" (README) true. The operation
+            // lock keeps this from being attributed to a load `play_media`
+            // has submitted to mpv but not yet recorded in `Routing`.
+            libmpv2_sys::mpv_event_id_MPV_EVENT_FILE_LOADED => {
                 let _operation = operation.lock().unwrap();
-                let resolution = routing.lock().unwrap().resolve_error();
-                match resolution {
-                    Some(Resolution::FallBack(url)) => {
-                        fall_back_to_browser(&url, &e, &events, &idle, &webpage)
-                    }
-                    Some(Resolution::PlaybackError(url)) => error!(
-                        url,
-                        error = ?e,
-                        reason = describe_playback_error(&e),
-                        "mpv reported an async playback error -- playback did not start; \
-                         see the mpv log line(s) above for the underlying cause (e.g. a \
-                         ytdl_hook/yt-dlp resolution failure or an HTTP error from the \
-                         media/CDN host)"
-                    ),
-                    Some(Resolution::Superseded(url)) => debug!(
-                        url,
-                        error = ?e,
-                        "a superseded media attempt failed after a newer Play was \
-                         submitted; the newer cast owns the screen"
-                    ),
-                    // No submitted load was outstanding (e.g. an error from
-                    // mpv's own idle state). Report it without a fallback.
-                    None => {
-                        let url = last_target.lock().unwrap().clone();
-                        error!(
+                routing.lock().unwrap().file_loaded();
+            }
+            libmpv2_sys::mpv_event_id_MPV_EVENT_END_FILE => {
+                // SAFETY: for `MPV_EVENT_END_FILE`, `data` points to an
+                // `mpv_event_end_file` (see mpv's client.h).
+                let end = unsafe { &*(event.data as *const libmpv2_sys::mpv_event_end_file) };
+                if end.error != 0 {
+                    // Hold the operation lock for the whole resolution: a
+                    // fallback cannot then interleave with a newer
+                    // `play`/`stop` (see `Player::operation`).
+                    let _operation = operation.lock().unwrap();
+                    let error = libmpv2::Error::Raw(end.error);
+                    match routing.lock().unwrap().resolve_error(end.playlist_entry_id) {
+                        Some(Resolution::FallBack(url)) => {
+                            fall_back_to_browser(&url, &error, &events, &idle, &webpage)
+                        }
+                        Some(Resolution::PlaybackError(url)) => error!(
                             url,
-                            error = ?e,
-                            reason = describe_playback_error(&e),
+                            error = ?error,
+                            reason = describe_playback_error(&error),
                             "mpv reported an async playback error -- playback did not start; \
                              see the mpv log line(s) above for the underlying cause (e.g. a \
                              ytdl_hook/yt-dlp resolution failure or an HTTP error from the \
                              media/CDN host)"
-                        );
+                        ),
+                        // An error for an entry the daemon did not submit (a
+                        // playlist entry mpv expanded, or a superseded load):
+                        // nothing to route, so name the most recent target
+                        // best-effort for the log.
+                        None => {
+                            let url = last_target.lock().unwrap().clone();
+                            error!(
+                                url,
+                                error = ?error,
+                                reason = describe_playback_error(&error),
+                                "mpv reported an async playback error -- playback did not start; \
+                                 see the mpv log line(s) above for the underlying cause (e.g. a \
+                                 ytdl_hook/yt-dlp resolution failure or an HTTP error from the \
+                                 media/CDN host)"
+                            );
+                        }
                     }
+                } else {
+                    // The clean end (end-of-file, a playlist redirect, or a
+                    // later `loadfile`/`stop`) resolves the submitted load.
+                    // Same lock as `FileLoaded`: it must not be attributed to
+                    // a submission `play_media` has not recorded yet.
+                    let _operation = operation.lock().unwrap();
+                    routing.lock().unwrap().resolve_end(end.playlist_entry_id);
                 }
             }
-            // mpv opened the oldest submitted load (but has not started it):
-            // the media path got somewhere with that URL, so it is media from
-            // here on. This is what makes "once mpv reports the file loaded,
-            // a failure later -- even before the first frame -- is a playback
-            // error, never re-routed" (README) true. Attribution is by
-            // submission order, so a stale `FileLoaded` from a superseded load
-            // marks *that* load, never a newer attempt's probe.
-            Some(Ok(Event::FileLoaded)) => {
-                let _operation = operation.lock().unwrap();
-                routing.lock().unwrap().file_loaded();
-            }
-            // The oldest submitted load ended cleanly: end-of-file, or a
-            // later `loadfile`/`stop` superseding it. Never a fallback.
-            Some(Ok(Event::EndFile(_))) => {
-                let _operation = operation.lock().unwrap();
-                routing.lock().unwrap().resolve_end();
-            }
-            Some(Ok(Event::Shutdown)) => break,
             _ => {}
         }
     });
@@ -1961,52 +2031,49 @@ mod tests {
     }
 
     /// Regression test for the stale-`FileLoaded` race: mpv's `FileLoaded` for
-    /// an older probe must resolve *that* probe, never clear a newer `Play`'s
-    /// probe. The old single-slot design cleared whatever probe was current,
-    /// so a page `Play` whose loadfile was submitted while the previous
-    /// load's `FileLoaded` was still queued lost its own probe and was never
-    /// handed to the browser -- a black screen for a URL the daemon is
-    /// required to display as a page.
+    /// an older load must resolve *that* load, never mark a newer `Play` as
+    /// loaded. The old design attributed `FileLoaded` by position, so a page
+    /// `Play` whose loadfile was submitted while the previous load's
+    /// `FileLoaded` was still queued lost its own probe and was never handed
+    /// to the browser -- a black screen for a URL the daemon is required to
+    /// display as a page.
     #[test]
     fn stale_file_loaded_resolves_its_own_load_not_a_newer_probe() {
         const MEDIA: &str = "http://127.0.0.1:1/media";
         const PAGE: &str = "http://127.0.0.1:1/page";
         let mut routing = Routing::default();
 
-        // A (unrouted media) is submitted, then B (unrouted page) supersedes
-        // it before the watcher has drained A's `FileLoaded`.
-        routing.submit(MEDIA, true);
-        routing.submit(PAGE, true);
+        // A (unrouted media, entry 1) is submitted, then B (unrouted page,
+        // entry 2) supersedes it before the watcher has drained A's
+        // `FileLoaded`.
+        routing.submit(MEDIA, true, Some(1));
+        routing.submit(PAGE, true, Some(2));
+        routing.start_file(1);
         routing.file_loaded();
 
-        // A's supersede ends it cleanly and resolves A, not B ...
-        routing.resolve_end();
-        // ... so B keeps its probe and still reaches the browser.
+        // A's stale `FileLoaded` belongs to entry 1, not to B, so B keeps its
+        // probe and still reaches the browser.
         assert_eq!(
-            routing.resolve_error(),
+            routing.resolve_error(2),
             Some(Resolution::FallBack(PAGE.to_string())),
-            "a stale FileLoaded must not consume the newer Play's probe"
+            "a stale FileLoaded must not mark the newer Play's probe as loaded"
         );
     }
 
-    /// A probe that never loaded but was superseded by a newer submission must
-    /// not open the browser over the newer cast; the newest unresolved probe
-    /// still may.
+    /// An error for an entry the daemon did not submit -- a playlist mpv
+    /// expanded, or a superseded load -- resolves nothing: only the entry the
+    /// submitted `loadfile` created can drive the routing decision.
     #[test]
-    fn superseded_probe_does_not_fall_back_over_a_newer_load() {
-        const FIRST: &str = "http://127.0.0.1:1/first";
-        const SECOND: &str = "http://127.0.0.1:1/second";
+    fn error_for_a_foreign_entry_never_resolves_the_submitted_load() {
+        const PAGE: &str = "http://127.0.0.1:1/page";
         let mut routing = Routing::default();
 
-        routing.submit(FIRST, true);
-        routing.submit(SECOND, true);
+        routing.submit(PAGE, true, Some(3));
+        assert_eq!(routing.resolve_error(2), None);
+
         assert_eq!(
-            routing.resolve_error(),
-            Some(Resolution::Superseded(FIRST.to_string()))
-        );
-        assert_eq!(
-            routing.resolve_error(),
-            Some(Resolution::FallBack(SECOND.to_string()))
+            routing.resolve_error(3),
+            Some(Resolution::FallBack(PAGE.to_string()))
         );
     }
 
@@ -2017,10 +2084,11 @@ mod tests {
         const URL: &str = "http://127.0.0.1:1/media";
         let mut routing = Routing::default();
 
-        routing.submit(URL, true);
+        routing.submit(URL, true, Some(1));
+        routing.start_file(1);
         routing.file_loaded();
         assert_eq!(
-            routing.resolve_error(),
+            routing.resolve_error(1),
             Some(Resolution::PlaybackError(URL.to_string()))
         );
     }
@@ -2034,40 +2102,40 @@ mod tests {
         const URL: &str = "http://127.0.0.1:1/media";
         let mut routing = Routing::default();
 
-        routing.submit(URL, false);
+        routing.submit(URL, false, Some(1));
         assert_eq!(
-            routing.resolve_error(),
+            routing.resolve_error(1),
             Some(Resolution::PlaybackError(URL.to_string()))
         );
 
-        routing.submit(URL, true);
+        routing.submit(URL, true, Some(2));
         routing.cancel();
         assert_eq!(
-            routing.resolve_error(),
+            routing.resolve_error(2),
             Some(Resolution::PlaybackError(URL.to_string())),
             "a cancelled probe must not fall back, but its own event still resolves its entry"
         );
     }
 
-    /// Regression test for the `Stop`/direct-page cancellation race: dropping
-    /// the outstanding entry (the old `clear()`) let the `EndFile` mpv still
-    /// had queued for it resolve the *next* load, so a page `Play` submitted
-    /// right after a `Stop` lost its own fallback and the screen stayed black.
-    /// The cancelled entry stays until its own event.
+    /// Regression test for the `Stop`/direct-page cancellation race: a
+    /// non-error `EndFile` for the cancelled load's own entry must resolve
+    /// *that* load, so a page `Play` submitted right after a `Stop` keeps its
+    /// own fallback.
     #[test]
     fn stale_end_after_cancel_resolves_its_own_load_not_a_newer_probe() {
         const FIRST: &str = "http://127.0.0.1:1/media";
         const SECOND: &str = "http://127.0.0.1:1/page";
         let mut routing = Routing::default();
 
-        routing.submit(FIRST, true);
+        routing.submit(FIRST, true, Some(1));
         routing.cancel();
-        routing.submit(SECOND, true);
+        routing.submit(SECOND, true, Some(2));
 
-        // mpv's non-error EndFile for FIRST arrives after SECOND was queued.
-        routing.resolve_end();
+        // mpv's non-error EndFile for FIRST (entry 1) arrives after SECOND
+        // (entry 2) was queued.
+        routing.resolve_end(1);
         assert_eq!(
-            routing.resolve_error(),
+            routing.resolve_error(2),
             Some(Resolution::FallBack(SECOND.to_string())),
             "a stale EndFile after cancel must not consume the newer Play's probe"
         );
@@ -2081,17 +2149,58 @@ mod tests {
         const SECOND: &str = "http://127.0.0.1:1/page";
         let mut routing = Routing::default();
 
-        routing.submit(FIRST, true);
+        routing.submit(FIRST, true, Some(1));
         routing.cancel();
-        routing.submit(SECOND, true);
+        routing.submit(SECOND, true, Some(2));
 
-        // mpv's FileLoaded for FIRST arrives after SECOND was queued.
+        // mpv's FileLoaded for FIRST (entry 1) arrives after SECOND (entry 2)
+        // was queued.
+        routing.start_file(1);
         routing.file_loaded();
-        routing.resolve_end();
         assert_eq!(
-            routing.resolve_error(),
+            routing.resolve_error(2),
             Some(Resolution::FallBack(SECOND.to_string())),
             "a stale FileLoaded after cancel must not mark the newer load as loaded"
+        );
+    }
+
+    /// Regression test for the playlist misattribution that position-based
+    /// attribution could not prevent: mpv expands a submitted `.m3u` into
+    /// playlist entries of its own and reports `StartFile`/`FileLoaded`/
+    /// `EndFile` for them, none of which belongs to a `loadfile` the daemon
+    /// submitted. Those events must not resolve a newer page `Play`'s probe --
+    /// otherwise the page the daemon is required to display is left on a
+    /// black screen. The event order mirrors real mpv, and the behaviour is
+    /// covered end to end by
+    /// `daemon/tests/webpage_display.rs::unclassified_playlist_then_page_displays_the_page`.
+    #[test]
+    fn playlist_entry_events_do_not_swallow_the_next_probes_fallback() {
+        const LIST: &str = "http://127.0.0.1:1/list.m3u";
+        const PAGE: &str = "http://127.0.0.1:1/page";
+        let mut routing = Routing::default();
+
+        // A: the submitted playlist (entry 1). mpv redirects it to its first
+        // expanded entry, id 2.
+        routing.submit(LIST, true, Some(1));
+        routing.start_file(1);
+        routing.resolve_end(1);
+
+        // B: an unrouted page (entry 3), submitted while the playlist's
+        // expanded entry 2 is still playing.
+        routing.submit(PAGE, true, Some(3));
+
+        // mpv stops entry 2 when B's `loadfile` replaces it, then a late
+        // `StartFile`/`FileLoaded` for entry 2 still arrives. None of it may
+        // touch B's probe.
+        routing.resolve_end(2);
+        routing.start_file(2);
+        routing.file_loaded();
+
+        // B's own load fails, so it must still reach the browser.
+        assert_eq!(
+            routing.resolve_error(3),
+            Some(Resolution::FallBack(PAGE.to_string())),
+            "a playlist entry's events must not swallow the newer Play's probe"
         );
     }
 

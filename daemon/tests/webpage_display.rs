@@ -846,6 +846,93 @@ fn unclassified_page_reaches_the_browser_after_a_failed_media_attempt() {
     session.print_console_tail();
 }
 
+/// Regression for the daemon's routing when mpv expands a submitted URL into a
+/// playlist: an unrouted `.m3u` Play is media (mpv plays its entries), and a
+/// *later* unrouted page Play must still fall back to the browser even though
+/// mpv reports `StartFile`/`FileLoaded`/`EndFile` for the playlist's own
+/// entries. Before the fix, one of those extra per-entry events was attributed
+/// to the page Play's probe, so the page was never handed to the engine and
+/// stayed on a black screen.
+#[test]
+#[ignore = "needs cage, chromium and grim on PATH; starts a headless compositor session"]
+fn unclassified_playlist_then_page_displays_the_page() {
+    let _serial = exclusive_session();
+    // The playlist's media: a real video, served at the URL the `.m3u` points
+    // at.
+    let (media_port, media_requests) = serve_bytes(
+        "application/octet-stream",
+        y4m_video(VIDEO_YUV.0, VIDEO_YUV.1, VIDEO_YUV.2, 300),
+    );
+    // mpv detects the playlist from the URL's `.m3u` extension; the body is a
+    // single local media URL. Serving a playlist rather than a bare media URL
+    // is what makes mpv emit the extra per-entry events this is about.
+    let playlist = format!("http://127.0.0.1:{media_port}/clip.y4m\n");
+    let (list_port, list_requests) = serve_bytes("audio/x-mpegurl", playlist.into_bytes());
+    let (page_port, page_requests) = serve_page(solid_color_page(PAGE_COLOR));
+    let session = start_session();
+    let mut control = session.connect();
+
+    // Unrouted playlist URL: the daemon tries it as media first, and mpv
+    // expands and plays it.
+    let reply = fcast(
+        &mut control,
+        OPCODE_PLAY,
+        Some(&serde_json::json!({
+            "url": format!("http://127.0.0.1:{list_port}/list.m3u"),
+        })),
+    );
+    assert_eq!(reply["state"], STATE_PLAYING, "reply: {reply}");
+    // Wait until the playlist's media is actually playing, so it is in flight
+    // when the page Play supersedes it.
+    let playing = wait_for_status(
+        &mut control,
+        |reply| reply["time"].as_f64().unwrap_or(0.0) > 0.2,
+        "the playlist's media to start playing",
+        Duration::from_secs(20),
+    );
+    eprintln!(
+        "playlist: playing at t={:.2}s",
+        playing["time"].as_f64().unwrap_or_default()
+    );
+
+    // Supersede it with an unrouted page. mpv stops the playlist's entry first
+    // (an `EndFile` for an entry the daemon never submitted), then fails to
+    // load the page; the daemon must still fall back.
+    let reply = fcast(
+        &mut control,
+        OPCODE_PLAY,
+        Some(&serde_json::json!({
+            "url": format!("http://127.0.0.1:{page_port}/"),
+        })),
+    );
+    assert_eq!(reply["state"], STATE_PLAYING, "reply: {reply}");
+
+    wait_for_color(
+        &session,
+        PAGE_COLOR,
+        "the page cast over the playlist to be on screen",
+        Duration::from_secs(40),
+    );
+    assert!(
+        list_requests.load(Ordering::SeqCst) >= 1,
+        "mpv must have fetched the playlist"
+    );
+    assert!(
+        media_requests.load(Ordering::SeqCst) >= 1,
+        "mpv must have fetched the playlist's media"
+    );
+    assert!(
+        page_requests.load(Ordering::SeqCst) >= 1,
+        "the browser engine must have fetched the page"
+    );
+    assert!(
+        session.console().contains("displaying it as a web page instead"),
+        "the console must say the page was handed to the browser; console tail:\n{}",
+        console_tail(&session.console())
+    );
+    session.print_console_tail();
+}
+
 /// A direct media file URL the sender did not classify stays on the media
 /// path: the daemon's first attempt *is* the answer, so mpv keeps playing and
 /// the browser engine never starts. The file is a real video (`y4m`) served
