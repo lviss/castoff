@@ -3,10 +3,12 @@
 //! castoff's answer to a Chromecast's ambient/idle screen.
 //!
 //! `IdleScreen` is the seam future content types plug into: `Clock` is the
-//! only variant implemented today, but a future static-wallpaper or
-//! cast-a-webpage variant is just another `render`/`refresh_interval` match
-//! arm here, not a rewrite of `Player`'s idle/active-playback wiring or of
-//! `IdleScreenController` below.
+//! only variant implemented today, but a future static-wallpaper variant is
+//! just another `render`/`refresh_interval` match arm here, not a rewrite of
+//! `Player`'s idle/active-playback wiring or of `IdleScreenController` below.
+//! Web pages are deliberately not such a variant -- a real browser engine
+//! cannot be an mpv OSD overlay, so they are a second Cage client instead
+//! (`webpage.rs`); see README's "How webpage (dashboard) display works".
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};

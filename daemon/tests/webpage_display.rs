@@ -318,7 +318,7 @@ fn deep_tmpdir(root: &Path) -> PathBuf {
 /// has no way to paint at all, however real the rest of the session is. The
 /// *browser* is unaffected: Chromium presents over shared memory, so the
 /// page-pixel assertions below still run there. Set
-/// `CASTOFF_E2E_SKIP_MPV_PIXELS=1` (as the package's Nix `checkPhase` does)
+/// `CASTOFF_E2E_SKIP_MPV_PIXELS=1` (as the package's Nix `postCheck` does)
 /// to keep the media step to the state/page assertions instead of failing on
 /// a pixel that this environment can never paint. In that case the daemon
 /// also runs with `CASTOFF_MPV_VO=null` (see `start_session`), because mpv's

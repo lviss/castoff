@@ -133,10 +133,10 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   starts Cage on wlroots' headless backend (`WLR_BACKENDS=headless` — no GPU, display or X server
   needed) with the real daemon binary as its client, serves a page over loopback, and checks what
   the compositor actually composites. It is `#[ignore]`d (needs `cage`, `chromium`, `grim`) and is
-  also run by the package's Nix `checkPhase` via `postCheck`. Knobs: `CASTOFF_E2E_SKIP_MPV_PIXELS`
-  (see two bullets down), `CASTOFF_E2E_BROWSER_FLAGS` (test-only Chromium flags, e.g.
-  `--no-sandbox --disable-gpu`), `CASTOFF_BROWSER` (browser program; the unit tests point it at
-  stub scripts).
+  also run by the package's Nix build (`postCheck`, after the default `checkPhase` has skipped it).
+  Knobs: `CASTOFF_E2E_SKIP_MPV_PIXELS` (see two bullets down), `CASTOFF_E2E_BROWSER_FLAGS`
+  (test-only Chromium flags, e.g. `--no-sandbox --disable-gpu`), `CASTOFF_BROWSER` (browser
+  program; the unit tests point it at stub scripts).
 - mpv's `vo=gpu` needs a buffer-sharing path that a compositor only has with a GL renderer. In a
   GL-less environment (the Nix build sandbox: no `/dev/dri`, so wlroots picks the pixman renderer)
   mpv cannot present *and* aborts the whole daemon with an assertion inside its own context probing

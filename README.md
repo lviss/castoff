@@ -374,8 +374,8 @@ the locally served page's pixels.
 ### End-to-end webpage/routing test
 
 The tests in `daemon/tests/webpage_display.rs` are `#[ignore]`d because they need a compositor and
-a browser, which few environments have (`nix flake check` runs them anyway, via the Nix
-`checkPhase`). On a machine with a GPU context for mpv -- the dev shell lists `cage`, `chromium`
+a browser, which few environments have (`nix flake check` runs them anyway, via the package's Nix
+`postCheck`). On a machine with a GPU context for mpv -- the dev shell lists `cage`, `chromium`
 and `grim` for exactly this -- run the full-strength version manually:
 
 ```sh
