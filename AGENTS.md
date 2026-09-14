@@ -193,7 +193,10 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   (2026-09-14) and is not implemented yet.** The goal: render *everything* -- mpv video, images,
   dashboards/web pages -- into one daemon-owned window, so the daemon is a normal windowed app on
   a desktop with a window manager (not kiosk-fullscreen-only), and so castoff owns its on-screen
-  displays, volume indicators and picture-in-picture consistently, whatever is on screen.
+  displays, volume indicators and picture-in-picture consistently, whatever is on screen. This is a
+  *product requirement*, not a styling preference: the captain has said outright that "multiple
+  windows isn't a viable product. That wouldn't match what a user would expect", so a multi-window
+  model is rejected on product grounds, not only on engineering ones.
   Captain-stated constraints: an *invisible/off-screen* Chromium whose frames are piped into that
   window is the intended mechanism (not Chromium owning a visible toplevel, which is what
   `daemon/src/webpage.rs` does today); Chromium specifically stays because Widevine/Netflix DRM is
