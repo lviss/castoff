@@ -42,18 +42,45 @@
         # the Nix build sandbox, which is fine: the one test that needs the
         # network (real YouTube playback, daemon/src/player.rs) is `#[ignore]`d
         # and run manually instead -- see README.
-        nativeBuildInputs = [ pkgs.makeWrapper ];
+        #
+        # cage/chromium/grim are test-only: they let the checkPhase run the
+        # ignored end-to-end webpage-display test (see `postCheck` below),
+        # which starts a real headless Cage session with the real Chromium
+        # engine and asserts on compositor output captured via
+        # `wlr-screencopy`.
+        nativeBuildInputs = [ pkgs.makeWrapper pkgs.cage pkgs.chromium pkgs.grim ];
 
-        # yt-dlp is a *runtime* dependency, not a build input: mpv's built-in
-        # ytdl_hook Lua script shells out to whatever `yt-dlp` it finds on
-        # `PATH` to resolve YouTube (and other non-direct-media) URLs -- see
-        # README's "How YouTube playback works". Wrap the binary so this is
-        # true regardless of the caller's environment (e.g. the `cage`
-        # session that execs this binary directly, no shell, on the real
-        # appliance).
+        # yt-dlp and Chromium are *runtime* dependencies, not build inputs:
+        # (a) mpv's built-in ytdl_hook Lua script shells out to whatever
+        #     `yt-dlp` it finds on `PATH` to resolve YouTube (and other
+        #     non-direct-media) URLs -- see README's "How YouTube playback
+        #     works";
+        # (b) the daemon spawns Chromium as a second fullscreen client of the
+        #     same Cage session to render web pages -- see README's "How
+        #     webpage (dashboard) display works".
+        # Wrap the binary so this is true regardless of the caller's
+        # environment (e.g. the `cage` session that execs this binary
+        # directly, no shell, on the real appliance).
         postFixup = ''
           wrapProgram $out/bin/castoff-daemon \
-            --prefix PATH : ${pkgs.lib.makeBinPath [ yt-dlp ]}
+            --prefix PATH : ${pkgs.lib.makeBinPath [ yt-dlp pkgs.chromium ]}
+        '';
+
+        # The end-to-end test needs a compositor and a browser, which few
+        # environments have, so it is `#[ignore]`d and thus skipped by the
+        # `cargo test` the checkPhase runs by default; run it explicitly here,
+        # where nativeBuildInputs provides both. `CASTOFF_E2E_SKIP_MPV_PIXELS`
+        # tells the test what this sandbox cannot do: with no `/dev/dri`, Cage
+        # falls back to wlroots' pixman renderer and mpv has no buffer-sharing
+        # path to present frames through, so only mpv's own pixel assertions
+        # are skipped (see `mpv_can_present` in
+        # daemon/tests/webpage_display.rs). The engine, the compositor and the
+        # page pixels asserted on are real regardless; `--nocapture` keeps all
+        # of it in the build log if it ever fails.
+        postCheck = ''
+          CASTOFF_E2E_SKIP_MPV_PIXELS=1 \
+            CASTOFF_E2E_BROWSER_FLAGS="--no-sandbox --disable-gpu" \
+            cargo test --test webpage_display -- --ignored --nocapture
         '';
 
         meta = {
@@ -107,14 +134,28 @@
         inputsFrom = [ castoff-daemon ];
         # `inputsFrom` only pulls in `castoff-daemon`'s buildInputs/nativeBuildInputs
         # (mpv-unwrapped, makeWrapper); it does NOT carry over that package's
-        # `postFixup` PATH wrapping. Without `yt-dlp` listed here too,
-        # `cargo build`/`cargo run` inside this dev shell produces an
-        # unwrapped binary with no `yt-dlp` on `PATH`, so YouTube playback
-        # silently fails (mpv's ytdl_hook has nothing to shell out to) even
-        # though `nix build` (which does apply the wrapper) works fine. Uses
-        # the same nixos-unstable `yt-dlp` as the package wrapper (see above),
-        # so tests run against the version the appliance actually ships.
-        packages = [ pkgs.cargo pkgs.rustc pkgs.rust-analyzer pkgs.clippy yt-dlp ];
+        # `postFixup` PATH wrapping. Without `yt-dlp` (and `chromium`) listed
+        # here too, `cargo build`/`cargo run` inside this dev shell produces an
+        # unwrapped binary with neither on `PATH`, so YouTube playback and web
+        # page display would fail (mpv's ytdl_hook has nothing to shell out
+        # to; the daemon has no browser engine to spawn) even though
+        # `nix build` (which does apply the wrapper) works fine. Uses the
+        # same nixos-unstable `yt-dlp` as the package wrapper (see above), so
+        # tests run against the version the appliance actually ships.
+        #
+        # `cage` and `grim` are test-only: `daemon/tests/webpage_display.rs`
+        # runs a real headless Cage session with the real Chromium engine and
+        # asserts on compositor output captured over `wlr-screencopy`.
+        packages = [
+          pkgs.cargo
+          pkgs.rustc
+          pkgs.rust-analyzer
+          pkgs.clippy
+          yt-dlp
+          pkgs.chromium
+          pkgs.cage
+          pkgs.grim
+        ];
       };
     };
 }

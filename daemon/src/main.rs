@@ -2,6 +2,7 @@ mod fcast;
 mod idle_screen;
 mod overlay;
 mod player;
+mod webpage;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -18,7 +19,14 @@ use player::Player;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
+    // The daemon's own log goes to stderr, with mpv's, Cage's and the browser
+    // engine's diagnostics -- journald captures it on the appliance, and it is
+    // the stream a caller reading "the console" sees. (stdout is left free,
+    // and not every environment that runs the daemon under a compositor
+    // forwards a child's stdout at all; `tracing`'s default is stdout.)
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .init();
 
     let port: u16 = std::env::var("CASTOFF_PORT")
         .ok()
