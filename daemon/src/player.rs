@@ -254,7 +254,7 @@ impl Player {
             let mpv = Arc::clone(&mpv);
             let webpage = Arc::clone(&webpage);
             Arc::new(move || {
-                let _ = status_tx.send(snapshot_status(&mpv, &webpage));
+                let _ = status_tx.send_replace(snapshot_status(&mpv, &webpage));
             })
         };
         let idle = Arc::new(IdleScreenController::new(Arc::clone(&mpv), Some(on_change)));
@@ -302,7 +302,7 @@ impl Player {
     /// paths instead (see `build`'s `on_change`, `fall_back_to_browser` and
     /// `handle_lifecycle_event`).
     fn publish_status(&self) {
-        let _ = self.status_tx.send(self.status());
+        let _ = self.status_tx.send_replace(self.status());
     }
 
     /// Show `screen` (currently only `IdleScreen::Clock`) until the next
@@ -884,7 +884,7 @@ fn fall_back_to_browser(
     // `idle.show` just above sent, and -- since the push task only starts
     // its ~1s tick once it has seen `Playing` -- would never be corrected
     // until some unrelated later state change.
-    let _ = status_tx.send(snapshot_status(mpv, webpage));
+    let _ = status_tx.send_replace(snapshot_status(mpv, webpage));
 }
 
 /// Spawn the background thread that tracks *playback lifecycle* on a second
@@ -977,7 +977,7 @@ fn handle_lifecycle_event(
         // the idle-screen `on_change` callback already covers it.
         Event::PlaybackRestart => {
             let _ = overlay.reveal();
-            let _ = status_tx.send(snapshot_status(mpv, webpage));
+            let _ = status_tx.send_replace(snapshot_status(mpv, webpage));
         }
         Event::EndFile(libmpv2::mpv_end_file_reason::Eof) => restore_idle_clock(idle, overlay),
         Event::Shutdown => return false,
@@ -1500,6 +1500,40 @@ mod tests {
         // never falls back to the browser, however the load ends.
         std::thread::sleep(Duration::from_millis(200));
         assert!(!player.webpage_active());
+    }
+
+    /// The status watch must hold the current state even while no sender is
+    /// connected (the daemon is the only writer between connections). Tokio's
+    /// `watch::Sender::send` leaves the watched value unchanged when there are
+    /// zero receivers, so a sender that connects mid-playback would otherwise
+    /// be seeded with a stale `Idle` and never corrected during steady play.
+    #[test]
+    fn status_watch_holds_current_state_with_no_subscribers() {
+        let player = headless_player();
+        // Zero receivers: `build` drops its own initial receiver, and no
+        // other subscriber exists. Seed a distinct value so the assertion
+        // below can tell a real update from the initial snapshot.
+        player.status_tx.send_replace(PlaybackUpdateMessage {
+            generation_time: 1,
+            state: PlaybackState::Paused,
+            time: None,
+            duration: None,
+            speed: None,
+        });
+
+        player.publish_status();
+
+        let rx = player.subscribe_status();
+        assert_eq!(
+            rx.borrow().state,
+            player.status().state,
+            "publish_status must replace the watched value with no subscribers"
+        );
+        assert_eq!(
+            rx.borrow().state,
+            PlaybackState::Idle,
+            "a fresh idle player must publish Idle, not the seeded value"
+        );
     }
 
     /// Regression test for a bug where a second `Play` after the first clip

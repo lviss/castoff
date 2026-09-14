@@ -25,7 +25,31 @@ use player::Player;
 /// per-connection command reply path (`dispatch`) and that same connection's
 /// background push task (`push_updates`) so the two can never interleave
 /// bytes of two different frames onto the wire.
-type SharedWriter = Arc<AsyncMutex<OwnedWriteHalf>>;
+///
+/// Both paths serialize on the same lock, but they snapshot their status at
+/// different moments, so a frame that was current when it was snapshotted can
+/// still reach the lock after a newer one. The newest `PlaybackUpdate`
+/// generation written is tracked here and a strictly older one is dropped, so
+/// the frames a sender sees stay monotonically fresh.
+struct ConnectionWriter {
+    write: OwnedWriteHalf,
+    last_generation: u64,
+}
+
+impl ConnectionWriter {
+    /// Write `status` unless a newer one was already written on this
+    /// connection. Returns whether it was written.
+    async fn write_playback_update(&mut self, status: &PlaybackUpdateMessage) -> Result<bool> {
+        if status.generation_time < self.last_generation {
+            return Ok(false);
+        }
+        self.last_generation = status.generation_time;
+        fcast::write_message(&mut self.write, Opcode::PlaybackUpdate, status).await?;
+        Ok(true)
+    }
+}
+
+type SharedWriter = Arc<AsyncMutex<ConnectionWriter>>;
 
 /// How often a push task re-sends `PlaybackUpdate` while the last known state
 /// is `Playing`. No tick fires at all while idle/paused -- see [Design
@@ -74,7 +98,10 @@ async fn main() -> Result<()> {
 /// write independently without one blocking on the other's read.
 async fn handle_connection(socket: TcpStream, player: Arc<Player>) -> Result<()> {
     let (mut read_half, write_half) = socket.into_split();
-    let writer: SharedWriter = Arc::new(AsyncMutex::new(write_half));
+    let writer: SharedWriter = Arc::new(AsyncMutex::new(ConnectionWriter {
+        write: write_half,
+        last_generation: 0,
+    }));
 
     let push_task = tokio::spawn(push_updates(Arc::clone(&writer), Arc::clone(&player)));
 
@@ -91,7 +118,7 @@ async fn handle_connection(socket: TcpStream, player: Arc<Player>) -> Result<()>
                     message: e.to_string(),
                 };
                 let mut w = writer.lock().await;
-                fcast::write_message(&mut *w, Opcode::PlaybackError, &msg).await?;
+                fcast::write_message(&mut w.write, Opcode::PlaybackError, &msg).await?;
             }
         }
     }
@@ -132,10 +159,19 @@ async fn push_updates(writer: SharedWriter, player: Arc<Player>) {
                     return; // Player dropped (daemon shutting down).
                 }
                 let status = rx.borrow_and_update().clone();
-                last_state = status.state;
-                if write_update(&writer, &status).await.is_err() {
-                    return;
-                }
+                let written = match write_update(&writer, &status).await {
+                    Ok(written) => written,
+                    Err(_) => return,
+                };
+                // A frame can be dropped as older than a command reply that
+                // overtook it; in that case re-read the latest published
+                // state so `last_state` (which arms the tick) reflects the
+                // frame actually on the wire, not the superseded one.
+                last_state = if written {
+                    status.state
+                } else {
+                    rx.borrow().state
+                };
             }
             _ = interval.tick(), if last_state == PlaybackState::Playing => {
                 // A *fresh* snapshot, not `rx.borrow()`: the tick exists so a
@@ -155,19 +191,23 @@ async fn push_updates(writer: SharedWriter, player: Arc<Player>) {
                 // Without it the tick would keep firing for the life of the
                 // connection, the standing wake loop the power-efficiency
                 // design principle forbids.
-                last_state = status.state;
-                if write_update(&writer, &status).await.is_err() {
-                    return;
-                }
+                let written = match write_update(&writer, &status).await {
+                    Ok(written) => written,
+                    Err(_) => return,
+                };
+                last_state = if written {
+                    status.state
+                } else {
+                    rx.borrow().state
+                };
             }
         }
     }
 }
 
-async fn write_update(writer: &SharedWriter, status: &PlaybackUpdateMessage) -> Result<()> {
+async fn write_update(writer: &SharedWriter, status: &PlaybackUpdateMessage) -> Result<bool> {
     let mut w = writer.lock().await;
-    fcast::write_message(&mut *w, Opcode::PlaybackUpdate, status).await?;
-    Ok(())
+    w.write_playback_update(status).await
 }
 
 async fn dispatch(writer: &SharedWriter, player: &Arc<Player>, frame: fcast::Frame) -> Result<()> {
@@ -228,7 +268,7 @@ async fn dispatch(writer: &SharedWriter, player: &Arc<Player>, frame: fcast::Fra
                 version: fcast::PROTOCOL_VERSION,
             };
             let mut w = writer.lock().await;
-            fcast::write_message(&mut *w, Opcode::Version, &reply).await?;
+            fcast::write_message(&mut w.write, Opcode::Version, &reply).await?;
             Ok(())
         }
         Opcode::Ping => {
@@ -237,7 +277,7 @@ async fn dispatch(writer: &SharedWriter, player: &Arc<Player>, frame: fcast::Fra
             // interesting "request" the way Play/Seek/etc. are.
             debug!("received Ping");
             let mut w = writer.lock().await;
-            fcast::write_empty(&mut *w, Opcode::Pong).await?;
+            fcast::write_empty(&mut w.write, Opcode::Pong).await?;
             Ok(())
         }
         other => {
@@ -248,10 +288,15 @@ async fn dispatch(writer: &SharedWriter, player: &Arc<Player>, frame: fcast::Fra
 }
 
 async fn send_status(writer: &SharedWriter, player: &Arc<Player>) -> Result<()> {
+    // Snapshot *under* the writer lock: `dispatch`'s reply and
+    // `push_updates`' unprompted push share this lock, and a status taken
+    // outside it could be written after a newer pushed state. The lock plus
+    // the generation check in `ConnectionWriter` keep the frames on this
+    // connection monotonically fresh.
+    let mut w = writer.lock().await;
     let player = Arc::clone(player);
     let status = tokio::task::spawn_blocking(move || player.status()).await?;
-    let mut w = writer.lock().await;
-    fcast::write_message(&mut *w, Opcode::PlaybackUpdate, &status).await?;
+    w.write_playback_update(&status).await?;
     Ok(())
 }
 
@@ -266,7 +311,7 @@ async fn send_volume(writer: &SharedWriter, player: &Arc<Player>) -> Result<()> 
     }
     let mut w = writer.lock().await;
     fcast::write_message(
-        &mut *w,
+        &mut w.write,
         Opcode::VolumeUpdate,
         &VolumeUpdateMessage {
             generation_time: player::now_millis(),
