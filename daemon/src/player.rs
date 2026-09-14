@@ -7,6 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::Result;
 use libmpv2::events::{mpv_event_id, Event};
 use libmpv2::Mpv;
+use tokio::sync::watch;
 use tracing::{debug, error, warn};
 
 use crate::fcast::{PlayMessage, PlayTarget, PlaybackState, PlaybackUpdateMessage};
@@ -35,6 +36,19 @@ pub struct Player {
     /// media-vs-web-page decision for it (`Play`s whose sender did not
     /// classify the URL); see `Routing`.
     routing: Arc<Mutex<Routing>>,
+    /// Broadcasts the latest `PlaybackUpdate`-shaped snapshot whenever any
+    /// method below changes playback state, or an async transition does (a
+    /// `PlaybackRestart`, an idle-screen show/hide, or the browser fallback
+    /// taking the screen -- see `IdleScreenController`'s `on_change`
+    /// callback, `fall_back_to_browser` and `spawn_lifecycle_watcher`).
+    /// `main.rs` gives every connected FCast sender its own subscription
+    /// (`subscribe_status`) so it can push updates onto that sender's
+    /// already-open socket without polling. `watch` (not `broadcast`)
+    /// deliberately: subscribers only ever care about the *current* status,
+    /// so coalescing rapid updates into the latest value is correct here and
+    /// sidesteps `broadcast`'s slow-subscriber lag/`RecvError::Lagged`
+    /// entirely.
+    status_tx: watch::Sender<PlaybackUpdateMessage>,
 }
 
 /// One `loadfile` submitted to mpv, tracked by the playlist entry mpv created
@@ -228,7 +242,22 @@ impl Player {
     }
 
     fn build(mpv: Arc<Mpv>, webpage: Arc<WebpageController>) -> Result<Self> {
-        let idle = Arc::new(IdleScreenController::new(Arc::clone(&mpv)));
+        let (status_tx, _status_rx) = watch::channel(snapshot_status(&mpv, &webpage));
+        // Fires whenever `IdleScreenController` shows/hides a screen (idle <->
+        // active transitions the `Player` methods below don't themselves
+        // cover, e.g. the eof-watcher bringing the clock back on a natural
+        // end-of-file with nothing queued next, or a Stop/`play_webpage`
+        // re-asserting it). Kept as a generic callback so `idle_screen.rs`
+        // doesn't need to know about FCast message types.
+        let on_change: Arc<dyn Fn() + Send + Sync> = {
+            let status_tx = status_tx.clone();
+            let mpv = Arc::clone(&mpv);
+            let webpage = Arc::clone(&webpage);
+            Arc::new(move || {
+                let _ = status_tx.send_replace(snapshot_status(&mpv, &webpage));
+            })
+        };
+        let idle = Arc::new(IdleScreenController::new(Arc::clone(&mpv), Some(on_change)));
         let overlay = Arc::new(PlaybackOverlay::new(Arc::clone(&mpv)));
         idle.spawn_eof_watcher();
         let operation = Arc::new(Mutex::new(()));
@@ -239,8 +268,15 @@ impl Player {
             Arc::clone(&webpage),
             Arc::clone(&routing),
             Arc::clone(&operation),
+            status_tx.clone(),
         )?;
-        spawn_lifecycle_watcher(&mpv, Arc::clone(&idle), Arc::clone(&overlay))?;
+        spawn_lifecycle_watcher(
+            Arc::clone(&mpv),
+            Arc::clone(&idle),
+            Arc::clone(&overlay),
+            Arc::clone(&webpage),
+            status_tx.clone(),
+        )?;
         Ok(Self {
             mpv,
             idle,
@@ -248,7 +284,25 @@ impl Player {
             webpage,
             operation,
             routing,
+            status_tx,
         })
+    }
+
+    /// Subscribe to this player's playback-state-changed broadcast. Every
+    /// connected FCast sender (`main.rs`) gets its own receiver so it can push
+    /// unprompted `PlaybackUpdate` frames onto its own already-open socket.
+    pub fn subscribe_status(&self) -> watch::Receiver<PlaybackUpdateMessage> {
+        self.status_tx.subscribe()
+    }
+
+    /// Recompute and broadcast the current status to every subscriber. Called
+    /// after every state-changing command (`play`/`pause`/`resume`/`stop`/
+    /// `seek`/`set_speed`) succeeds; async transitions (`PlaybackRestart`, an
+    /// idle-screen show/hide, the browser fallback) publish through their own
+    /// paths instead (see `build`'s `on_change`, `fall_back_to_browser` and
+    /// `handle_lifecycle_event`).
+    fn publish_status(&self) {
+        let _ = self.status_tx.send_replace(self.status());
     }
 
     /// Show `screen` (currently only `IdleScreen::Clock`) until the next
@@ -288,7 +342,7 @@ impl Player {
         // the field's doc comment). The guard is released on every return
         // path, including errors.
         let _operation = self.operation.lock().unwrap();
-        match msg.explicit_target() {
+        let result = match msg.explicit_target() {
             // The sender said what this is: honour it, with no fallback. A
             // webpage `Play` with no `url` cannot be rendered, and inline
             // `content` is still only accepted for media (below), so reject
@@ -320,7 +374,16 @@ impl Player {
             // attempt fails before the file loads. See README's routing
             // rules.
             None => self.play_media(msg, true),
+        };
+        // Publish on every path (media or web page). A media load may still
+        // report `Idle` at this instant -- mpv resolves `idle-active` off this
+        // call stack (see README's FCast notes) -- but the async
+        // `PlaybackRestart`/idle-screen paths publish the later `Playing`;
+        // a web-page `Play` is `Playing` here already.
+        if result.is_ok() {
+            self.publish_status();
         }
+        result
     }
 
     /// The media path: hand `msg`'s URL to mpv. `probing` is true when the
@@ -415,13 +478,17 @@ impl Player {
     pub fn pause(&self) -> Result<()> {
         self.mpv
             .set_property("pause", true)
-            .map_err(|e| anyhow::anyhow!("pause failed: {e:?}"))
+            .map_err(|e| anyhow::anyhow!("pause failed: {e:?}"))?;
+        self.publish_status();
+        Ok(())
     }
 
     pub fn resume(&self) -> Result<()> {
         self.mpv
             .set_property("pause", false)
-            .map_err(|e| anyhow::anyhow!("resume failed: {e:?}"))
+            .map_err(|e| anyhow::anyhow!("resume failed: {e:?}"))?;
+        self.publish_status();
+        Ok(())
     }
 
     /// Stop playback and return to mpv's idle state (no decode pipeline
@@ -463,11 +530,19 @@ impl Player {
             let _ = self.abort_loading_to_idle();
             return Err(anyhow::anyhow!("stop failed: {e:?}"));
         }
-        if already_idle {
+        let result = if already_idle {
             self.show_idle_screen(IdleScreen::Clock)
         } else {
             self.fade_in_idle_clock()
+        };
+        // Both branches already publish via `IdleScreenController`'s
+        // `on_change` callback (`show_idle_screen`/`fade_in_idle_clock` end by
+        // showing the clock), but publish explicitly too so `stop` doesn't
+        // rely on that indirection to notify subscribers.
+        if result.is_ok() {
+            self.publish_status();
         }
+        result
     }
 
     /// Fade the idle clock in from black: drop the cover overlays (the screen
@@ -527,7 +602,9 @@ impl Player {
     pub fn seek(&self, time: f64) -> Result<()> {
         self.mpv
             .command("seek", &[&time.to_string(), "absolute"])
-            .map_err(|e| anyhow::anyhow!("seek failed: {e:?}"))
+            .map_err(|e| anyhow::anyhow!("seek failed: {e:?}"))?;
+        self.publish_status();
+        Ok(())
     }
 
     pub fn set_volume(&self, volume: f64) -> Result<()> {
@@ -539,40 +616,14 @@ impl Player {
     pub fn set_speed(&self, speed: f64) -> Result<()> {
         self.mpv
             .set_property("speed", speed)
-            .map_err(|e| anyhow::anyhow!("set_speed failed: {e:?}"))
+            .map_err(|e| anyhow::anyhow!("set_speed failed: {e:?}"))?;
+        self.publish_status();
+        Ok(())
     }
 
     /// Snapshot current mpv state as an FCast PlaybackUpdate.
     pub fn status(&self) -> PlaybackUpdateMessage {
-        let paused: bool = self.mpv.get_property("pause").unwrap_or(false);
-        let idle: bool = self.mpv.get_property("idle-active").unwrap_or(true);
-        let time: Option<f64> = self.mpv.get_property("time-pos").ok();
-        let duration: Option<f64> = self.mpv.get_property("duration").ok();
-        let speed: Option<f64> = self.mpv.get_property("speed").ok();
-        let webpage_active = self.webpage.is_active();
-
-        let state = if webpage_active {
-            // A displayed web page is live content the sender asked for, not
-            // the idle screen; mpv is only carrying the clock *behind* the
-            // engine's window (see `play_webpage`), so mpv's own state must
-            // not make this look like nothing is playing.
-            PlaybackState::Playing
-        } else if idle {
-            PlaybackState::Idle
-        } else if paused {
-            PlaybackState::Paused
-        } else {
-            PlaybackState::Playing
-        };
-
-        PlaybackUpdateMessage {
-            generation_time: now_millis(),
-            state,
-            // A web page has no mpv timeline to report.
-            time: if webpage_active { None } else { time },
-            duration: if webpage_active { None } else { duration },
-            speed,
-        }
+        snapshot_status(&self.mpv, &self.webpage)
     }
 
     /// Hand the screen to the browser engine (`webpage`) while keeping the
@@ -607,6 +658,44 @@ impl Player {
 
 fn to_mpv_volume(fcast_volume: f64) -> f64 {
     (fcast_volume.clamp(0.0, 1.0)) * 100.0
+}
+
+/// Snapshot `mpv`'s current state (plus whether the browser engine is
+/// showing a page) as an FCast `PlaybackUpdate`. Takes the handles rather
+/// than `&Player` so the contexts that only hold those handles -- the
+/// idle-screen `on_change` callback, the async-event watcher's browser
+/// fallback, and the lifecycle watcher thread -- can publish the exact same
+/// shape as `Player::status`.
+fn snapshot_status(mpv: &Mpv, webpage: &WebpageController) -> PlaybackUpdateMessage {
+    let paused: bool = mpv.get_property("pause").unwrap_or(false);
+    let idle: bool = mpv.get_property("idle-active").unwrap_or(true);
+    let time: Option<f64> = mpv.get_property("time-pos").ok();
+    let duration: Option<f64> = mpv.get_property("duration").ok();
+    let speed: Option<f64> = mpv.get_property("speed").ok();
+    let webpage_active = webpage.is_active();
+
+    let state = if webpage_active {
+        // A displayed web page is live content the sender asked for, not
+        // the idle screen; mpv is only carrying the clock *behind* the
+        // engine's window (see `play_webpage`), so mpv's own state must
+        // not make this look like nothing is playing.
+        PlaybackState::Playing
+    } else if idle {
+        PlaybackState::Idle
+    } else if paused {
+        PlaybackState::Paused
+    } else {
+        PlaybackState::Playing
+    };
+
+    PlaybackUpdateMessage {
+        generation_time: now_millis(),
+        state,
+        // A web page has no mpv timeline to report.
+        time: if webpage_active { None } else { time },
+        duration: if webpage_active { None } else { duration },
+        speed,
+    }
 }
 
 /// Spawn a background thread that handles mpv's *asynchronous* load
@@ -651,6 +740,7 @@ fn spawn_async_event_watcher(
     webpage: Arc<WebpageController>,
     routing: Arc<Mutex<Routing>>,
     operation: Arc<Mutex<()>>,
+    status_tx: watch::Sender<PlaybackUpdateMessage>,
 ) -> Result<()> {
     let events = mpv
         .create_client(Some("castoff-event-watcher"))
@@ -707,7 +797,7 @@ fn spawn_async_event_watcher(
                     let error = libmpv2::Error::Raw(end.error);
                     match routing.lock().unwrap().resolve_error(end.playlist_entry_id) {
                         Some(Resolution::FallBack(url)) => {
-                            fall_back_to_browser(&url, &error, &events, &idle, &webpage)
+                            fall_back_to_browser(&url, &error, &events, &idle, &webpage, &status_tx)
                         }
                         Some(Resolution::PlaybackError(url)) => error!(
                             url,
@@ -761,6 +851,7 @@ fn fall_back_to_browser(
     mpv: &Mpv,
     idle: &IdleScreenController,
     webpage: &WebpageController,
+    status_tx: &watch::Sender<PlaybackUpdateMessage>,
 ) {
     warn!(
         url,
@@ -781,6 +872,14 @@ fn fall_back_to_browser(
              either; the screen is back to the daemon's idle clock"
         );
     }
+    // This path never goes through a `Player` method: a successful `show`
+    // flips `webpage.is_active()` from false to true, which is the
+    // difference between `Idle` and `Playing` in `snapshot_status`. Without
+    // this publish a subscriber would stay at the `Idle` status the
+    // `idle.show` just above sent, and -- since the push task only starts
+    // its ~1s tick once it has seen `Playing` -- would never be corrected
+    // until some unrelated later state change.
+    let _ = status_tx.send_replace(snapshot_status(mpv, webpage));
 }
 
 /// Spawn the background thread that tracks *playback lifecycle* on a second
@@ -798,9 +897,11 @@ fn fall_back_to_browser(
 /// also returns to idle. The STOP/REDIRECT end reasons a superseding
 /// `loadfile` produces are ignored, so a rapid re-Play keeps its own spinner.
 fn spawn_lifecycle_watcher(
-    mpv: &Mpv,
+    mpv: Arc<Mpv>,
     idle: Arc<IdleScreenController>,
     overlay: Arc<PlaybackOverlay>,
+    webpage: Arc<WebpageController>,
+    status_tx: watch::Sender<PlaybackUpdateMessage>,
 ) -> Result<()> {
     let events = mpv
         .create_client(Some("castoff-lifecycle"))
@@ -818,7 +919,7 @@ fn spawn_lifecycle_watcher(
     std::thread::spawn(move || loop {
         match events.wait_event(-1.0) {
             Some(Ok(event)) => {
-                if !handle_lifecycle_event(event, &idle, &overlay) {
+                if !handle_lifecycle_event(event, &idle, &overlay, &mpv, &webpage, &status_tx) {
                     return;
                 }
             }
@@ -858,12 +959,20 @@ fn handle_lifecycle_event(
     event: Event<'_>,
     idle: &IdleScreenController,
     overlay: &PlaybackOverlay,
+    mpv: &Mpv,
+    webpage: &WebpageController,
+    status_tx: &watch::Sender<PlaybackUpdateMessage>,
 ) -> bool {
     match event {
         // First frame is ready: stop spinning and fade the black overlay away
-        // to reveal playback.
+        // to reveal playback. This is the one state transition into Playing
+        // that doesn't go through `IdleScreenController` (it neither shows
+        // nor hides an idle screen), so it must publish explicitly --
+        // everywhere else, a `Player` method's own `publish_status` call or
+        // the idle-screen `on_change` callback already covers it.
         Event::PlaybackRestart => {
             let _ = overlay.reveal();
+            let _ = status_tx.send_replace(snapshot_status(mpv, webpage));
         }
         Event::EndFile(libmpv2::mpv_end_file_reason::Eof) => restore_idle_clock(idle, overlay),
         Event::Shutdown => return false,
@@ -895,47 +1004,49 @@ pub(crate) fn now_millis() -> u64 {
         .unwrap_or(0)
 }
 
+/// A headless mpv core (`vo=null`/`ao=null`, no window or audio device),
+/// sufficient to drive real `Player` behavior in a sandbox with no display
+/// or sound hardware. Mirrors `Player::new`'s `keep-open` setting (needed for
+/// the double-play regression test). `pub(crate)`, not private to this
+/// module's own `tests` submodule, so `main.rs`'s tests can build a real
+/// headless `Player` too rather than needing a second mock.
+#[cfg(test)]
+pub(crate) fn headless_mpv() -> Arc<Mpv> {
+    Arc::new(
+        Mpv::with_initializer(|init| {
+            init.set_property("vo", "null")?;
+            init.set_property("ao", "null")?;
+            init.set_property("idle", "yes")?;
+            init.set_property("keep-open", "yes")?;
+            Ok(())
+        })
+        .expect("failed to initialize headless mpv for test"),
+    )
+}
+
+/// A `Player` over [`headless_mpv`], with the real (Chromium) browser engine
+/// configured but never started by these tests, and its initial idle screen
+/// showing (needed by the idle-screen test). `pub(crate)` for `main.rs`'s
+/// push-path tests (see [`headless_mpv`]).
+#[cfg(test)]
+pub(crate) fn headless_player() -> Player {
+    // No browser program that could exist: a test that accidentally trips
+    // the unrouted-Play fallback fails to start an engine (and the watcher
+    // logs it) instead of launching a real Chromium.
+    let player = Player::with_browser(headless_mpv(), "/nonexistent/castoff-test-browser")
+        .expect("create player");
+    player
+        .show_idle_screen(IdleScreen::Clock)
+        .expect("show initial idle screen");
+    player
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
 
     use super::*;
-
-    /// A headless mpv core (`vo=null`/`ao=null`, no window or audio device),
-    /// sufficient to drive real `Player` behavior in a sandbox with no
-    /// display or sound hardware. Mirrors `Player::new`'s `keep-open`
-    /// setting (needed for the double-play regression test below).
-    fn headless_mpv() -> Arc<Mpv> {
-        Arc::new(
-            Mpv::with_initializer(|init| {
-                init.set_property("vo", "null")?;
-                init.set_property("ao", "null")?;
-                init.set_property("idle", "yes")?;
-                init.set_property("keep-open", "yes")?;
-                Ok(())
-            })
-            .expect("failed to initialize headless mpv for test"),
-        )
-    }
-
-    /// A `Player` over [`headless_mpv`], with the real (Chromium) browser
-    /// engine configured but never started by these tests, and its initial
-    /// idle screen showing (needed by the idle-screen test below).
-    fn headless_player() -> Player {
-        // No browser program that could exist: a test that accidentally
-        // trips the unrouted-Play fallback fails to start an engine (and the
-        // watcher logs it) instead of launching a real Chromium.
-        let player = Player::with_browser(
-            headless_mpv(),
-            "/nonexistent/castoff-test-browser",
-        )
-        .expect("create player");
-        player
-            .show_idle_screen(IdleScreen::Clock)
-            .expect("show initial idle screen");
-        player
-    }
 
     /// [`headless_player`] with a caller-supplied browser engine program
     /// (see `stub_browser`) instead of Chromium.
@@ -1384,6 +1495,40 @@ mod tests {
         // never falls back to the browser, however the load ends.
         std::thread::sleep(Duration::from_millis(200));
         assert!(!player.webpage_active());
+    }
+
+    /// The status watch must hold the current state even while no sender is
+    /// connected (the daemon is the only writer between connections). Tokio's
+    /// `watch::Sender::send` leaves the watched value unchanged when there are
+    /// zero receivers, so a sender that connects mid-playback would otherwise
+    /// be seeded with a stale `Idle` and never corrected during steady play.
+    #[test]
+    fn status_watch_holds_current_state_with_no_subscribers() {
+        let player = headless_player();
+        // Zero receivers: `build` drops its own initial receiver, and no
+        // other subscriber exists. Seed a distinct value so the assertion
+        // below can tell a real update from the initial snapshot.
+        player.status_tx.send_replace(PlaybackUpdateMessage {
+            generation_time: 1,
+            state: PlaybackState::Paused,
+            time: None,
+            duration: None,
+            speed: None,
+        });
+
+        player.publish_status();
+
+        let rx = player.subscribe_status();
+        assert_eq!(
+            rx.borrow().state,
+            player.status().state,
+            "publish_status must replace the watched value with no subscribers"
+        );
+        assert_eq!(
+            rx.borrow().state,
+            PlaybackState::Idle,
+            "a fresh idle player must publish Idle, not the seeded value"
+        );
     }
 
     /// Regression test for a bug where a second `Play` after the first clip
@@ -2640,6 +2785,9 @@ mod tests {
             Event::EndFile(libmpv2::mpv_end_file_reason::Eof),
             &player.idle,
             &player.overlay,
+            &player.mpv,
+            &player.webpage,
+            &player.status_tx,
         );
 
         assert!(keep_going, "a normal EOF must not stop the watcher");

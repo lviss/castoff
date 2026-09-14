@@ -141,13 +141,23 @@ struct State {
 pub(crate) struct IdleScreenController {
     mpv: Arc<Mpv>,
     state: Arc<Mutex<State>>,
+    /// Notified on every real `show`/`hide` transition (never from the
+    /// per-second refresh thread's own re-renders, which don't change
+    /// `current`) so `Player` can push an unprompted `PlaybackUpdate` for
+    /// idle/active transitions that happen off of any of its own methods --
+    /// e.g. the eof watcher bringing the clock back after a natural
+    /// end-of-file. A plain callback, not a `PlaybackUpdateMessage` sender
+    /// directly, so this module doesn't need to know about FCast message
+    /// types.
+    on_change: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl IdleScreenController {
-    pub(crate) fn new(mpv: Arc<Mpv>) -> Self {
+    pub(crate) fn new(mpv: Arc<Mpv>, on_change: Option<Arc<dyn Fn() + Send + Sync>>) -> Self {
         Self {
             mpv,
             state: Arc::new(Mutex::new(State::default())),
+            on_change,
         }
     }
 
@@ -191,6 +201,9 @@ impl IdleScreenController {
                 let _ = screen.render(&mpv, 255);
             });
         }
+        if let Some(cb) = &self.on_change {
+            cb();
+        }
         Ok(())
     }
 
@@ -213,6 +226,9 @@ impl IdleScreenController {
             self.mpv
                 .command("osd-overlay", &[&id.to_string(), "none", ""])
                 .map_err(|e| anyhow::anyhow!("osd-overlay (clear) failed: {e:?}"))?;
+        }
+        if let Some(cb) = &self.on_change {
+            cb();
         }
         Ok(())
     }

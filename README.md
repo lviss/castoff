@@ -79,8 +79,20 @@ Implemented opcodes (all of FCast v2's playback-control surface):
 | `Version` (11) | bidirectional | replies with the protocol version this daemon speaks (`2`) |
 | `Ping` (12) | bidirectional | replies `Pong` |
 
-`PlaybackUpdate`/`VolumeUpdate` are sent as an immediate reply to a command, not on a polling
-timer -- see [Design principles](#design-principles).
+Every connected sender keeps its FCast TCP connection open (`daemon/src/main.rs`'s
+`handle_connection` reads one persistent socket per sender, not a reconnect-per-command model),
+and the daemon uses that for more than command replies: `PlaybackUpdate` is sent both as an
+immediate reply to the command that caused it (unchanged) *and* pushed, unprompted, to every
+other connected sender the moment playback state changes for any reason -- a command on a
+different connection, or an async transition like mpv actually starting to render
+(`PlaybackRestart`) or a clip reaching end-of-file on its own. While the last known state is
+`Playing`, each connection also gets a `PlaybackUpdate` on a further ~1s tick, recomputed from
+mpv at that moment so its `time`/`generationTime` advance and a sender's progress bar can track
+playback live without polling the daemon; that tick stops entirely while
+idle or paused (see [Design principles](#design-principles)). `VolumeUpdate` is unaffected: still
+only an immediate reply to `SetVolume`, on no timer. Wire format is unchanged -- the push path
+sends the same `PlaybackUpdateMessage` shape (`generationTime`/`state`/`time`/`duration`/`speed`)
+as the synchronous reply, just possibly more than once and without an incoming command.
 
 ### How YouTube playback works
 
@@ -425,8 +437,12 @@ this scaffold yet, but they should carry forward into every later task on this c
 - **Power efficiency.** This device runs on boat power (a battery bank, not shore mains), so the
   daemon must avoid busy-polling/wake loops, idle CPU spin, or keeping the display/decode
   pipeline active when nothing is playing. Concretely so far: the FCast TCP server is
-  event-driven (`tokio`, no polling loop); `PlaybackUpdate`/`VolumeUpdate` replies are sent only
-  in response to a command, never on a timer; mpv is configured with `hwdec=auto-safe` so decode
+  event-driven (`tokio`, no polling loop); `VolumeUpdate` replies are sent only in response to a
+  command, never on a timer. `PlaybackUpdate` is the one exception, and deliberately so: each
+  connected sender's push task (`daemon/src/main.rs`) ticks on a ~1s timer *only* while the last
+  known state is `Playing`, using `tokio::select!` so that arm isn't even polled while idle/paused
+  -- the timer itself only exists (and only costs anything) for the duration of active playback,
+  not as a standing wake loop; mpv is configured with `hwdec=auto-safe` so decode
   uses hardware acceleration when available; and `stop`/idle leaves mpv's *decode* pipeline
   dormant rather than rendering a video. Displaying a web page follows the same rule: the browser
   engine keeps the page live, so the daemon polls nothing and re-fetches nothing on a timer (a

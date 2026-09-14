@@ -454,12 +454,8 @@ fn solid_color_page(color: [u8; 3]) -> String {
     )
 }
 
-/// Send one FCast frame and read the daemon's reply frame back.
-fn fcast(
-    stream: &mut TcpStream,
-    opcode: u8,
-    body: Option<&serde_json::Value>,
-) -> serde_json::Value {
+/// Write one FCast frame to the daemon.
+fn write_command(stream: &mut TcpStream, opcode: u8, body: Option<&serde_json::Value>) {
     let body = body.map(|b| b.to_string()).unwrap_or_default();
     let mut frame = Vec::with_capacity(5 + body.len());
     frame.extend_from_slice(&(1 + body.len() as u32).to_le_bytes());
@@ -467,7 +463,10 @@ fn fcast(
     frame.extend_from_slice(body.as_bytes());
     stream.write_all(&frame).expect("write FCast frame");
     stream.flush().expect("flush FCast frame");
+}
 
+/// Read one `PlaybackUpdate` frame from the daemon, panicking on anything else.
+fn read_playback_update(stream: &mut TcpStream) -> serde_json::Value {
     let mut len_buf = [0u8; 4];
     stream
         .read_exact(&mut len_buf)
@@ -477,10 +476,64 @@ fn fcast(
     stream.read_exact(&mut payload).expect("read reply payload");
     assert_eq!(
         payload[0], OPCODE_PLAYBACK_UPDATE,
-        "expected a PlaybackUpdate reply, got opcode {}",
+        "expected a PlaybackUpdate, got opcode {}",
         payload[0]
     );
     serde_json::from_slice(&payload[1..]).expect("parse PlaybackUpdate body")
+}
+
+/// Send one FCast frame and drain `PlaybackUpdate` frames until one reports
+/// `state`. The daemon pushes unprompted `PlaybackUpdate` frames onto this same
+/// connection -- on every state change from any sender, plus a ~1s tick while
+/// playing -- so a command's own reply can sit behind a backlog of pushed
+/// frames; a single read is not enough. Frames are drained until the command's
+/// result is seen, or the deadline passes.
+fn fcast_state(
+    stream: &mut TcpStream,
+    opcode: u8,
+    body: Option<&serde_json::Value>,
+    state: u64,
+    what: &str,
+) -> serde_json::Value {
+    write_command(stream, opcode, body);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let reply = read_playback_update(stream);
+        if reply["state"].as_u64() == Some(state) {
+            return reply;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {what}; last PlaybackUpdate: {reply}"
+        );
+    }
+}
+
+/// Send one FCast frame and return the daemon's *fresh* reply, skipping any
+/// unprompted frames that were already queued before the command was sent
+/// (they carry an older `generationTime`). Unlike [`fcast_state`] this returns
+/// whatever the daemon currently reports, so callers that need a condition
+/// re-send until it holds (see `wait_for_status`).
+fn fcast_reply(
+    stream: &mut TcpStream,
+    opcode: u8,
+    body: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let sent_at = now_millis();
+    write_command(stream, opcode, body);
+    loop {
+        let reply = read_playback_update(stream);
+        if reply["generationTime"].as_u64().unwrap_or(0) >= sent_at {
+            return reply;
+        }
+    }
+}
+
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// One decoded composited frame (RGB, 3 bytes per pixel).
@@ -615,13 +668,15 @@ fn casting_a_webpage_puts_that_page_on_screen_and_stop_returns_to_idle() {
 
     // Cast the page exactly as a sender would: `container` says text/html
     // (see `fcast::PlayMessage::explicit_target`), the daemon owns the rest.
-    let reply = fcast(
+    let reply = fcast_state(
         &mut control,
         OPCODE_PLAY,
         Some(&serde_json::json!({
             "container": "text/html",
             "url": format!("http://127.0.0.1:{page_port}/"),
         })),
+        STATE_PLAYING,
+        "the cast page to be reported playing",
     );
     assert_eq!(
         reply["state"], STATE_PLAYING,
@@ -646,13 +701,15 @@ fn casting_a_webpage_puts_that_page_on_screen_and_stop_returns_to_idle() {
     // ProcessSingleton lock aborts (or defers to the first and exits), and the
     // sender's second page never appears. This asserts on real pixels: only
     // the second page's colour may fill the screen.
-    let reply = fcast(
+    let reply = fcast_state(
         &mut control,
         OPCODE_PLAY,
         Some(&serde_json::json!({
             "container": "text/html",
             "url": format!("http://127.0.0.1:{second_page_port}/"),
         })),
+        STATE_PLAYING,
+        "the second cast page to be reported playing",
     );
     assert_eq!(reply["state"], STATE_PLAYING, "reply: {reply}");
     let after_second = wait_for_color(
@@ -672,12 +729,14 @@ fn casting_a_webpage_puts_that_page_on_screen_and_stop_returns_to_idle() {
 
     // Media supersedes the page: the engine goes away and mpv takes the
     // screen back (a real synthetic video, decoded and painted by mpv).
-    let reply = fcast(
+    let reply = fcast_state(
         &mut control,
         OPCODE_PLAY,
         Some(&serde_json::json!({
             "url": "av://lavfi:color=c=cyan:size=640x360:rate=10:duration=60",
         })),
+        STATE_PLAYING,
+        "media playback to be reported playing",
     );
     assert_eq!(reply["state"], STATE_PLAYING, "reply: {reply}");
     let after_media = if session.mpv_pixels_expected {
@@ -707,7 +766,13 @@ fn casting_a_webpage_puts_that_page_on_screen_and_stop_returns_to_idle() {
 
     // Stop returns the screen to the daemon's idle behaviour: the page's
     // pixels are gone for good.
-    let reply = fcast(&mut control, OPCODE_STOP, None);
+    let reply = fcast_state(
+        &mut control,
+        OPCODE_STOP,
+        None,
+        STATE_IDLE,
+        "Stop to return to idle",
+    );
     assert_eq!(reply["state"], STATE_IDLE, "reply after Stop: {reply}");
     let after_stop = if session.mpv_pixels_expected {
         wait_for_color_gone(
@@ -748,7 +813,7 @@ fn wait_for_status(
 ) -> serde_json::Value {
     let deadline = Instant::now() + timeout;
     loop {
-        let reply = fcast(control, OPCODE_RESUME, None);
+        let reply = fcast_reply(control, OPCODE_RESUME, None);
         if pred(&reply) {
             return reply;
         }
@@ -803,12 +868,14 @@ fn unclassified_page_reaches_the_browser_after_a_failed_media_attempt() {
 
     // No `container`: exactly what a client that only knows a URL sends.
     let played_at = Instant::now();
-    let reply = fcast(
+    let reply = fcast_state(
         &mut control,
         OPCODE_PLAY,
         Some(&serde_json::json!({
             "url": format!("http://127.0.0.1:{page_port}/"),
         })),
+        STATE_PLAYING,
+        "the unclassified page to be reported playing",
     );
     assert_eq!(reply["state"], STATE_PLAYING, "reply: {reply}");
 
@@ -874,12 +941,14 @@ fn unclassified_playlist_then_page_displays_the_page() {
 
     // Unrouted playlist URL: the daemon tries it as media first, and mpv
     // expands and plays it.
-    let reply = fcast(
+    let reply = fcast_state(
         &mut control,
         OPCODE_PLAY,
         Some(&serde_json::json!({
             "url": format!("http://127.0.0.1:{list_port}/list.m3u"),
         })),
+        STATE_PLAYING,
+        "the playlist to be reported playing",
     );
     assert_eq!(reply["state"], STATE_PLAYING, "reply: {reply}");
     // Wait until the playlist's media is actually playing, so it is in flight
@@ -898,12 +967,14 @@ fn unclassified_playlist_then_page_displays_the_page() {
     // Supersede it with an unrouted page. mpv stops the playlist's entry first
     // (an `EndFile` for an entry the daemon never submitted), then fails to
     // load the page; the daemon must still fall back.
-    let reply = fcast(
+    let reply = fcast_state(
         &mut control,
         OPCODE_PLAY,
         Some(&serde_json::json!({
             "url": format!("http://127.0.0.1:{page_port}/"),
         })),
+        STATE_PLAYING,
+        "the page cast over the playlist to be reported playing",
     );
     assert_eq!(reply["state"], STATE_PLAYING, "reply: {reply}");
 
@@ -926,7 +997,9 @@ fn unclassified_playlist_then_page_displays_the_page() {
         "the browser engine must have fetched the page"
     );
     assert!(
-        session.console().contains("displaying it as a web page instead"),
+        session
+            .console()
+            .contains("displaying it as a web page instead"),
         "the console must say the page was handed to the browser; console tail:\n{}",
         console_tail(&session.console())
     );
@@ -949,12 +1022,14 @@ fn unclassified_direct_media_url_plays_as_media() {
     let mut control = session.connect();
 
     let played_at = Instant::now();
-    let reply = fcast(
+    let reply = fcast_state(
         &mut control,
         OPCODE_PLAY,
         Some(&serde_json::json!({
             "url": format!("http://127.0.0.1:{media_port}/clip.y4m"),
         })),
+        STATE_PLAYING,
+        "the media file to be reported playing",
     );
     assert_eq!(reply["state"], STATE_PLAYING, "reply: {reply}");
 
@@ -1010,12 +1085,14 @@ fn unclassified_youtube_url_plays_as_video() {
     let session = start_session();
     let mut control = session.connect();
 
-    let reply = fcast(
+    let reply = fcast_state(
         &mut control,
         OPCODE_PLAY,
         Some(&serde_json::json!({
             "url": "https://www.youtube.com/watch?v=jNQXAC9IVRw",
         })),
+        STATE_PLAYING,
+        "the YouTube URL to be reported playing",
     );
     assert_eq!(reply["state"], STATE_PLAYING, "reply: {reply}");
 
@@ -1079,10 +1156,12 @@ fn unclassified_ordinary_web_page_displays_in_the_browser() {
     let session = start_session();
     let mut control = session.connect();
 
-    let reply = fcast(
+    let reply = fcast_state(
         &mut control,
         OPCODE_PLAY,
         Some(&serde_json::json!({ "url": "https://example.com/" })),
+        STATE_PLAYING,
+        "the ordinary web page to be reported playing",
     );
     assert_eq!(reply["state"], STATE_PLAYING, "reply: {reply}");
     session.wait_for_console("URL is not playable as media", Duration::from_secs(30));
@@ -1101,7 +1180,12 @@ fn unclassified_ordinary_web_page_displays_in_the_browser() {
     );
 
     // A web page has no mpv timeline to report.
-    let status = fcast(&mut control, OPCODE_RESUME, None);
+    let status = wait_for_status(
+        &mut control,
+        |status| status["time"].is_null() && status["duration"].is_null(),
+        "a displayed page to report no mpv timeline",
+        Duration::from_secs(20),
+    );
     assert!(
         status["time"].is_null() && status["duration"].is_null(),
         "a displayed page must not report an mpv timeline: {status}"
@@ -1119,10 +1203,12 @@ fn a_url_nothing_can_render_falls_back_to_the_browser() {
     let _serial = exclusive_session();
     let session = start_session();
     let mut control = session.connect();
-    let reply = fcast(
+    let reply = fcast_state(
         &mut control,
         OPCODE_PLAY,
         Some(&serde_json::json!({ "url": "http://127.0.0.1:1/nothing" })),
+        STATE_PLAYING,
+        "the unrenderable URL to be reported playing",
     );
     assert_eq!(reply["state"], STATE_PLAYING, "reply: {reply}");
     let console = session.wait_for_console(
@@ -1146,10 +1232,12 @@ fn a_url_nothing_can_render_and_no_browser_is_reported_on_the_console() {
     let _serial = exclusive_session();
     let session = start_session_with(&[("CASTOFF_BROWSER", "/nonexistent/castoff-e2e-browser")]);
     let mut control = session.connect();
-    let reply = fcast(
+    let reply = fcast_state(
         &mut control,
         OPCODE_PLAY,
         Some(&serde_json::json!({ "url": "http://127.0.0.1:1/nothing" })),
+        STATE_PLAYING,
+        "the unrenderable URL to be reported playing",
     );
     assert_eq!(reply["state"], STATE_PLAYING, "reply: {reply}");
     session.wait_for_console(
