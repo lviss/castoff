@@ -237,7 +237,15 @@ fn start_session_with(extra_env: &[(&str, &str)]) -> Session {
         .env("HOME", &home)
         .env("WLR_BACKENDS", "headless")
         .env("WLR_LIBINPUT_NO_DEVICES", "1")
-        .env("CASTOFF_PORT", daemon_port.to_string());
+        .env("CASTOFF_PORT", daemon_port.to_string())
+        // The captain's box had a generated nix-shell `TMPDIR` ~120 characters
+        // deep. Chromium used to build its profile under `TMPDIR`, where the
+        // process-singleton socket no longer fit the kernel's unix-socket
+        // limit, so the engine aborted with `FATAL ... Socket path too long`
+        // before painting anything (the page simply never appeared). Every
+        // session in this file now runs under exactly that shape, so the page
+        // cases below are the regression test.
+        .env("TMPDIR", deep_tmpdir(&runtime_dir));
     if let Ok(flags) = std::env::var("CASTOFF_E2E_BROWSER_FLAGS") {
         command.env("CASTOFF_BROWSER", browser_wrapper(&runtime_dir, &flags));
     }
@@ -286,6 +294,19 @@ fn start_session_with(extra_env: &[(&str, &str)]) -> Session {
     // which some environments do not forward to a client's redirected fd.)
     session.wait_for_console("FCast control server listening", Duration::from_secs(20));
     session
+}
+
+/// A deliberately deep temp directory, mirroring the generated nix-shell
+/// `TMPDIR` (a ~120-character path) that made Chromium's process-singleton
+/// socket too long on the captain's box. Lives under the session's runtime
+/// dir, so it is cleaned up with the session.
+fn deep_tmpdir(root: &Path) -> PathBuf {
+    let mut dir = root.to_path_buf();
+    while dir.display().to_string().len() < 120 {
+        dir.push("nix-shell-1310600-2273476824");
+    }
+    std::fs::create_dir_all(&dir).expect("create deep TMPDIR");
+    dir
 }
 
 /// Whether mpv can be expected to present frames into this session's

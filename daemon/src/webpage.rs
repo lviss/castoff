@@ -62,20 +62,57 @@ const KILL_GRACE: Duration = Duration::from_secs(2);
 /// arbitrary string from ever reaching Chromium's argv.
 const ALLOWED_SCHEMES: [&str; 3] = ["http://", "https://", "file://"];
 
-/// Distinguishes browser profile directories when more than one
-/// `WebpageController` exists in one process (e.g. the test suite, which
-/// builds a `Player` per test).
+/// Root the browser engine's directories are created under, unless
+/// `CASTOFF_BROWSER_PROFILE_DIR` overrides it. Deliberately a *fixed* short
+/// absolute path rather than `std::env::temp_dir()`: `temp_dir()` honours
+/// `TMPDIR`, and a deep ambient `TMPDIR` is what broke the engine on real
+/// hardware (see `Browser::temp_dir` and `SINGLETON_PATH_RESERVE`).
+const BROWSER_ROOT: &str = "/tmp";
+
+/// What Chromium appends to its temp directory for its process singleton:
+/// `/org.chromium.Chromium.<6 random chars>/SingletonSocket` (plus the
+/// separator). Reserved up front rather than measured per launch, because the
+/// random component only exists once Chromium is running -- and this has to
+/// be checked before it runs.
+const SINGLETON_PATH_RESERVE: usize = 64;
+
+/// The longest singleton socket path Linux accepts: `sun_path` is 108 bytes
+/// *including* the terminating NUL.
+const MAX_SOCKET_PATH: usize = 107;
+
+/// Distinguishes browser directories when more than one `WebpageController`
+/// exists in one process (e.g. the test suite, which builds a `Player` per
+/// test).
 static PROFILE_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// How to launch the browser engine.
 pub(crate) struct Browser {
     program: String,
-    /// Chromium's on-disk state. Deliberately under the system temp
-    /// directory (tmpfs on the appliance): a dashboard needs no durable
-    /// profile, and keeping the browser's cache/profile out of the disk
-    /// keeps the box from spinning it up. Later authenticated-dashboard work
-    /// can point this at a persistent state dir instead.
+    /// Chromium's on-disk state: `<root>/castoff-browser-<pid>-<n>`, one per
+    /// `WebpageController` and shared by every engine that controller starts
+    /// (a persistent profile is what later authenticated pages need -- see
+    /// `WebpageController::show`).
+    ///
+    /// Under a *fixed* short root, never `std::env::temp_dir()`: `/tmp` is
+    /// short and is tmpfs on the appliance, so the profile stays non-durable
+    /// (no disk writes) by design, which is what a dashboard needs, and its
+    /// length does not depend on the caller's `TMPDIR`.
+    /// `CASTOFF_BROWSER_PROFILE_DIR` can move it, and `Browser::spawn`
+    /// refuses a root without room to sit before Chromium's socket limit
+    /// rather than letting the engine die cryptically.
     profile_dir: PathBuf,
+    /// The engine's `TMPDIR`: `<root>/castoff-browser-tmp-<pid>-<n>`.
+    ///
+    /// Chromium's process singleton is a unix socket it creates at
+    /// `<TMPDIR>/org.chromium.Chromium.<random>/SingletonSocket` -- under
+    /// *TMPDIR*, not under `--user-data-dir`. Verified against the pinned
+    /// Chromium: a deep `TMPDIR` aborts with `FATAL ... Socket path too
+    /// long` even with a short profile, while a short `TMPDIR` with a deep
+    /// profile works. Inheriting the daemon's `TMPDIR` therefore killed the
+    /// engine on the captain's box, whose generated nix-shell `TMPDIR` is
+    /// ~120 characters; the engine gets this fixed short one instead, and
+    /// `Browser::spawn` creates it before launching.
+    temp_dir: PathBuf,
 }
 
 impl Browser {
@@ -85,15 +122,51 @@ impl Browser {
         // host can point at another Chromium build (or a wrapper around it)
         // without rebuilding, and is used by the test suite.
         let program = std::env::var("CASTOFF_BROWSER").unwrap_or_else(|_| "chromium".to_string());
-        let profile_dir = std::env::temp_dir().join(format!(
-            "castoff-browser-{}-{}",
-            std::process::id(),
-            PROFILE_SEQ.fetch_add(1, Ordering::Relaxed),
-        ));
+        let root = std::env::var("CASTOFF_BROWSER_PROFILE_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from(BROWSER_ROOT));
+        let seq = PROFILE_SEQ.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
         Self {
             program,
-            profile_dir,
+            profile_dir: root.join(format!("castoff-browser-{pid}-{seq}")),
+            temp_dir: root.join(format!("castoff-browser-tmp-{pid}-{seq}")),
         }
+    }
+
+    /// Refuse to launch Chromium when either directory it will use leaves no
+    /// room for the process-singleton socket Chromium puts under its
+    /// `TMPDIR`.
+    ///
+    /// Chromium's own way of reporting this is a `FATAL` from deep inside
+    /// `process_singleton_posix.cc` ("Socket path too long") followed by an
+    /// immediate exit, which on a TV box looks like "nothing happened". This
+    /// says it up front, with the path and the numbers, and the caller turns
+    /// it into an error the daemon's console and the sender both see.
+    fn check_paths_fit(&self) -> Result<()> {
+        for (what, path) in [("temp", &self.temp_dir), ("profile", &self.profile_dir)] {
+            let rendered = path.display();
+            let longest = rendered.to_string().len() + SINGLETON_PATH_RESERVE;
+            if longest > MAX_SOCKET_PATH {
+                error!(
+                    directory = %rendered,
+                    which = what,
+                    path_len_with_singleton = longest,
+                    limit = MAX_SOCKET_PATH,
+                    "refusing to start the browser engine: this path leaves no room for \
+                     Chromium's process-singleton unix socket, which would abort the engine with \
+                     `Socket path too long` before it painted anything; the browser root must be \
+                     a short path"
+                );
+                anyhow::bail!(
+                    "browser {what} path is too long for Chromium's process-singleton socket: \
+                     {rendered} (+{SINGLETON_PATH_RESERVE} bytes of Chromium socket path = \
+                     {longest}, limit {MAX_SOCKET_PATH}); set CASTOFF_BROWSER_PROFILE_DIR to a \
+                     shorter root"
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Chromium argv for `url` (program excluded). Pure so tests can assert
@@ -148,9 +221,23 @@ impl Browser {
     /// Start Chromium on `url`. Returns as soon as the process is spawned;
     /// loading and painting the page happen inside the engine afterwards.
     fn spawn(&self, url: &str) -> Result<Child> {
+        self.check_paths_fit()?;
+        // Chromium needs its `TMPDIR` to exist before it starts (it creates
+        // its process-singleton socket under it), and it is one shared
+        // directory per controller, like the profile.
+        std::fs::create_dir_all(&self.temp_dir).with_context(|| {
+            format!(
+                "failed to create the browser engine's temp dir {:?}",
+                self.temp_dir
+            )
+        })?;
         let mut command = Command::new(&self.program);
         command
             .args(self.args(url))
+            // The engine's own temp dir, so Chromium's process-singleton
+            // socket path cannot inherit a deep ambient `TMPDIR` -- see the
+            // field's doc comment.
+            .env("TMPDIR", &self.temp_dir)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             // Chromium's own diagnostics -- a page that failed to load, a
@@ -354,6 +441,7 @@ mod tests {
         let browser = Browser {
             program: "chromium".to_string(),
             profile_dir: PathBuf::from("/tmp/castoff-browser-test"),
+            temp_dir: PathBuf::from("/tmp/castoff-browser-tmp-test"),
         };
         let args = browser.args("http://127.0.0.1:8000/dashboard");
 
@@ -368,6 +456,73 @@ mod tests {
         // The URL must never be its own argv element, where Chromium could
         // read it as a flag.
         assert!(!args.iter().any(|a| a == "http://127.0.0.1:8000/dashboard"));
+    }
+
+    /// Regression test for the failure seen on real hardware: a deep ambient
+    /// `TMPDIR` (there: a ~120-character nix-shell path) pushed Chromium's
+    /// process-singleton socket past the kernel's unix-socket limit and the
+    /// engine aborted with `FATAL ... Socket path too long` before painting
+    /// anything. Both directories the daemon hands Chromium must therefore
+    /// come from the fixed short root, not from whatever `TMPDIR` says.
+    #[test]
+    fn browser_directories_are_short_and_tmpdir_independent() {
+        let browser = Browser::from_env();
+        for dir in [&browser.profile_dir, &browser.temp_dir] {
+            assert!(
+                dir.starts_with(BROWSER_ROOT),
+                "{dir:?} must live under the fixed short root {BROWSER_ROOT:?}"
+            );
+            let longest = dir.display().to_string().len() + SINGLETON_PATH_RESERVE;
+            assert!(
+                longest <= MAX_SOCKET_PATH,
+                "{dir:?} leaves only {} of {MAX_SOCKET_PATH} bytes for Chromium's singleton \
+                 socket",
+                MAX_SOCKET_PATH - longest,
+            );
+        }
+        browser
+            .check_paths_fit()
+            .expect("the default directories must fit");
+    }
+
+    /// And when one of them *cannot* fit -- a caller-supplied root that is too
+    /// deep -- the daemon must say so before Chromium does, rather than
+    /// letting the engine die with an internal message: no process is started,
+    /// and the error names the path and the limit. Both the deep-`TMPDIR`
+    /// shape (the real failure) and a deep profile are covered.
+    #[test]
+    fn a_path_without_room_for_the_singleton_socket_is_refused_legibly() {
+        let too_deep = format!("/tmp/{}", "nested/".repeat(40));
+        let deep_temp = Browser {
+            program: "chromium".to_string(),
+            profile_dir: PathBuf::from("/tmp/castoff-browser-test"),
+            temp_dir: PathBuf::from(&too_deep),
+        };
+        let deep_profile = Browser {
+            program: "chromium".to_string(),
+            profile_dir: PathBuf::from(&too_deep),
+            temp_dir: PathBuf::from("/tmp/castoff-browser-tmp-test"),
+        };
+
+        for browser in [&deep_temp, &deep_profile] {
+            let err = browser
+                .check_paths_fit()
+                .expect_err("a directory this deep must be refused");
+            let message = err.to_string();
+            assert!(
+                message.contains(&too_deep) && message.contains(&MAX_SOCKET_PATH.to_string()),
+                "the refusal must name the path and the limit: {message}"
+            );
+            // `spawn` is what reaches Chromium, so it must refuse before that.
+            let err = browser
+                .spawn("http://127.0.0.1:8000/dashboard")
+                .expect_err("spawn must refuse instead of launching Chromium");
+            assert!(
+                err.to_string()
+                    .contains("too long for Chromium's process-singleton socket"),
+                "unexpected spawn error: {err}"
+            );
+        }
     }
 
     #[test]

@@ -218,9 +218,15 @@ The daemon supervises the engine (`daemon/src/webpage.rs`):
 
 The daemon never re-fetches or re-renders the page on a timer: the engine keeps it live, and any
 refresh cadence belongs to the page itself (Grafana's auto-refresh, say), which is both the
-data-efficient and the correct behavior. The engine's profile lives under the system temp
-directory (tmpfs on the appliance), so browsing state never spins up the disk; while a page is up,
-mpv's decode pipeline is stopped, so nothing plays or decodes behind it.
+data-efficient and the correct behavior. The engine's profile and its `TMPDIR` both live under a
+*fixed* short root (`/tmp`, tmpfs on the appliance; `CASTOFF_BROWSER_PROFILE_DIR` moves it), not
+under whatever `TMPDIR` the daemon inherited: Chromium builds its process-singleton unix socket at
+`<TMPDIR>/org.chromium.Chromium.<random>/SingletonSocket`, and a deep ambient `TMPDIR` made that
+path exceed the kernel's limit, aborting the engine with `FATAL ... Socket path too long` before
+the page appeared (seen on real hardware). Browsing state therefore never spins up the disk, and
+the daemon refuses a root without room for that socket with a plain-language console error instead
+of letting Chromium die cryptically; while a page is up, mpv's decode pipeline is stopped, so
+nothing plays or decodes behind it.
 
 Not supported: pages behind a login (there is no credential flow yet -- see
 [Not yet implemented](#not-yet-implemented-follow-up-work)), DRM-protected video, and any

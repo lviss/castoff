@@ -171,6 +171,18 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   watcher on the main handle, the routing/error watcher `spawn_async_event_watcher`, and the
   lifecycle watcher) has its own client/queue to avoid contention.
 
+- Chromium's process-singleton socket is created under the engine's **`TMPDIR`**
+  (`<TMPDIR>/org.chromium.Chromium.<random>/SingletonSocket`), *not* under `--user-data-dir`:
+  verified against the pinned Chromium -- a deep `TMPDIR` aborts with
+  `FATAL ... Socket path too long` (exit 133) even with a short profile, while a short `TMPDIR`
+  with a deep profile works. The captain's box had a generated nix-shell `TMPDIR` ~120 characters
+  deep, so the engine died before painting and the page never appeared. `daemon/src/webpage.rs`
+  therefore gives the engine a fixed short `TMPDIR` *and* profile root (`/tmp`,
+  `CASTOFF_BROWSER_PROFILE_DIR` to move it), checks both fit Chromium's 107-byte socket limit and
+  refuses with a plain-language console error otherwise, and `daemon/tests/webpage_display.rs`
+  runs every session's daemon under a deliberately deep `TMPDIR` so the page cases cover this.
+  Don't reintroduce `std::env::temp_dir()` for either path.
+
 ## Maintaining this file
 
 Keep this file for knowledge useful to almost every future agent session in this project.
