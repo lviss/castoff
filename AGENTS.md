@@ -189,6 +189,32 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   runs every session's daemon under a deliberately deep `TMPDIR` so the page cases cover this.
   Don't reintroduce `std::env::temp_dir()` for either path.
 
+- **Single-window display is the captain's stated direction for where castoff is going
+  (2026-09-14) and is not implemented yet.** The goal: render *everything* -- mpv video, images,
+  dashboards/web pages -- into one daemon-owned window, so the daemon is a normal windowed app on
+  a desktop with a window manager (not kiosk-fullscreen-only), and so castoff owns its on-screen
+  displays, volume indicators and picture-in-picture consistently, whatever is on screen.
+  Captain-stated constraints: an *invisible/off-screen* Chromium whose frames are piped into that
+  window is the intended mechanism (not Chromium owning a visible toplevel, which is what
+  `daemon/src/webpage.rs` does today); Chromium specifically stays because Widevine/Netflix DRM is
+  a hard requirement; a separate X server for compositing was considered and rejected for
+  dependency weight. Findings of the 2026-09-14 investigation (full report:
+  `/ai/firstmate/data/castoff-daemon-webpage-display/single-window-investigation.md`): the only
+  realistic invisible-Chromium path is CEF *windowless* (off-screen) rendering, whose
+  `OnAcceleratedPaint` hands DMABUF planes to a host GL/wgpu context -- `cef`
+  (tauri-apps/cef-rs, `accelerated_osr` feature) is the maintained binding, while
+  `welding`/wgpu-weld is the same idea and a useful reference but a one-person prototype --
+  combined with mpv's *render API* (`libmpv2::render::RenderContext`; OpenGL only, no Vulkan) so
+  the daemon owns the Wayland toplevel and composites both sources. Chromium-the-process cannot be
+  made invisible here: Cage fullscreens every toplevel and has no hidden-window concept, and
+  headless Chromium has no Widevine. Before building any of it, CEF+Widevine has to be settled by
+  a real probe: nixpkgs' `cef-binary` (Spotify's builds; CEF's required GN args set
+  `enable_widevine`) has the CDM plumbing but *not* the CDM binary, so `widevine-cdm` must be
+  placed where libcef finds it. PR https://github.com/lviss/castoff/pull/6's second-client model is
+  an interim: its FCast `container` routing, playlist-entry-id attribution and probe/fallback
+  logic survive a single-window rewrite unchanged, while `webpage.rs`'s process supervision and
+  the Chromium `TMPDIR`/profile-singleton fix are specific to it and would be deleted.
+
 ## Maintaining this file
 
 Keep this file for knowledge useful to almost every future agent session in this project.
