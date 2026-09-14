@@ -11,9 +11,11 @@ scaffold: the TV-box daemon and its NixOS packaging. Nothing else exists yet -- 
 Right now the supported playback sources are a direct media URL and YouTube: send the daemon an
 FCast `Play` command with a remote (`http(s)://`) or local (`file://`) URL to a media file -- e.g.
 an mp4 -- or a `youtube.com`/`youtu.be` watch URL, and it loads and plays it via mpv (see
-[How YouTube playback works](#how-youtube-playback-works)). That's it: no Jellyfin, no images, no
-casting a webpage. See [Not yet implemented](#not-yet-implemented-follow-up-work) below for what's
-planned but not built.
+[How YouTube playback works](#how-youtube-playback-works)). A Play that is still loading shows an
+on-screen spinner, and starts/stops are wrapped in a short fade (see
+[On-screen feedback](#on-screen-feedback-loading-indicator-and-startstop-fade)). That's it: no
+Jellyfin, no images, no casting a webpage. See
+[Not yet implemented](#not-yet-implemented-follow-up-work) below for what's planned but not built.
 
 ## What's here
 
@@ -103,6 +105,67 @@ That URL attribution is best-effort: if a newer Play replaces an in-flight one b
 error event is drained, the logged URL may name the newer request rather than the one that
 actually failed.
 
+### On-screen feedback: loading indicator and start/stop fade
+
+A `Play` that has been accepted but has not started rendering yet does not leave the screen
+unchanged: the daemon fades whatever is on screen to black and shows a rotating spinner over it,
+so a slow network or a cold `yt-dlp` resolution reads as "working on it" instead of "nothing
+happened". Both are drawn through mpv's own OSD (`osd-overlay` ASS events) -- the same surface as
+the idle clock, in `daemon/src/overlay.rs`, not a compositor or a second window. The spinner goes
+up *before* `loadfile` is submitted and comes down the moment mpv reports `PlaybackRestart` (the
+first frame is actually rendering), not merely when the load was queued. It redraws at ~30
+frames/s (12 degrees per frame, one revolution per ~1s) and stops completely as soon as the load
+ends, errors, or is superseded. If the load fails, the spinner is torn down and the idle clock
+returns; the failure itself is still reported on the console by the error logger described above,
+never hidden behind the spinner.
+
+**What the fade covers.** A transition is two ~400ms fades through black (20 opacity steps at
+20ms each), so each direction is long enough to read on a TV as a fade rather than a cut:
+
+- **Play.** (1) The old content -- the idle clock, or a previous video -- fades to black. (2) The
+  spinner appears on the black and rotates until mpv reports the first frame is rendering. (3) The
+  spinner is removed and the black fades away to the new video.
+- **Stop.** (1) The video fades to black. (2) The idle clock fades in over that black while the
+  black backdrop stays up (so a not-yet-cleared video frame can't flash through). (3) The backdrop
+  is dropped once the clock's own opaque background covers the canvas. A `Stop` that arrives after
+  a clip already ended on its own is a no-op instead: the eof watcher has already restored the
+  clock, so there is nothing to fade and the screen does not blink.
+
+So a fade runs on *both* boundaries of a Play (old content to black, black to new video) and
+*both* boundaries of a Stop (video to black, black to idle clock). The spinner does not mask
+either fade: it is drawn only after the fade to black finishes and is cleared before the fade
+away begins.
+
+**Testing affordance: slowing the animations.** Set
+`CASTOFF_ANIMATION_SLOWDOWN=<factor>` (e.g. `10`) in the daemon's environment to scale *both*
+the fade's per-step duration and the spinner's step interval by that factor, so the sequence can
+be watched frame by frame. It is read once at startup, applies to both animations (so a slowed
+run shows the whole sequence in proportion, rather than a slow fade next to a full-speed
+spinner), and changes only the duration of an already-bounded animation: the spinner still stops
+redrawing the instant a load ends, errors, or is superseded. Unset, empty, malformed,
+non-finite, or below `1` all mean `1` (the shipping behavior), and large values are clamped, so a
+typo can't stretch a transition indefinitely. This is an operator/testing affordance, not a user
+setting, so it is deliberately an environment variable rather than a control-protocol option.
+
+Per-frame cost: a spinner frame is a single `osd-overlay` command, measured at ~11µs headless
+(`vo=null`), i.e. ~0.03% of one core at 30 redraws/s just to submit the frame -- trivial next to
+video decode, and it stops entirely once the load ends. The opaque fade rect underneath is not
+re-issued while the spinner turns, since it does not change.
+
+A fade through black was chosen over a crossfade between the new and old content because it is
+one mechanism that covers every combination -- idle clock to video and video to video, in both
+directions -- whereas a true crossfade would require compositing two decode/render pipelines at
+once, i.e. the second rendering stack and extra power draw the design principles rule out. Both
+the spinner and the fades are bounded animations that stop redrawing once settled; see
+[Design principles](#design-principles).
+
+Measured in the `.md`-documented Xvfb capture harness: the spinner redraw loop runs at 30.3
+redraws/s (one `osd-overlay` command every 33ms, 12 degrees each, so one revolution per second),
+and setting `CASTOFF_ANIMATION_SLOWDOWN=10` drops it to 3.03/s for a ~10s revolution -- exactly
+one tenth, applied to both animations. `mpv`'s own present rate under the software renderer used
+for the capture (a few frames/s) coalesces those redraws, so a real GPU presents every step;
+what is measured here is the daemon's redraw cadence, which is what the animation controls.
+
 ## Building and running
 
 ### Build the daemon on its own
@@ -182,7 +245,11 @@ this scaffold yet, but they should carry forward into every later task on this c
   an on-screen clock via mpv's own OSD instead of a black screen, redrawn on a ~1s
   `std::thread::sleep` timer rather than a busy loop or a second rendering stack. `IdleScreen` is
   a small seam (`Clock` is the only variant today) meant to grow a static-wallpaper or
-  cast-a-webpage variant later without restructuring.
+  cast-a-webpage variant later without restructuring. The loading spinner and the start/stop
+  fade live in `daemon/src/overlay.rs` and follow the same rule: the spinner redraws at ~30
+  frames/s only while a `Play` is genuinely in flight, stops the moment playback starts or the
+  load fails, and the fade is a fixed, bounded set of ~20 frames that then stops redrawing -- no
+  always-on animation and no per-frame redraw once settled.
 - **Data efficiency.** Avoid needless re-fetching over the network. This isn't exercised by the
   scaffold (there's no Immich integration yet), but it constrains that future work: when the
   Immich slideshow integration is built, it must cache each displayed image locally and only

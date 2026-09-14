@@ -1,5 +1,6 @@
 mod fcast;
 mod idle_screen;
+mod overlay;
 mod player;
 
 use std::net::SocketAddr;

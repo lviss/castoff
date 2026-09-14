@@ -35,7 +35,46 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   loaded) even with `force-window=yes` — confirmed empirically, there's no headless (no
   GPU/display) way to assert on rendered idle-screen pixels. Tests covering idle-screen-type
   behavior (`daemon/src/player.rs`'s idle-screen test) instead assert on real mpv command
-  success/failure plus real state transitions (e.g. `eof-reached`), not pixels.
+  success/failure plus real state transitions (e.g. `eof-reached`), not pixels. For a one-off
+  *visual* check there is a path: run the daemon/mpv under `Xvfb` with a real `vo`
+  (`--gpu-context=x11egl`, `LIBGL_ALWAYS_SOFTWARE=1`) and capture the X root window
+  (`import -window root`, or `x11grab` from `nixpkgs#ffmpeg-full` — the default `nixpkgs#ffmpeg`
+  is built `--disable-libxcb` and has no x11grab). `screenshot-to-file` does *not* include
+  `osd-overlay` overlays, and `vo=null` cannot screenshot at all, which is why the automated tests
+  stay headless. That Xvfb capture is how the loading spinner and start/stop fades were verified
+  end-to-end; it needs a display, so it stays a manual evidence step, not a test.
+- The loading spinner and start/stop fade live in `daemon/src/overlay.rs`, drawing through the same
+  `osd-overlay` ASS path as the idle clock (not a second rendering stack). It owns overlay ids
+  9100 (fade rect) / 9101 (spinner); the idle clock keeps 9000/9001, so don't reuse those.
+  IMPORTANT: mpv stacks `osd-overlay` layers by **recency, not by id** (empirically verified) --
+  the most recently added/updated overlay is on top. That's fine for covering video (an overlay is
+  always above video), but it means a cover rect can't reveal the idle clock: the re-created clock
+  is stacked above the rect and pops in. `Player::fade_in_idle_clock` therefore ramps the clock's
+  own `\1a` alpha up (`IdleScreenController::render_at`) over the still-opaque rect, then drops the
+  rect once the clock's opaque background covers the canvas. Do NOT reintroduce a remove+re-add of
+  the rect to force z-order: mpv can render between the remove and the add, flashing the video.
+  The spinner is an ASS vector annular sector rotated in place via
+  `\an7\pos` + `\org` + `\frz` (no font dependency; `\an5` would make the arc orbit the canvas --
+  see `spinner_ass`'s comment before touching the anchor). Every animation is a bounded
+  loop that stops on a generation-counter bump; the spinner thread is deadline-scheduled to
+  redraw at ~30/s (measured 30.3/s; 12 degrees/frame, ~1s revolution) and only while a Play is in
+  flight. Overlay draws hold the state
+  mutex across their `osd-overlay` command and `clear()` holds
+  it across its teardown, so a draw that passed the staleness check can never land after the
+  overlays were removed (the stale-spinner-draw race). `Player::play`/`stop` block ~400ms per fade
+  (20 opacity steps at 20ms), but a superseding command aborts the old animation at its next frame,
+  so the concurrent-`play` test stays fast; `play`/`stop` overlay error paths fall back through
+  `abort_loading_to_idle` -> `fade_in_idle_clock`, which rolls the overlay back to a visible clock
+  if any of its own steps fail, so a partial setup can't leave the opaque fade covering the screen.
+  `stop` decides "already idle" from the idle clock being on screen, not mpv's `idle-active`: with
+  `keep-open=yes` a clip that reached EOF is not `idle-active` though the clock is already back, so
+  keying off that would conceal the visible clock and blink it (regression test
+  `stop_after_end_of_file_does_not_blink_the_idle_clock`); `fade_in_idle_clock` skips its alpha
+  ramp in that case, since `render_at` must not run alongside `show`'s refresh thread.
+  `CASTOFF_ANIMATION_SLOWDOWN` (read once in `PlaybackOverlay::new`, parsed by `parse_slowdown`)
+  multiplies both step durations for manual inspection (measured 30.3/s -> 3.03/s at 10x);
+  unset/unusable -> 1 (shipping), clamped at
+  1000, and it never makes an animation always-on.
 - YouTube playback needs no daemon-side code: mpv's built-in `ytdl_hook` Lua script (same core in
   both CLI mpv and `libmpv2`) auto-detects non-direct-media URLs and shells out to `yt-dlp` on
   `PATH`, unconditionally, with no libmpv init tweaks required — see README's "How YouTube
@@ -62,6 +101,20 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   `MPV_ERROR_NOTHING_TO_PLAY`), so `spawn_error_logger` pairs it with
   `describe_playback_error`'s plain-language reason; keep new async-error paths going through that
   logging rather than adding a second mechanism.
+- "Playback actually started rendering" is mpv's `PlaybackRestart` event, not the `loadfile` call
+  returning (that only queues the load). A third `Mpv` client (`spawn_lifecycle_watcher`) consumes
+  it and takes the spinner down; a fresh client must `enable_event` it (`libmpv2`'s
+  `mpv_event_id::PlaybackRestart`/`EndFile`). `wait_event` returns `Some(Err(..))` for an `END_FILE`
+  with a nonzero error code, and `Ok(Event::EndFile(reason))` otherwise: `EndFileReason::Eof` while
+  the spinner is still up is treated as a load that never started and returns to the idle clock,
+  while the STOP/REDIRECT a superseding `loadfile` produces are ignored so a rapid re-Play keeps
+  its spinner (see `player.rs`'s `handle_lifecycle_event`). With the shipped `keep-open=yes`, a
+  normal EOF emits no `END_FILE` at all (mpv pauses at `eof-reached` and the idle clock returns via
+  that property watcher), so the EOF arm is defensive; it could not be produced end-to-end in
+  tests, so `end_of_file_without_playback_restart_returns_to_idle_clock` drives
+  `handle_lifecycle_event` directly with the real event. Each mpv event consumer (idle-screen eof
+  watcher on the main handle, error logger, lifecycle watcher) has its own client/queue to avoid
+  contention.
 
 ## Maintaining this file
 

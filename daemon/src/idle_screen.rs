@@ -60,27 +60,31 @@ impl IdleScreen {
 
     /// Draw one frame of this idle screen using mpv's own OSD facilities
     /// (an ASS overlay), rather than a second rendering stack or a second
-    /// Cage-visible client.
-    fn render(self, mpv: &Mpv) -> Result<()> {
+    /// Cage-visible client. `opacity` is 0 (invisible) to 255 (fully opaque),
+    /// applied to both the background and the content so the screen can be
+    /// faded in without a separate cover layer.
+    fn render(self, mpv: &Mpv, opacity: u8) -> Result<()> {
         match self {
             IdleScreen::Clock => {
                 let text = local_time_hh_mm();
                 let cx = CANVAS_WIDTH / 2;
                 let cy = CANVAS_HEIGHT / 2;
-                // An opaque black rectangle covering the whole canvas -- so
-                // the last video frame doesn't linger behind the clock --
-                // and the time, centered (`\an5`) at a large font size, are
-                // sent as two separate ASS events/overlays: see
-                // `OSD_OVERLAY_BG_ID`'s doc comment for why they can't share
-                // one event.
+                // ASS alpha is inverted from opacity: 00 is opaque, FF is
+                // transparent.
+                let alpha = 255 - opacity;
+                // A black rectangle covering the whole canvas -- so the last
+                // video frame doesn't linger behind the clock -- and the
+                // time, centered (`\an5`) at a large font size, are sent as
+                // two separate ASS events/overlays: see `OSD_OVERLAY_BG_ID`'s
+                // doc comment for why they can't share one event.
                 let bg = format!(
-                    "{{\\an7\\pos(0,0)\\1c&H000000&\\1a&H00&\\bord0\\shad0\\p1}}\
+                    "{{\\an7\\pos(0,0)\\1c&H000000&\\1a&H{alpha:02X}&\\bord0\\shad0\\p1}}\
                      m 0 0 l {w} 0 l {w} {h} l 0 {h}{{\\p0}}",
                     w = CANVAS_WIDTH,
                     h = CANVAS_HEIGHT,
                 );
                 let fg = format!(
-                    "{{\\an5\\pos({cx},{cy})\\1c&HFFFFFF&\\1a&H00&\\fs{fs}\\bord0\\shad0}}{text}",
+                    "{{\\an5\\pos({cx},{cy})\\1c&HFFFFFF&\\1a&H{alpha:02X}\\fs{fs}\\bord0\\shad0}}{text}",
                     fs = CLOCK_FONT_SIZE,
                 );
                 mpv.command(
@@ -150,8 +154,18 @@ impl IdleScreenController {
         self.state.lock().unwrap().current
     }
 
+    /// Render `screen` at a fraction of full opacity without changing which
+    /// screen is current or starting the refresh timer. `Player` uses this to
+    /// fade the idle clock in on a Stop or a failed load: the clock is itself
+    /// an OSD overlay, so `mpv`'s recency-based stacking means a cover rect
+    /// cannot reveal it -- fading its own alpha in is the crossfade. The
+    /// caller must not use this while `show`'s refresh thread is running.
+    pub(crate) fn render_at(&self, screen: IdleScreen, opacity: u8) -> Result<()> {
+        screen.render(&self.mpv, opacity)
+    }
+
     pub(crate) fn show(&self, screen: IdleScreen) -> Result<()> {
-        screen.render(&self.mpv)?;
+        screen.render(&self.mpv, 255)?;
 
         let generation = {
             let mut state = self.state.lock().unwrap();
@@ -172,7 +186,7 @@ impl IdleScreenController {
                 if !still_current {
                     return;
                 }
-                let _ = screen.render(&mpv);
+                let _ = screen.render(&mpv, 255);
             });
         }
         Ok(())
