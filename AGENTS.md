@@ -176,6 +176,42 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   `handle_lifecycle_event` directly with the real event. Each mpv event consumer (idle-screen eof
   watcher on the main handle, the routing/error watcher `spawn_async_event_watcher`, and the
   lifecycle watcher) has its own client/queue to avoid contention.
+- Every FCast sender's persistent socket (`handle_connection` in `main.rs`) is split
+  (`TcpStream::into_split`) into an owned read half driving the existing per-connection reply loop
+  and an owned write half shared (`Arc<tokio::sync::Mutex<OwnedWriteHalf>>`) with that connection's
+  push task, so the synchronous command-reply path and the unprompted `PlaybackUpdate` push path
+  (`Player::subscribe_status`/`main.rs`'s `push_updates`) can never interleave bytes of two frames
+  onto the same wire. `Player`'s broadcast is a `tokio::sync::watch::Sender<PlaybackUpdateMessage>`,
+  not `broadcast`, on purpose: every subscriber only ever cares about the *current* status, so
+  `watch`'s coalescing-to-latest-value semantics are exactly right and sidestep `broadcast`'s
+  slow-subscriber lag/`RecvError::Lagged` entirely -- there is no backpressure concern to design
+  around here. Each push task's periodic ~1s tick is gated by a `tokio::select!` arm's `if
+  last_state == Playing` guard, so the interval future isn't even polled while idle/paused. That
+  tick takes a *fresh* `Player::status()` snapshot (via `spawn_blocking`, like `send_status`),
+  never the `watch` value: the watch only changes on a state change, so re-sending it would repeat
+  the same `time`/`generationTime` every tick and no progress bar would ever advance.
+  `snapshot_status` (in `player.rs`) is the single status shape all publishers use -- the six
+  state-changing `Player` methods, the idle-screen `on_change` callback, `handle_lifecycle_event`'s
+  `PlaybackRestart` arm, and `fall_back_to_browser`; it takes `&Mpv` + `&WebpageController` rather
+  than `&Player` so those non-`Player` contexts can call it. `fall_back_to_browser` must publish
+  after `webpage.show` succeeds: that is the only false->true `webpage.is_active()` flip that
+  neither an idle-screen callback nor a `Player` method covers, and without it a client would stay
+  stuck on the `Idle` the preceding `idle.show` published -- the ~1s tick only starts once a
+  subscriber has seen `Playing`, so it would never self-correct. A web page that exits on its own
+  *is* covered by the tick (last state was `Playing`) rather than by a publish: `webpage.rs` clears
+  its active page from the reaping thread with no callback, so the tick arm itself folds the
+  observed state back into `last_state`. That fold is load-bearing -- without it the tick would
+  keep firing every second for the life of the connection after such a transition, the standing
+  wake loop the power-efficiency principle forbids; `main.rs`'s
+  `periodic_push_stops_when_playback_ends` covers the tick stopping.
+- The synchronous `PlaybackUpdate` reply to a `Play` command (and any push fired by `play()`'s own
+  end-of-method `publish_status()` call) can legitimately still report `state: Idle`: mpv's
+  `idle-active` property does not necessarily flip to `false` synchronously within the
+  `loadfile`/unpause calls `Player::play` makes -- like the async playback-error/`PlaybackRestart`
+  timing documented above, mpv resolves this off that call stack. A real client (or a test
+  asserting over the wire, see `main.rs`'s `periodic_push_only_fires_while_playing`) must not
+  assume the very first `PlaybackUpdate` after `Play` already reports `Playing`; wait for one that
+  does, or rely on the push path's later `PlaybackRestart`-triggered update instead.
 
 - Chromium's process-singleton socket is created under the engine's **`TMPDIR`**
   (`<TMPDIR>/org.chromium.Chromium.<random>/SingletonSocket`), *not* under `--user-data-dir`:

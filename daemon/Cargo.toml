@@ -12,7 +12,9 @@ libmpv2 = "6"
 # outcomes to the exact `loadfile` submission they belong to by that id (see
 # `daemon/src/player.rs`), which the safe `Event::EndFile` cannot express.
 libmpv2-sys = "4"
-tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "sync"] }
+# `time` is what the per-connection PlaybackUpdate push task needs for its
+# roughly-once-a-second tick while playing (see `main.rs`).
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "sync", "time"] }
 serde = { version = "1", features = ["derive"] }
 serde_repr = "0.1"
 serde_json = "1"
