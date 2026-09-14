@@ -579,6 +579,13 @@ impl Player {
         self.mpv
             .command("stop", &[])
             .map_err(|e| anyhow::anyhow!("stop before displaying a web page failed: {e:?}"))?;
+        // A media `Play` this page supersedes may have left the loading
+        // overlay (and its redraw thread) up. Take it down before drawing the
+        // clock that sits behind the page: otherwise the spinner would keep
+        // redrawing over the page -- and over the idle clock after the engine
+        // exits -- at its animation cadence, forever. `clear` is a no-op when
+        // nothing is up (see `overlay.rs`).
+        self.overlay.clear()?;
         self.show_idle_screen(IdleScreen::Clock)
     }
 
@@ -2520,6 +2527,40 @@ mod tests {
             Some(IdleScreen::Clock),
             "the idle clock must return"
         );
+    }
+
+    /// A page `Play` that supersedes an in-flight media load must take the
+    /// loading overlay (and its spinner thread) down. The page owns the
+    /// screen, and a spinner redrawing over it -- and over the idle clock
+    /// after the engine exits -- at the animation cadence is pure waste.
+    #[test]
+    fn webpage_play_clears_a_leftover_loading_overlay() {
+        let dir = scratch_dir("webpage-clears-overlay");
+        let browser = stub_browser(&dir, "browser-waiting", "sleep 300");
+        let player = headless_player_with_browser(&browser);
+
+        // Exactly what an in-flight media `Play` leaves behind while mpv is
+        // still opening the URL.
+        player.overlay.conceal().expect("conceal");
+        player.hide_idle_screen().expect("hide idle");
+        player.overlay.spawn_spinner().expect("spinner");
+        assert!(player.loading_overlay_active(), "precondition: spinner up");
+
+        player
+            .play(&webpage_play("http://127.0.0.1:9/dashboard"))
+            .expect("webpage play");
+
+        assert!(
+            !player.loading_overlay_active(),
+            "the page must take the loading overlay down"
+        );
+        assert!(player.webpage_active(), "the engine must still be up");
+        assert_eq!(
+            player.idle_screen(),
+            Some(IdleScreen::Clock),
+            "the clock sits behind the page"
+        );
+        wait_for_stub_log(&dir);
     }
 
     /// Regression test for the failed-setup path where the loading overlay has

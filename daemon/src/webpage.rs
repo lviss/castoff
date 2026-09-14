@@ -376,11 +376,14 @@ impl WebpageController {
             }
             // The page was on screen and nothing asked it to go away:
             // Cage has already revealed mpv's idle screen again, so this
-            // is an error worth in the log, not a silent state change.
+            // is an error worth in the log, not a silent state change. The
+            // cause is translated, because `ExitStatus(unix_wait_status(133))`
+            // tells nobody anything.
             match status {
                 Ok(status) => error!(
                     url,
                     ?status,
+                    cause = %engine_exit_cause(&status),
                     "browser engine exited on its own; the screen is back to the \
                      daemon's idle screen"
                 ),
@@ -423,8 +426,36 @@ impl WebpageController {
     }
 }
 
+/// Plain language for why the browser engine is gone, so nobody has to read a
+/// Chromium internal line to find out: an `ExitStatus(unix_wait_status(133))`
+/// tells an operator nothing. Chromium aborts (a signal, commonly SIGTRAP)
+/// when it cannot set up its profile or its process-singleton socket -- see
+/// `Browser::temp_dir` -- and its own last stderr line above names the
+/// concrete cause.
+fn engine_exit_cause(status: &std::process::ExitStatus) -> String {
+    use std::os::unix::process::ExitStatusExt;
+    match (status.code(), status.signal()) {
+        (_, Some(signal)) => format!(
+            "the engine aborted or crashed (terminated by signal {signal}); its own error \
+             line(s) above say why -- e.g. a startup failure such as a profile or socket path \
+             that is too long"
+        ),
+        (Some(code), None) => {
+            format!("the engine exited on its own with status {code}")
+        }
+        (None, None) => "the engine exited without an exit status".to_string(),
+    }
+}
+
 fn validate_url(url: &str) -> Result<()> {
-    if ALLOWED_SCHEMES.iter().any(|scheme| url.starts_with(scheme)) {
+    // URL schemes are case-insensitive (RFC 3986) and Chromium accepts
+    // `--app=HTTPS://...`, so `HTTPS://dashboard.lan/` must not be refused
+    // while `PlayMessage::explicit_target` (which is also case-insensitive)
+    // accepted the same page.
+    if ALLOWED_SCHEMES.iter().any(|scheme| {
+        url.get(..scheme.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(scheme))
+    }) {
         return Ok(());
     }
     anyhow::bail!(
@@ -525,12 +556,38 @@ mod tests {
         }
     }
 
+    /// An engine that died must be explained in plain language: the raw
+    /// `ExitStatus` from the captain's real report (`unix_wait_status(133)`)
+    /// told nobody anything, and the whole point of the fix was that he
+    /// should never have to read a Chromium internal line.
+    #[test]
+    fn engine_exit_causes_are_plain_language() {
+        use std::os::unix::process::ExitStatusExt;
+
+        // 133 = 128 + 5: killed by signal 5 (SIGTRAP), how Chromium aborts.
+        let aborted = engine_exit_cause(&std::process::ExitStatus::from_raw(133));
+        assert!(
+            aborted.contains("signal 5") && aborted.contains("aborted or crashed"),
+            "a signal death must be named: {aborted}"
+        );
+
+        let exited = engine_exit_cause(&std::process::ExitStatus::from_raw(3 << 8));
+        assert!(
+            exited.contains("exit") && exited.contains("status 3"),
+            "a clean non-zero exit must be named: {exited}"
+        );
+    }
+
     #[test]
     fn only_http_https_and_file_urls_are_allowed() {
         for url in [
             "http://grafana.lan:3000/d/boat",
             "https://example.invalid/dashboard",
             "file:///srv/dashboard.html",
+            // Schemes are case-insensitive (RFC 3986).
+            "HTTPS://dashboard.lan/",
+            "Http://grafana.lan/",
+            "FILE:///srv/dashboard.html",
         ] {
             validate_url(url).unwrap_or_else(|e| panic!("{url} should be allowed: {e}"));
         }
