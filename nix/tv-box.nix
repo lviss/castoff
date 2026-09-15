@@ -95,7 +95,22 @@
   virtualisation.vmVariant = {
     virtualisation = {
       graphics = true;
-      memorySize = 2048;
+      memorySize = 4096;
+
+      # nixos-generators' qemu-vm module defaults `virtualisation.cores` to 1,
+      # which is nowhere near enough for this appliance's software-rendered
+      # stack: Cage, mpv and Chromium all draw through Mesa's llvmpipe (no
+      # GPU in this VM -- see below), and llvmpipe is itself
+      # multi-threaded and wants several cores to keep up. Measured on a
+      # 16-core host: with 1 core, the VM took 3+ minutes just to reach the
+      # point where the daemon's FCast port answers, and Chromium took
+      # several more minutes on top of that to paint a cast page. With 4
+      # cores, boot-to-FCast-ready and the same Chromium cast both land
+      # in well under a minute (see README's VM section for the measured
+      # numbers). Pick a number that fits comfortably alongside whatever
+      # else is running on the host; it can be higher than the host's own
+      # core count; it just can't usefully exceed it.
+      cores = 4;
 
       # QEMU's default x86 VGA adapter is `std` (bochs-drm), which has no
       # render node at all: `EGL device` enumeration finds nothing, so neither
@@ -139,6 +154,63 @@
     # changes that -- so what hangs is plymouth's own console handover.) A
     # boot splash buys an appliance-less VM nothing, so the VM doesn't run one.
     boot.plymouth.enable = lib.mkForce false;
+
+    # Growing/shrinking the QEMU window resizes the *guest's* rendered
+    # resolution -- but this needs an active push, not just a compatible
+    # display device, because of a real gap in Cage/wlroots. Measured on
+    # this exact VM:
+    #   1. QEMU's virtio-gpu device (`-vga virtio`, unchanged from above)
+    #      already forwards a host window resize to the guest for free: a
+    #      `VIRTIO_GPU_EVENT_DISPLAY` config-change interrupt that shows up
+    #      as a DRM `change` hotplug uevent (confirmed with `udevadm
+    #      monitor --subsystem-match=drm` while resizing), and the guest
+    #      kernel's own live connector state tracks it immediately -- the
+    #      first line of `/sys/class/drm/card*-Virtual-1/modes` is always
+    #      the most recently requested size.
+    #   2. Cage's compositor never picks it up on its own. wlroots' generic
+    #      DRM-backend hotplug handler (`scan_drm_connectors` in
+    #      `backend/drm/drm.c`) only re-probes a connector across a
+    #      connect/disconnect transition, never for a mode-only change
+    #      while it stays connected; Cage's own output code (`output.c`)
+    #      only ever picks a mode once, when the output is first created.
+    #      So out of the box, resizing the window changes nothing on
+    #      screen -- no choice of display device fixes that, since the gap
+    #      is in the compositor, not the device.
+    #   3. Cage *does* accept an externally-driven mode change, though: it
+    #      implements `wlr-output-management-v1` (`output.c`'s
+    #      `handle_output_manager_apply`), and `wlr-randr --custom-mode`
+    #      against that protocol was verified end-to-end (screendumps at
+    #      three different requested sizes each came back exactly that
+    #      size).
+    # This rule closes the gap by hand: on every DRM hotplug it re-reads the
+    # live sysfs mode and pushes it to Cage's one output through
+    # `wlr-randr`, running as the `kiosk` user (Cage's Wayland socket is
+    # only reachable by its owner). Entirely VM-only -- the real appliance
+    # has no virtio-gpu resize event to react to in the first place, and
+    # `wlr-randr` is not part of its runtime closure.
+    environment.systemPackages = [ pkgs.wlr-randr ];
+    services.udev.extraRules =
+      let
+        followResize = pkgs.writeShellScript "castoff-vm-follow-resize" ''
+          set -eu
+          for modes in /sys/class/drm/card*-Virtual-1/modes; do
+            [ -e "$modes" ] || continue
+            wh=$(${pkgs.coreutils}/bin/head -n1 "$modes")
+            [ -n "$wh" ] || continue
+            uid=$(${pkgs.coreutils}/bin/id -u kiosk)
+            wlr_randr() {
+              ${pkgs.util-linux}/bin/runuser -u kiosk -- \
+                ${pkgs.coreutils}/bin/env XDG_RUNTIME_DIR="/run/user/$uid" WAYLAND_DISPLAY=wayland-0 \
+                ${pkgs.wlr-randr}/bin/wlr-randr "$@"
+            }
+            output=$(wlr_randr | ${pkgs.gawk}/bin/awk 'NR==1{print $1}')
+            [ -n "$output" ] || continue
+            wlr_randr --output "$output" --custom-mode "$wh"
+          done
+        '';
+      in ''
+        SUBSYSTEM=="drm", ACTION=="change", RUN+="${pkgs.systemd}/bin/systemd-run --quiet --no-block --collect --unit=castoff-vm-follow-resize ${followResize}"
+      '';
 
     # Neither cage nor mpv can get a *hardware* GL context here, so both are
     # told to accept Mesa's software (llvmpipe) one: wlroots refuses software

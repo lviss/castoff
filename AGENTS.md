@@ -287,6 +287,40 @@ This file is the project's committed home for project-intrinsic agent knowledge:
     That console is the VM's promised fallback for a blank screen; see README's VM section for what
     the captain should see (QEMU `Ctrl+Alt+3`) and the host-side FCast port forward
     (`virtualisation.forwardPorts`, 46899, bound on all host interfaces by SLiRP).
+  - **`virtualisation.cores` defaults to 1** in nixpkgs' qemu-vm module (`virtualisation.memorySize`
+    already defaulted sanely). One core is not enough for this VM's all-software stack (Cage, mpv
+    and Chromium all draw through llvmpipe, which itself wants several cores) -- measured on a
+    16-core host, boot-to-FCast-ready plus a Chromium cast rendering went from 300+ seconds at 1
+    core to ~33 seconds at 4. `nix/tv-box.nix` sets `cores = 4` and `memorySize = 4096` for this.
+  - **Resizing the QEMU window does not, by itself, resize what Cage renders**, even though
+    `-vga virtio`'s device already supports it end-to-end on the QEMU/kernel side: a window resize
+    reaches the guest for free (confirmed with `udevadm monitor --subsystem-match=drm` while
+    resizing: it fires a plain `change` uevent on the DRM card, no disconnect/reconnect), and the
+    guest kernel's own connector state genuinely tracks it live -- the first line of
+    `/sys/class/drm/card*-Virtual-1/modes` is always the most recently requested size, confirmed by
+    resizing to several different sizes in a row and re-reading it each time. What doesn't move is
+    wlroots: its generic DRM-backend hotplug handler (`scan_drm_connectors` in
+    `backend/drm/drm.c`, verified against the pinned wlroots source) only re-probes a connector's
+    modes across a connect/disconnect transition, never for a mode-only change while the connector
+    stays connected -- and Cage's own output code (`output.c`) only ever calls
+    `wlr_output_preferred_mode` once, when the output is first created (`handle_new_output`). No
+    choice of virtio-gpu device or QEMU display backend changes this, since the gap is in the
+    compositor, not the device -- confirmed by driving a raw RFB `SetDesktopSize` client message at
+    the VNC display backend (bypassing any real window entirely) and getting QEMU's own
+    "request forwarded" acknowledgement while the guest's rendered framebuffer (verified by size via
+    QEMU `screendump`) stayed unchanged. Cage *does* accept an externally-driven mode change,
+    though: it implements `wlr-output-management-v1` (`output.c`'s `handle_output_manager_apply`),
+    which is exactly what `wlr-randr` speaks, and `wlr-randr --output <name> --custom-mode <W>x<H>`
+    was confirmed (via `screendump`) to switch Cage's actual rendered resolution to an arbitrary
+    exact size, not just one of the connector's pre-baked EDID modes. `nix/tv-box.nix` wires this
+    up for real with a udev rule (`SUBSYSTEM=="drm", ACTION=="change"`) that re-reads the live sysfs
+    mode and pushes it through `wlr-randr`, run via `systemd-run --no-block` (so the udev worker
+    never blocks on it) as the `kiosk` user via `runuser` (only that user can reach Cage's Wayland
+    socket at `/run/user/<uid>/wayland-0`). A resize event that lands before Cage itself is up is a
+    harmless no-op (`wlr-randr` fails to connect, the script's `set -eu` + per-step `continue`
+    guards just skip it) -- confirmed in the journal (`castoff-vm-follow-resize.service`) during a
+    real boot. Entirely VM-only: `wlr-randr` and the udev rule are not part of the appliance's
+    runtime closure, since the real box has no virtio-gpu resize event to react to.
 
 ## Maintaining this file
 

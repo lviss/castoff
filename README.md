@@ -427,10 +427,16 @@ which is NixOS's `virtualisation.vmVariant` (see `nix/tv-box.nix`) with nixpkgs'
 folded in -- so a VM-only fix cannot accidentally land on one of the two commands and not the
 other. None of the VM-only settings apply to the appliance on real hardware.
 
-**What you should see.** A QEMU window, ~10 seconds of boot messages, then the appliance's
+**What you should see.** A QEMU window, ~10-20 seconds of boot messages, then the appliance's
 **idle screen: a large white clock centred on a black screen**. That is the kiosk session (Cage
 running the daemon) up and drawing. It is not the desktop, and there is no menu, panel or
 cursor: the appliance is one fullscreen client, exactly as on the TV.
+
+**Resizing the QEMU window resizes the guest's picture, not just the window frame around it.**
+Growing or shrinking the window changes the actual resolution Cage renders at -- drag a corner and
+the clock (or whatever's on screen) redraws crisp at the new size, it doesn't just get stretched or
+letterboxed. See "Why the resize needs a nudge" below for what makes this work and its one sharp
+edge (a resize sent before Cage itself is up is a harmless no-op, not an error).
 
 Cast something to it to check playback. The VM forwards FCast's port to the host, so the
 daemon inside the VM is reachable at **`127.0.0.1:46899`** (SLiRP's host side binds
@@ -485,7 +491,8 @@ Things that legitimately stop the VM from coming up, and what they look like:
   Hardware-accelerated video decode is genuinely unavailable here; playback is software-decoded
   and so is choppier and more CPU-hungry than on the real box. That is the one capability the VM
   cannot preview. On a slower host, expect the clock and playback to be visibly heavy.
-- **A first boot is slow.** The VM's disk image is created on first run; give it a minute.
+- **A first boot creates the disk image.** That's a one-time few extra seconds on the very first
+  run; every boot after that reuses the same `nixos.qcow2`.
 
 If the kiosk session is up (`cage-tty1` active) but nothing is drawn, check the console output
 for mpv's concrete error line -- the daemon turns on mpv's own logging precisely so a failed load
@@ -509,6 +516,30 @@ machine:
   the boot or after the first `Play`. On the real box mpv's auto-detection reaches the same
   Wayland/EGL context first and its hwdec probes find real hardware, so neither setting is used
   there.
+
+**Give it enough CPU.** `virtualisation.cores` defaults to 1 in nixpkgs' qemu-vm module, and 1
+core is nowhere near enough for this VM's all-software stack (Cage, mpv and Chromium all draw
+through Mesa's llvmpipe, and llvmpipe itself wants several cores). `nix/tv-box.nix` raises it to 4
+(and memory to 4096 MiB) for exactly that reason -- measured on a 16-core host, that took boot
+(fresh disk) to the point where the daemon answers FCast, plus casting a Chromium page and having
+it render, from **over five minutes total down to about 33 seconds**. Lower it if the host can't
+spare 4 cores; raise it if the host has room and casting still feels heavy.
+
+**Why the resize needs a nudge.** QEMU's virtio-gpu already forwards a host window resize to the
+guest for free -- no config needed beyond the `-vga virtio` from above -- but Cage's compositor
+doesn't act on it by itself: wlroots only re-reads a connector's modes when it connects or
+disconnects, never for a same-connector resize, and Cage only ever picks a mode once, when its
+output first appears. `nix/tv-box.nix` closes that gap with a udev rule (`ACTION=="change"` on the
+DRM device) that re-reads the guest kernel's live mode -- the first line of
+`/sys/class/drm/card*-Virtual-1/modes`, which does track the resize -- and pushes it to Cage
+through `wlr-randr --custom-mode` (Cage accepts external mode changes via
+`wlr-output-management-v1`; this is what `wlr-randr` speaks). It runs as the `kiosk` user because
+only that user can reach Cage's Wayland socket. One consequence: a resize that lands *before* the
+kiosk session itself is up (early in boot) is a no-op -- `wlr-randr` can't reach a Wayland socket
+that doesn't exist yet, the helper unit exits without changing anything, and the very next resize
+after Cage starts works normally. This is entirely VM-only tooling (`wlr-randr` and the udev rule
+are not part of the appliance's runtime closure); the real box has no virtio-gpu resize event to
+react to in the first place.
 
 ### Dev shell
 
