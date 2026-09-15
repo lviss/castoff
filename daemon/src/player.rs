@@ -195,8 +195,29 @@ impl Player {
         // not a castoff one). Pointing this at `null` keeps the daemon alive
         // there; the appliance's default stays hardware-accelerated `gpu`.
         let vo = std::env::var("CASTOFF_MPV_VO").unwrap_or_else(|_| "gpu".to_string());
+        // `CASTOFF_MPV_GPU_CONTEXT` is the counterpart knob, for a machine
+        // that *has* a display but no GPU (the NixOS VM): mpv's automatic
+        // context probing tries its Vulkan and then X11 contexts first, and
+        // merely connecting to the X display cage advertises is enough to make
+        // wlroots start its lazily-spawned Xwayland. Xwayland cannot bring up
+        // a screen without a GPU, so it aborts -- and takes the whole kiosk
+        // session down with it (wlroots asserts while tearing down the dead
+        // Xwayland surface). Pinning the context to `wayland` keeps mpv on the
+        // Wayland/EGL path the appliance already uses on real hardware, where
+        // mpv's own auto-detection reaches it first. Unset or empty (the
+        // shipping default) leaves that auto-detection alone.
+        let gpu_context = std::env::var("CASTOFF_MPV_GPU_CONTEXT").unwrap_or_default();
+        // `CASTOFF_MPV_HWDEC` (default `auto-safe`) exists for the same
+        // GPU-less machine, one layer down: `auto-safe` probes VDPAU, whose
+        // backend lookup opens an X display, so *playing* anything wakes the
+        // same doomed Xwayland even with the context pinned above. The VM has
+        // no hardware decoder to find anyway.
+        let hwdec = std::env::var("CASTOFF_MPV_HWDEC").unwrap_or_else(|_| "auto-safe".to_string());
         let mpv = Mpv::with_initializer(|init| {
             init.set_property("vo", vo.as_str())?;
+            if !gpu_context.is_empty() {
+                init.set_property("gpu-context", gpu_context.as_str())?;
+            }
             init.set_property("fullscreen", "yes")?;
             init.set_property("force-window", "yes")?;
             init.set_property("idle", "yes")?;
@@ -204,7 +225,7 @@ impl Player {
             // Prefer hardware decode when available: much lower CPU/power draw
             // than software decode for the long, mostly-static playback runs
             // this box is built for.
-            init.set_property("hwdec", "auto-safe")?;
+            init.set_property("hwdec", hwdec.as_str())?;
             init.set_property("input-default-bindings", "no")?;
             init.set_property("input-vo-keyboard", "no")?;
             init.set_property("osc", "no")?;
