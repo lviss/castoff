@@ -90,29 +90,24 @@
         };
       };
 
-      # Separate nixosConfiguration, identical to `tv-box` but with the
-      # qemu-vm module pulled in, so it can be built directly with
-      # `nix build .#packages.x86_64-linux.tv-box-vm` without going through
-      # `nixos-rebuild` -- useful in sandboxes/CI with no access to
-      # `nixos-rebuild build-vm`. See README for both workflows.
-      tv-box-vm-system = nixpkgs.lib.nixosSystem {
+      # The appliance configuration. `nixos-rebuild build-vm --flake .#tv-box`
+      # and `nix build .#tv-box-vm` both build *this* configuration's
+      # `system.build.vm`, i.e. `virtualisation.vmVariant` (see nix/tv-box.nix)
+      # extended with nixpkgs' qemu-vm module. `tv-box-vm` used to be a second
+      # nixosConfiguration with qemu-vm.nix wired in by hand, which meant the
+      # VM-only settings a `build-vm` run needs could not live in the shared
+      # module and the two documented commands were not actually equivalent.
+      tv-box-system = nixpkgs.lib.nixosSystem {
         inherit system;
         specialArgs = { castoffDaemon = castoff-daemon; };
-        modules = [
-          ./nix/tv-box.nix
-          "${nixpkgs}/nixos/modules/virtualisation/qemu-vm.nix"
-          {
-            virtualisation.graphics = true;
-            virtualisation.memorySize = 2048;
-          }
-        ];
+        modules = [ ./nix/tv-box.nix ];
       };
     in
     {
       packages.${system} = {
         castoff-daemon = castoff-daemon;
         default = castoff-daemon;
-        tv-box-vm = tv-box-vm-system.config.system.build.vm;
+        tv-box-vm = tv-box-system.config.system.build.vm;
       };
 
       checks.${system} = {
@@ -124,11 +119,7 @@
         program = "${castoff-daemon}/bin/castoff-daemon";
       };
 
-      nixosConfigurations.tv-box = nixpkgs.lib.nixosSystem {
-        inherit system;
-        specialArgs = { castoffDaemon = castoff-daemon; };
-        modules = [ ./nix/tv-box.nix ];
-      };
+      nixosConfigurations.tv-box = tv-box-system;
 
       devShells.${system}.default = pkgs.mkShell {
         inputsFrom = [ castoff-daemon ];

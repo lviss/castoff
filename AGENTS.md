@@ -246,6 +246,48 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   investigation it followed at
   `/ai/firstmate/data/castoff-daemon-webpage-display/single-window-investigation.md`).
 
+- The NixOS VM preview (`nix build .#tv-box-vm` / `nixos-rebuild build-vm --flake .#tv-box`) is
+  a *separate* surface from the appliance, and all of its wiring lives in one place:
+  `virtualisation.vmVariant` in `nix/tv-box.nix`. The flake's `tv-box-vm` package is
+  `nixosConfigurations.tv-box.config.system.build.vm`, which *is* that vmVariant (NixOS's own
+  `build-vm` hook, `nixos/modules/virtualisation/build-vm.nix`), so both documented commands build
+  the same closure and neither touches the real box. Keep both properties: do not reintroduce a
+  second `nixosConfiguration` for the VM, and do not put VM-only settings in the shared part of the
+  module. Two VM-only facts that are easy to lose and were expensive to find:
+  - **Plymouth blocks the kiosk entirely.** With the VM's default kernel command line (the one the
+    qemu-vm module generates), `plymouth-quit.service` never finishes,
+    `plymouth-quit-wait.service` ("Hold until boot process finishes up") holds `multi-user.target`,
+    and `cage-tty1.service` is ordered `After=plymouth-quit.service` -- so Cage is *never started at
+    all* and the screen is a cleared VT with a blinking cursor (exactly the reported symptom;
+    reproduced on repeated boots). The same image reaches `graphical.target` in ~11s and starts
+    Cage with `plymouth.enable=0`. It is plymouth's *console handover* that hangs, not something
+    downstream: pointing `/dev/console` at the serial console instead of tty0 let
+    `plymouth-quit` finish. The VM disables plymouth.
+  - **Xwayland cannot start without a GPU, and takes Cage down with it.** Cage starts Xwayland
+    lazily and sets `DISPLAY=:0` for its client; *two* separate pieces of mpv open that display on
+    their own -- its automatic GPU-context probing (Vulkan, then X11, before Wayland) and its
+    `hwdec=auto-safe` VDPAU probe, so the failure surfaces both at startup and on the first `Play`.
+    Merely connecting wakes Xwayland, which aborts (`Refusing to try glamor on llvmpipe` -> `Fatal
+    server error: Couldn't add screen`) and makes wlroots assert on the dead surface
+    (`xwayland/xwm.c:592`), killing the session. The VM keeps mpv off X11 with two
+    `daemon/src/player.rs` knobs -- `CASTOFF_MPV_GPU_CONTEXT=wayland` and `CASTOFF_MPV_HWDEC=no`
+    (unset on the appliance, where auto-detection already reaches Wayland and the hwdec probes find
+    real hardware). Do not "fix" this by unsetting `DISPLAY` globally or by disabling Xwayland for
+    the appliance: `-vga virtio` alone does not fix it (Xwayland refuses glamor on llvmpipe even
+    with a render node present), and `vo=wlshm` is not an alternative -- this mpv/wlroots pair kills
+    the Wayland connection on it (`wl_viewport.set_destination sent with invalid values`).
+  - The VM needs `-vga virtio` (not qemu's default `std`/bochs-drm, which has *no render node*),
+    plus `services.cage.environment.WLR_RENDERER_ALLOW_SOFTWARE=1`: Mesa comes up as llvmpipe,
+    which wlroots refuses unless told otherwise. Hardware-accelerated rendering is the one thing
+    the VM genuinely cannot do; everything else (kiosk, idle clock, mpv video, Chromium pages) was
+    verified to render in the VM by QEMU `screendump` on the built VM, in software.
+  - The VM's serial console autologins root (a `serial-getty@ttyS0` override in the vmVariant).
+    It must be `overrideStrategy = "asDropin"`: systemd ignores a unit *file* named after a
+    template *instance*, so the plain `serviceConfig` form silently leaves the `login:` prompt.
+    That console is the VM's promised fallback for a blank screen; see README's VM section for what
+    the captain should see (QEMU `Ctrl+Alt+3`) and the host-side FCast port forward
+    (`virtualisation.forwardPorts`, 46899, bound on all host interfaces by SLiRP).
+
 ## Maintaining this file
 
 Keep this file for knowledge useful to almost every future agent session in this project.

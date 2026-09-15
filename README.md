@@ -372,7 +372,8 @@ perl -e '
 
 ```sh
 nix flake check   # builds and tests the daemon package (via `checks`), and evaluates
-                   # the tv-box and tv-box-vm NixOS configurations and the dev shell
+                   # the tv-box NixOS configuration (which includes the `tv-box-vm`
+                   # package) and the dev shell
 ```
 
 The package's tests include the end-to-end webpage/routing test (see
@@ -408,7 +409,7 @@ Chromium's own sandbox is unavailable (a container without user namespaces),
 
 ### NixOS VM, no TV hardware required
 
-Two equivalent ways to boot the whole appliance (Cage + castoff-daemon as PID-1-adjacent kiosk
+Two equivalent ways to boot the whole appliance (Cage + castoff-daemon, as the real box's kiosk
 session) in a throwaway VM:
 
 ```sh
@@ -420,6 +421,94 @@ nixos-rebuild build-vm --flake .#tv-box
 nix build .#tv-box-vm
 ./result/bin/run-*-vm
 ```
+
+Both build the *same* thing: `.#tv-box-vm` is the `tv-box` configuration's `system.build.vm`,
+which is NixOS's `virtualisation.vmVariant` (see `nix/tv-box.nix`) with nixpkgs' qemu-vm module
+folded in -- so a VM-only fix cannot accidentally land on one of the two commands and not the
+other. None of the VM-only settings apply to the appliance on real hardware.
+
+**What you should see.** A QEMU window, ~10 seconds of boot messages, then the appliance's
+**idle screen: a large white clock centred on a black screen**. That is the kiosk session (Cage
+running the daemon) up and drawing. It is not the desktop, and there is no menu, panel or
+cursor: the appliance is one fullscreen client, exactly as on the TV.
+
+Cast something to it to check playback. The VM forwards FCast's port to the host, so the
+daemon inside the VM is reachable at **`127.0.0.1:46899`** (SLiRP's host side binds
+`0.0.0.0:46899`, i.e. every host interface, so another machine on the same LAN can also reach
+it at the host's LAN address and port -- useful for trying the Android app; to keep it to the
+host alone, set `host.address = "127.0.0.1"` on the `forwardPorts` entry in `nix/tv-box.nix`).
+From the host:
+
+```sh
+# Serve something for the VM to play. The guest reaches the *host's* loopback as
+# 10.0.2.2, so the URL to cast is http://10.0.2.2:<port>/... -- anything else
+# (a file: URL, a LAN address, a public URL) works too, as long as the VM can
+# reach it.
+mkdir -p /tmp/castoff-vm-media && cd /tmp/castoff-vm-media
+printf '<html><body style="background:#123;color:#0ff;font:48px sans-serif">dashboard</body></html>' > dashboard.html
+nix run nixpkgs#python3 -- -m http.server 8000 &
+
+# Send an FCast Play (opcode 1): 4-byte little-endian length, 1-byte opcode, JSON body.
+perl -e '
+  my $body = q({"url":"http://10.0.2.2:8000/dashboard.html","container":"text/html"});
+  use IO::Socket::INET;
+  my $s = IO::Socket::INET->new(PeerAddr => "127.0.0.1", PeerPort => 46899,
+                                Proto => "tcp", Timeout => 5) or die "connect: $!";
+  syswrite($s, pack("V", length($body) + 1) . chr(1) . $body);
+  my $buf; sysread($s, $buf, 4096); print unpack("H*", $buf), "\n";
+'
+```
+
+The page replaces the clock (Chromium maps over mpv), a media URL plays instead, and `Stop`
+(opcode `4`, no body) brings the clock back. `printf '\x01\x00\x00\x00\x0c' | nc 127.0.0.1 46899`
+is a `Ping`, if you just want to check the port is live.
+
+**"I see a black screen but no clock."** Press **Ctrl+Alt+3** in the QEMU window (or use its
+**View** menu to select the serial console): the VM autologins **root** there, so a blank screen
+always comes with a shell rather than a dead rectangle. Then:
+
+```sh
+systemctl status cage-tty1          # the kiosk session
+journalctl -b -u cage-tty1          # cage's and the daemon's own output
+ss -ltnp | grep 46899               # the daemon's control listener
+```
+
+Things that legitimately stop the VM from coming up, and what they look like:
+
+- **The host already uses port 46899.** QEMU then refuses to start at all, before any boot:
+  `Could not set up host forwarding rule 'tcp::46899-:46899'`. Stop whatever holds the port (or
+  change `host.port` in `nix/tv-box.nix`). The daemon running on the host itself is the usual
+  cause.
+- **No GPU, on purpose.** The VM has no hardware GPU, so everything -- the clock, video, web
+  pages -- is drawn by Mesa's llvmpipe software renderer (`nix/tv-box.nix` gives the VM a virtio
+  GPU so that renderer has something to draw through, and lets Cage and mpv use it).
+  Hardware-accelerated video decode is genuinely unavailable here; playback is software-decoded
+  and so is choppier and more CPU-hungry than on the real box. That is the one capability the VM
+  cannot preview. On a slower host, expect the clock and playback to be visibly heavy.
+- **A first boot is slow.** The VM's disk image is created on first run; give it a minute.
+
+If the kiosk session is up (`cage-tty1` active) but nothing is drawn, check the console output
+for mpv's concrete error line -- the daemon turns on mpv's own logging precisely so a failed load
+says why (see [How YouTube playback works](#how-youtube-playback-works)); the same reasoning
+applies to a load that fails in the VM. A `journalctl -b -u cage-tty1 | grep -i assertion` that
+shows `xwayland/xwm.c` means the VM's X11-avoiding settings above have been lost -- that assertion
+is what a GPU-less Xwayland does to the kiosk session.
+
+Three environment variables in `nix/tv-box.nix`'s `virtualisation.vmVariant` are worth knowing
+about when debugging the VM's rendering, because all three are VM-only settings for a GPU-less
+machine:
+
+- `WLR_RENDERER_ALLOW_SOFTWARE=1` lets wlroots' DRM backend use Mesa's software GL renderer
+  instead of refusing it and falling back to pixman (which advertises no dma-buf, leaving mpv
+  with nothing to present into).
+- `CASTOFF_MPV_GPU_CONTEXT=wayland` and `CASTOFF_MPV_HWDEC=no` (`daemon/src/player.rs`) keep mpv
+  off X11. Left alone, mpv's context probing and its `hwdec=auto-safe` VDPAU probe both open the
+  X display Cage advertises, which makes wlroots start its lazily-spawned Xwayland -- and
+  Xwayland cannot bring up a screen without a GPU, so it aborts and takes the kiosk session down
+  with it (`cage: xwayland/xwm.c:592: ... Assertion ... failed`), typically a few seconds after
+  the boot or after the first `Play`. On the real box mpv's auto-detection reaches the same
+  Wayland/EGL context first and its hwdec probes find real hardware, so neither setting is used
+  there.
 
 ### Dev shell
 
