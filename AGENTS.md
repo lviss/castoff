@@ -225,34 +225,26 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   runs every session's daemon under a deliberately deep `TMPDIR` so the page cases cover this.
   Don't reintroduce `std::env::temp_dir()` for either path.
 
-- **Single-window display is the captain's stated direction for where castoff is going
-  (2026-09-14) and is not implemented yet.** The goal: render *everything* -- mpv video, images,
-  dashboards/web pages -- into one daemon-owned window, so the daemon is a normal windowed app on
-  a desktop with a window manager (not kiosk-fullscreen-only), and so castoff owns its on-screen
-  displays, volume indicators and picture-in-picture consistently, whatever is on screen. This is a
-  *product requirement*, not a styling preference: the captain has said outright that "multiple
-  windows isn't a viable product. That wouldn't match what a user would expect", so a multi-window
-  model is rejected on product grounds, not only on engineering ones.
-  Captain-stated constraints: an *invisible/off-screen* Chromium whose frames are piped into that
-  window is the intended mechanism (not Chromium owning a visible toplevel, which is what
-  `daemon/src/webpage.rs` does today); Chromium specifically stays because Widevine/Netflix DRM is
-  a hard requirement; a separate X server for compositing was considered and rejected for
-  dependency weight. Findings of the 2026-09-14 investigation (full report:
-  `/ai/firstmate/data/castoff-daemon-webpage-display/single-window-investigation.md`): the only
-  realistic invisible-Chromium path is CEF *windowless* (off-screen) rendering, whose
-  `OnAcceleratedPaint` hands DMABUF planes to a host GL/wgpu context -- `cef`
-  (tauri-apps/cef-rs, `accelerated_osr` feature) is the maintained binding, while
-  `welding`/wgpu-weld is the same idea and a useful reference but a one-person prototype --
-  combined with mpv's *render API* (`libmpv2::render::RenderContext`; OpenGL only, no Vulkan) so
-  the daemon owns the Wayland toplevel and composites both sources. Chromium-the-process cannot be
-  made invisible here: Cage fullscreens every toplevel and has no hidden-window concept, and
-  headless Chromium has no Widevine. Before building any of it, CEF+Widevine has to be settled by
-  a real probe: nixpkgs' `cef-binary` (Spotify's builds; CEF's required GN args set
-  `enable_widevine`) has the CDM plumbing but *not* the CDM binary, so `widevine-cdm` must be
-  placed where libcef finds it. PR https://github.com/lviss/castoff/pull/6's second-client model is
-  an interim: its FCast `container` routing, playlist-entry-id attribution and probe/fallback
-  logic survive a single-window rewrite unchanged, while `webpage.rs`'s process supervision and
-  the Chromium `TMPDIR`/profile-singleton fix are specific to it and would be deleted.
+- **"One window where it's cheap" is the captain's stated direction for where castoff is going
+  (2026-09-14) and is not implemented yet.** The cases that are cheap to unify -- dashboards,
+  images and static pages -- should render into one daemon-owned window, so the daemon is a normal
+  windowed app on a desktop with a window manager (not kiosk-fullscreen-only) and so castoff owns
+  its on-screen displays, volume indicators and picture-in-picture consistently, whatever is on
+  screen. His reasoning survives: "multiple windows isn't a viable product. That wouldn't match
+  what a user would expect." It is explicitly *not* a blanket requirement that everything render
+  into one window: video keeps the merged model -- the daemon playing through mpv plus a real
+  Chromium client for web pages (`daemon/src/webpage.rs`) -- which on the appliance's own kiosk
+  compositor already presents as one fullscreen image.
+  The earlier, blanket wording was withdrawn rather than overlooked. The only realistic
+  invisible-Chromium mechanism was CEF windowless rendering, and the 2026-09-14 spike measured two
+  blockers to a browser-rendered video path: the pinned CEF build cannot decode H.264 or AAC for
+  licensing reasons (no proprietary codecs), and its accelerated windowless path delivered zero
+  frames on this machine's NVIDIA driver. A video-capable single window would therefore need a
+  from-source CEF build with its own pinning and CI, which is not pursued; this note scopes no CEF
+  work. The measurements and evidence are in the spike report
+  `/ai/firstmate/data/castoff-single-window-architecture/report.md` (with the earlier
+  investigation it followed at
+  `/ai/firstmate/data/castoff-daemon-webpage-display/single-window-investigation.md`).
 
 ## Maintaining this file
 
