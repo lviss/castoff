@@ -71,6 +71,16 @@ const OPCODE_PLAY: u8 = 1;
 const OPCODE_RESUME: u8 = 3;
 const OPCODE_STOP: u8 = 4;
 const OPCODE_PLAYBACK_UPDATE: u8 = 6;
+/// castoff private extension (see README's "Queueing (private extension)"):
+/// pushed unprompted whenever the play queue changes, interleaved on the same
+/// connection as `PlaybackUpdate` frames -- `read_playback_update` skips it.
+const OPCODE_QUEUE_STATE: u8 = 15;
+/// castoff private extension: move to the next queue item and play it. A
+/// `Play` while something is already playing only enqueues (see
+/// `Player::is_idle`), so superseding what's on screen now needs an explicit
+/// jump -- see the unit test `a_second_webpage_play_replaces_the_first_engine`
+/// in `daemon/src/player.rs`.
+const OPCODE_QUEUE_JUMP_FORWARD: u8 = 16;
 const STATE_IDLE: u64 = 0;
 const STATE_PLAYING: u64 = 1;
 
@@ -465,21 +475,30 @@ fn write_command(stream: &mut TcpStream, opcode: u8, body: Option<&serde_json::V
     stream.flush().expect("flush FCast frame");
 }
 
-/// Read one `PlaybackUpdate` frame from the daemon, panicking on anything else.
+/// Read one `PlaybackUpdate` frame from the daemon, panicking on anything
+/// else -- except `QueueState`, which is skipped: every `Play` in these tests
+/// now also enqueues (see README's "Queueing (private extension)"), so an
+/// unprompted `QueueState` push can legitimately land interleaved with the
+/// `PlaybackUpdate` frames these tests actually care about.
 fn read_playback_update(stream: &mut TcpStream) -> serde_json::Value {
-    let mut len_buf = [0u8; 4];
-    stream
-        .read_exact(&mut len_buf)
-        .expect("read reply length prefix");
-    let len = u32::from_le_bytes(len_buf) as usize;
-    let mut payload = vec![0u8; len];
-    stream.read_exact(&mut payload).expect("read reply payload");
-    assert_eq!(
-        payload[0], OPCODE_PLAYBACK_UPDATE,
-        "expected a PlaybackUpdate, got opcode {}",
-        payload[0]
-    );
-    serde_json::from_slice(&payload[1..]).expect("parse PlaybackUpdate body")
+    loop {
+        let mut len_buf = [0u8; 4];
+        stream
+            .read_exact(&mut len_buf)
+            .expect("read reply length prefix");
+        let len = u32::from_le_bytes(len_buf) as usize;
+        let mut payload = vec![0u8; len];
+        stream.read_exact(&mut payload).expect("read reply payload");
+        if payload[0] == OPCODE_QUEUE_STATE {
+            continue;
+        }
+        assert_eq!(
+            payload[0], OPCODE_PLAYBACK_UPDATE,
+            "expected a PlaybackUpdate, got opcode {}",
+            payload[0]
+        );
+        return serde_json::from_slice(&payload[1..]).expect("parse PlaybackUpdate body");
+    }
 }
 
 /// Send one FCast frame and drain `PlaybackUpdate` frames until one reports
@@ -695,19 +714,31 @@ fn casting_a_webpage_puts_that_page_on_screen_and_stop_returns_to_idle() {
         "the browser engine must have fetched the page from the local server"
     );
 
-    // Supersede the page with a *second page*. Both engines share one
-    // Chromium profile, so the replacement must only start once the first is
-    // gone: a replacement started while the first still holds the profile's
-    // ProcessSingleton lock aborts (or defers to the first and exits), and the
-    // sender's second page never appears. This asserts on real pixels: only
-    // the second page's colour may fill the screen.
-    let reply = fcast_state(
+    // Cast a *second page*. The first is still displayed, so this only
+    // enqueues (see `Player::is_idle`); jumping forward is what actually
+    // swaps the engine, the same way the unit test
+    // `a_second_webpage_play_replaces_the_first_engine` in
+    // `daemon/src/player.rs` exercises it, and what the Android task's Next
+    // button will send. Both engines share one Chromium profile, so the
+    // replacement must only start once the first is gone: a replacement
+    // started while the first still holds the profile's ProcessSingleton
+    // lock aborts (or defers to the first and exits), and the sender's second
+    // page never appears. This asserts on real pixels: only the second
+    // page's colour may fill the screen.
+    fcast_state(
         &mut control,
         OPCODE_PLAY,
         Some(&serde_json::json!({
             "container": "text/html",
             "url": format!("http://127.0.0.1:{second_page_port}/"),
         })),
+        STATE_PLAYING,
+        "the second cast page to be enqueued",
+    );
+    let reply = fcast_state(
+        &mut control,
+        OPCODE_QUEUE_JUMP_FORWARD,
+        None,
         STATE_PLAYING,
         "the second cast page to be reported playing",
     );
@@ -727,14 +758,22 @@ fn casting_a_webpage_puts_that_page_on_screen_and_stop_returns_to_idle() {
         "the browser engine must have fetched the second page from the local server"
     );
 
-    // Media supersedes the page: the engine goes away and mpv takes the
-    // screen back (a real synthetic video, decoded and painted by mpv).
-    let reply = fcast_state(
+    // Cast media. The second page is still displayed, so this only enqueues
+    // too; jumping forward supersedes the page and mpv takes the screen back
+    // (a real synthetic video, decoded and painted by mpv).
+    fcast_state(
         &mut control,
         OPCODE_PLAY,
         Some(&serde_json::json!({
             "url": "av://lavfi:color=c=cyan:size=640x360:rate=10:duration=60",
         })),
+        STATE_PLAYING,
+        "media playback to be enqueued",
+    );
+    let reply = fcast_state(
+        &mut control,
+        OPCODE_QUEUE_JUMP_FORWARD,
+        None,
         STATE_PLAYING,
         "media playback to be reported playing",
     );

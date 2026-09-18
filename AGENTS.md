@@ -19,7 +19,11 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   plain-`curl` fetch (no User-Agent) with no pattern tied to a specific crate; if a build fails
   with `curl: (22) ... 403` on a `crate-*.tar.gz.drv`, just retry the same `nix build` — it
   resumes from whatever already fetched successfully and has always succeeded within a few
-  retries. This is a `crates.io`-side bot-mitigation quirk, not a broken lockfile.
+  retries. This is a `crates.io`-side bot-mitigation quirk, not a broken lockfile. The sandboxed
+  `checkPhase`'s unit-test binary itself (`--release`) has also been seen to die with a bare
+  `SIGSEGV` once, with no repeat across an immediate retry of the same `nix flake check` or several
+  direct `cargo test --release` runs outside the sandbox -- treat a lone `SIGSEGV` there as sandbox
+  flakiness to retry too, and only escalate if it reproduces.
 - `nix build`/`nix flake check` see only *git-tracked* files (via the flake's `self` source
   filter) — a new source file left untracked compiles fine under a plain `cargo build` in
   `nix develop` but fails the flake build with a "file not found for module" error. `git add` new
@@ -75,6 +79,15 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   multiplies both step durations for manual inspection (measured 30.3/s -> 3.03/s at 10x);
   unset/unusable -> 1 (shipping), clamped at
   1000, and it never makes an animation always-on.
+  `PlaybackOverlay::is_active()` stays true for the whole ~400ms `reveal` fade-out that follows a
+  genuine `PlaybackRestart`, not just for the loading phase -- it's "are the overlay's decorative
+  pixels on screen," not "is a load still unresolved." `Player::is_idle` (the play-queue gate, see
+  below) needs the latter, so it checks a separate `is_restarted`/`mark_restarted` flag on the same
+  `State` instead: true from `PlaybackRestart` (set at the top of `handle_lifecycle_event`'s arm,
+  before `reveal` starts its fade) until the next `spawn_spinner` call resets it. Using
+  `is_active()` there instead made a `Play` arriving during that cosmetic fade-out still interrupt
+  already-genuine playback rather than queue behind it (regression tests
+  `play_while_playing_enqueues_instead_of_interrupting` and siblings in `player.rs`).
 - YouTube playback needs no daemon-side code: mpv's built-in `ytdl_hook` Lua script (same core in
   both CLI mpv and `libmpv2`) auto-detects non-direct-media URLs and shells out to `yt-dlp` on
   `PATH`, unconditionally, with no libmpv init tweaks required — see README's "How YouTube
@@ -212,6 +225,23 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   asserting over the wire, see `main.rs`'s `periodic_push_only_fires_while_playing`) must not
   assume the very first `PlaybackUpdate` after `Play` already reports `Playing`; wait for one that
   does, or rely on the push path's later `PlaybackRestart`-triggered update instead.
+- The play queue (`daemon/src/queue.rs`) is castoff's own private FCast extension: opcodes 14-17
+  (`RequestQueue`/`QueueState`/`QueueJumpForward`/`QueueJumpBackward`, beyond FCast's reserved
+  0-13), documented in README's "Queueing (private extension)". `Player::play` (`is_idle`, see
+  above) enqueues instead of interrupting whenever something is already playing -- including a
+  displayed web page, so a `Play` that arrives while one is on screen also only enqueues, superseded
+  media or not; superseding what's already showing now needs an explicit `QueueJumpForward` (see
+  the unit test `a_second_webpage_play_replaces_the_first_engine` and the e2e test
+  `casting_a_webpage_puts_that_page_on_screen_and_stop_returns_to_idle`, which drives the same jump
+  over the wire). The queue is persisted as JSON (write-then-rename) to
+  `queue::default_state_path()` and reloaded at `Player::build`; `nix/tv-box.nix` gives the
+  `cage-tty1` unit a systemd `StateDirectory=castoff` for this. A jump command (not a plain `Play`)
+  legitimately produces *two* `QueueState` frames on the wire, not one: `play_jumped_item` publishes
+  the new position via the queue-changed watch channel (picked up by `push_updates`) *and*
+  `dispatch`'s own handler separately replies with `send_queue_state` -- a test that reads exactly
+  one `QueueState` frame per jump command risks consuming a leftover frame from the *previous* jump
+  instead of the current one's (see `main.rs`'s `read_queue_state_until`, which loops until the
+  frame it wants shows up, rather than trusting a 1:1 command/frame correspondence).
 
 - Chromium's process-singleton socket is created under the engine's **`TMPDIR`**
   (`<TMPDIR>/org.chromium.Chromium.<random>/SingletonSocket`), *not* under `--user-data-dir`:

@@ -70,14 +70,18 @@ Implemented opcodes (all of FCast v2's playback-control surface):
 
 | Opcode | Direction | Daemon behavior |
 | --- | --- | --- |
-| `Play` (1) | sender -> receiver | plays the `url` as media in mpv, or displays it as a web page in the browser engine; the daemon decides which unless the sender's `container` MIME type says so explicitly (see [How the daemon decides between media and a web page](#how-the-daemon-decides-between-media-and-a-web-page)). Inline `content` (e.g. a DASH manifest) is rejected -- not yet supported; replies with `PlaybackUpdate` |
+| `Play` (1) | sender -> receiver | queues the `url` (media for mpv, or a web page for the browser engine -- the daemon decides which unless the sender's `container` MIME type says so explicitly, see [How the daemon decides between media and a web page](#how-the-daemon-decides-between-media-and-a-web-page)); if nothing is currently playing it starts immediately and becomes the queue's current item, otherwise it is only appended (see [Queueing (private extension)](#queueing-private-extension)). Inline `content` (e.g. a DASH manifest) is rejected -- not yet supported; replies with `PlaybackUpdate` |
 | `Pause` (2) / `Resume` (3) | sender -> receiver | toggles mpv's `pause` property; replies with `PlaybackUpdate` |
-| `Stop` (4) | sender -> receiver | stops playback, taking a displayed web page down; mpv returns to idle; replies with `PlaybackUpdate` |
+| `Stop` (4) | sender -> receiver | stops the current item, taking a displayed web page down; mpv returns to idle; replies with `PlaybackUpdate`. Does not clear or move within the queue (see [Queueing (private extension)](#queueing-private-extension)) |
 | `Seek` (5) | sender -> receiver | absolute seek; replies with `PlaybackUpdate` |
 | `SetVolume` (8) | sender -> receiver | sets mpv volume (FCast's 0.0-1.0 scale, mapped to mpv's 0-100); replies with `VolumeUpdate` |
 | `SetSpeed` (10) | sender -> receiver | sets mpv playback speed; replies with `PlaybackUpdate` |
 | `Version` (11) | bidirectional | replies with the protocol version this daemon speaks (`2`) |
 | `Ping` (12) | bidirectional | replies `Pong` |
+| `RequestQueue` (14, private extension) | sender -> receiver | replies with `QueueState` (see [Queueing (private extension)](#queueing-private-extension)) |
+| `QueueState` (15, private extension) | receiver -> sender | the full queue and the current position in it; sent both as `RequestQueue`'s reply and, unprompted, to every connected sender whenever the queue changes |
+| `QueueJumpForward` (16, private extension) | sender -> receiver | moves to the next queue item, if any, and plays it; replies with `QueueState`. A no-op (still replies) at the last item |
+| `QueueJumpBackward` (17, private extension) | sender -> receiver | moves to the previous queue item, if any, and plays it; replies with `QueueState`. A no-op (still replies) at the first item |
 
 Every connected sender keeps its FCast TCP connection open (`daemon/src/main.rs`'s
 `handle_connection` reads one persistent socket per sender, not a reconnect-per-command model),
@@ -93,6 +97,47 @@ idle or paused (see [Design principles](#design-principles)). `VolumeUpdate` is 
 only an immediate reply to `SetVolume`, on no timer. Wire format is unchanged -- the push path
 sends the same `PlaybackUpdateMessage` shape (`generationTime`/`state`/`time`/`duration`/`speed`)
 as the synchronous reply, just possibly more than once and without an incoming command.
+
+### Queueing (private extension)
+
+FCast v2 itself has no queue concept, and this daemon only ever implements a subset of the
+protocol for a single-user personal project (not aiming for interop with third-party FCast
+senders) -- so queueing is a straightforward private extension: four new opcodes beyond FCast's
+reserved `0`-`13` range (`RequestQueue` 14, `QueueState` 15, `QueueJumpForward` 16,
+`QueueJumpBackward` 17), using the same length-prefixed-opcode-plus-JSON-body framing as every
+other message. See [`daemon/src/fcast.rs`](daemon/src/fcast.rs) for the exact `QueueItemMessage`/
+`QueueStateMessage` struct shapes (each field is documented there) and
+[`daemon/src/queue.rs`](daemon/src/queue.rs) for the queue itself.
+
+- **Queueing instead of interrupting.** A `Play` (opcode 1) no longer always interrupts whatever
+  is playing. `Player::play` (`daemon/src/player.rs`) appends every `Play` to the queue; if
+  nothing is currently playing (the idle clock is up, or a load is still in flight with nothing
+  rendering yet -- see `Player::is_idle`'s doc comment for exactly which states count), it also
+  starts immediately and becomes the queue's current position. Otherwise it just waits its turn.
+  A displayed web page counts as "currently playing" here too, so a queue can freely mix media and
+  web-page items -- that mix is expected, not a special case.
+- **Auto-advance on completion.** When the current item reaches genuine end-of-file (not a `Stop`
+  -- see below), the daemon automatically starts the next queued item instead of falling back to
+  the idle clock, if one exists (`auto_advance_queue` in `daemon/src/player.rs`, wired through
+  `IdleScreenController`'s eof watcher in `daemon/src/idle_screen.rs`). A web page has no
+  end-of-file of its own, so an item behind one only starts on an explicit jump.
+- **`Stop` halts, it does not clear the queue.** `Stop` (opcode 4) stops the current item the same
+  as before; the queue's contents and position are untouched, so the same item (or the next one)
+  is still there to jump back to or resume from with a later `Play`/jump.
+- **Jumping.** `QueueJumpForward`/`QueueJumpBackward` move to the next/previous item in the queue
+  and play it, on demand -- not only on auto-advance. "Backward" means the previous *queue* item,
+  not rewinding the current item's playback position (that's `Seek`, unrelated). Both are a no-op
+  (but still reply with `QueueState`) at either edge of the queue.
+- **The daemon remembers the queue.** The queue (its items and current position) is persisted to a
+  small JSON file and reloaded at startup, so it survives a restart -- see
+  `queue::default_state_path`'s doc comment in `daemon/src/queue.rs` for exactly where that file
+  lives (`CASTOFF_STATE_DIR`, then systemd's `STATE_DIRECTORY`, then XDG's state-home convention).
+  A restart does not by itself resume playback: mpv always starts fresh and idle, and only a
+  client command (a `Play`, or a jump) starts anything playing again.
+- **Seeing and being notified of the queue.** `RequestQueue` asks for the current queue on demand;
+  `QueueState` is both that reply and, unprompted, pushed to every connected sender whenever the
+  queue changes (an add, an auto-advance, or a jump) -- the same push-on-change model
+  `PlaybackUpdate` already uses, and, like it, purely event-driven with no polling timer.
 
 ### How YouTube playback works
 

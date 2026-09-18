@@ -1,6 +1,7 @@
 //! Thin wrapper around libmpv2 that maps FCast-shaped requests onto mpv
 //! commands/properties, and reads back mpv state as an FCast PlaybackUpdate.
 
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -10,9 +11,12 @@ use libmpv2::Mpv;
 use tokio::sync::watch;
 use tracing::{debug, error, warn};
 
-use crate::fcast::{PlayMessage, PlayTarget, PlaybackState, PlaybackUpdateMessage};
+use crate::fcast::{
+    PlayMessage, PlayTarget, PlaybackState, PlaybackUpdateMessage, QueueStateMessage,
+};
 use crate::idle_screen::{IdleScreen, IdleScreenController};
 use crate::overlay::PlaybackOverlay;
+use crate::queue::Queue;
 use crate::webpage::WebpageController;
 
 pub struct Player {
@@ -36,6 +40,19 @@ pub struct Player {
     /// media-vs-web-page decision for it (`Play`s whose sender did not
     /// classify the URL); see `Routing`.
     routing: Arc<Mutex<Routing>>,
+    /// The play queue: items queued after (or as) the currently playing one
+    /// (`queue.rs`). `play` appends to it and either plays the new item
+    /// immediately (nothing else is playing) or leaves it queued;
+    /// `queue_jump_forward`/`queue_jump_backward` and the eof-triggered
+    /// auto-advance (`auto_advance_queue`, wired through
+    /// `IdleScreenController`'s `on_eof`) move the current position within
+    /// it.
+    queue: Arc<Mutex<Queue>>,
+    /// Where `queue` is persisted (see `queue::default_state_path`), or
+    /// `None` if no writable state directory could be resolved -- the queue
+    /// then stays in-memory only for this run (logged once at startup by
+    /// `Player::new`).
+    state_path: Option<PathBuf>,
     /// Broadcasts the latest `PlaybackUpdate`-shaped snapshot whenever any
     /// method below changes playback state, or an async transition does (a
     /// `PlaybackRestart`, an idle-screen show/hide, or the browser fallback
@@ -49,6 +66,24 @@ pub struct Player {
     /// sidesteps `broadcast`'s slow-subscriber lag/`RecvError::Lagged`
     /// entirely.
     status_tx: watch::Sender<PlaybackUpdateMessage>,
+    /// Broadcasts the latest queue snapshot whenever it changes (an item is
+    /// added, playback auto-advances past one, or a client jumps
+    /// forward/backward) -- the same push-on-change model `status_tx` uses
+    /// for `PlaybackUpdate` (see `main.rs`'s `push_updates`).
+    queue_tx: watch::Sender<QueueStateMessage>,
+}
+
+/// The handles play/queue operations need, grouped so the free functions
+/// below -- used both by `Player`'s own methods and the queue auto-advance
+/// callback, which runs (via `IdleScreenController`'s `on_eof`) before a
+/// `Player` exists to borrow `&self` from -- don't need a long parameter
+/// list.
+struct Handles<'a> {
+    mpv: &'a Mpv,
+    webpage: &'a WebpageController,
+    overlay: &'a PlaybackOverlay,
+    idle: &'a IdleScreenController,
+    routing: &'a Mutex<Routing>,
 }
 
 /// One `loadfile` submitted to mpv, tracked by the playlist entry mpv created
@@ -250,20 +285,49 @@ impl Player {
     }
 
     fn from_mpv(mpv: Arc<Mpv>) -> Result<Self> {
-        Self::build(mpv, Arc::new(WebpageController::from_env()))
+        let state_path = crate::queue::default_state_path();
+        if state_path.is_none() {
+            warn!(
+                "could not resolve a queue state directory (checked CASTOFF_STATE_DIR, \
+                 STATE_DIRECTORY, XDG_STATE_HOME, HOME); the play queue will not survive a \
+                 restart this run"
+            );
+        }
+        Self::build(mpv, Arc::new(WebpageController::from_env()), state_path)
     }
 
     /// `from_mpv` with a caller-supplied browser program, so tests can drive
     /// the daemon's real process orchestration (spawn, supersede, terminate,
     /// spontaneous exit) without a compositor or a real engine -- the engine
-    /// itself is covered end-to-end by `daemon/tests/webpage_display.rs`.
+    /// itself is covered end-to-end by `daemon/tests/webpage_display.rs`. No
+    /// queue persistence (`state_path: None`): most tests don't care about it
+    /// and every test in this one process would otherwise share (and
+    /// clobber) the same default state file. `with_browser_and_state` is for
+    /// the tests that do care.
     #[cfg(test)]
     fn with_browser(mpv: Arc<Mpv>, program: &str) -> Result<Self> {
-        Self::build(mpv, Arc::new(WebpageController::with_program(program)))
+        Self::build(mpv, Arc::new(WebpageController::with_program(program)), None)
     }
 
-    fn build(mpv: Arc<Mpv>, webpage: Arc<WebpageController>) -> Result<Self> {
+    /// `with_browser`, but with queue persistence pointed at `state_path` --
+    /// for tests exercising the queue surviving a simulated restart.
+    #[cfg(test)]
+    fn with_browser_and_state(mpv: Arc<Mpv>, program: &str, state_path: PathBuf) -> Result<Self> {
+        Self::build(
+            mpv,
+            Arc::new(WebpageController::with_program(program)),
+            Some(state_path),
+        )
+    }
+
+    fn build(
+        mpv: Arc<Mpv>,
+        webpage: Arc<WebpageController>,
+        state_path: Option<PathBuf>,
+    ) -> Result<Self> {
         let (status_tx, _status_rx) = watch::channel(snapshot_status(&mpv, &webpage));
+        let queue = Arc::new(Mutex::new(Queue::load(state_path.as_deref())));
+        let (queue_tx, _queue_rx) = watch::channel(queue.lock().unwrap().to_state_message());
         // Fires whenever `IdleScreenController` shows/hides a screen (idle <->
         // active transitions the `Player` methods below don't themselves
         // cover, e.g. the eof-watcher bringing the clock back on a natural
@@ -278,11 +342,50 @@ impl Player {
                 let _ = status_tx.send_replace(snapshot_status(&mpv, &webpage));
             })
         };
-        let idle = Arc::new(IdleScreenController::new(Arc::clone(&mpv), Some(on_change)));
         let overlay = Arc::new(PlaybackOverlay::new(Arc::clone(&mpv)));
-        idle.spawn_eof_watcher();
         let operation = Arc::new(Mutex::new(()));
         let routing = Arc::new(Mutex::new(Routing::default()));
+        // Tries to advance the play queue instead of letting the eof watcher
+        // show the idle screen; built here (not as a `Player` method) because
+        // it has to be threaded into `IdleScreenController::new` below,
+        // before a `Player` exists to borrow `&self` from. Takes `idle` as a
+        // parameter at call time (from the eof watcher, which already holds
+        // it) rather than capturing it, for the same reason -- see
+        // `auto_advance_queue`.
+        let on_eof: crate::idle_screen::OnEof = {
+            let mpv = Arc::clone(&mpv);
+            let webpage = Arc::clone(&webpage);
+            let overlay = Arc::clone(&overlay);
+            let routing = Arc::clone(&routing);
+            let operation = Arc::clone(&operation);
+            let queue = Arc::clone(&queue);
+            let status_tx = status_tx.clone();
+            let queue_tx = queue_tx.clone();
+            let state_path = state_path.clone();
+            Arc::new(move |idle: &IdleScreenController| {
+                let handles = Handles {
+                    mpv: &mpv,
+                    webpage: &webpage,
+                    overlay: &overlay,
+                    idle,
+                    routing: &routing,
+                };
+                auto_advance_queue(
+                    &handles,
+                    &operation,
+                    &queue,
+                    state_path.as_deref(),
+                    &status_tx,
+                    &queue_tx,
+                )
+            })
+        };
+        let idle = Arc::new(IdleScreenController::new(
+            Arc::clone(&mpv),
+            Some(on_change),
+            Some(on_eof),
+        ));
+        idle.spawn_eof_watcher();
         spawn_async_event_watcher(
             &mpv,
             Arc::clone(&idle),
@@ -305,7 +408,10 @@ impl Player {
             webpage,
             operation,
             routing,
+            queue,
+            state_path,
             status_tx,
+            queue_tx,
         })
     }
 
@@ -326,13 +432,112 @@ impl Player {
         let _ = self.status_tx.send_replace(self.status());
     }
 
+    /// Subscribe to this player's queue-changed broadcast. Every connected
+    /// FCast sender (`main.rs`) gets its own receiver so it can push
+    /// unprompted `QueueState` frames onto its own already-open socket.
+    pub fn subscribe_queue(&self) -> watch::Receiver<QueueStateMessage> {
+        self.queue_tx.subscribe()
+    }
+
+    /// The current queue as the wire shape sent to FCast senders.
+    pub fn queue_state(&self) -> QueueStateMessage {
+        self.queue.lock().unwrap().to_state_message()
+    }
+
+    /// Recompute and broadcast the current queue to every subscriber. Called
+    /// after every queue mutation (`play` enqueueing/starting an item, a
+    /// jump, or the eof-triggered auto-advance).
+    fn publish_queue_state(&self) {
+        let _ = self.queue_tx.send_replace(self.queue_state());
+    }
+
+    /// Persist the queue to `self.state_path` (a no-op if that couldn't be
+    /// resolved at startup -- see `queue::default_state_path`).
+    fn persist_queue(&self) {
+        self.queue.lock().unwrap().save(self.state_path.as_deref());
+    }
+
+    /// The handles the free play/queue functions below need, borrowed from
+    /// this player's own fields (see `Handles`).
+    fn handles(&self) -> Handles<'_> {
+        Handles {
+            mpv: &self.mpv,
+            webpage: &self.webpage,
+            overlay: &self.overlay,
+            idle: &self.idle,
+            routing: &self.routing,
+        }
+    }
+
+    /// Whether nothing is genuinely playing right now, in the sense that
+    /// matters for queueing: `play` uses this to decide whether a `Play`
+    /// should start immediately (and become the queue's current item) or
+    /// only be enqueued behind whatever is already playing.
+    ///
+    /// A displayed web page always counts as playing. Otherwise, a load
+    /// still *loading* (the spinner is up, nothing has reached
+    /// `PlaybackRestart` yet -- see `overlay.rs`'s `is_restarted`) counts as
+    /// idle, same as the idle clock itself: nothing has committed to playing
+    /// anything yet, so a fresh `Play` here supersedes the in-flight load
+    /// exactly as it always has (mpv's own `loadfile ... replace`, and the
+    /// rapid-re-Play spinner/routing behavior `player.rs`'s tests cover)
+    /// rather than queueing behind it. Deliberately checks `is_restarted`,
+    /// not `overlay.is_active()`: `is_active()` also covers `reveal`'s
+    /// ~400ms cosmetic fade-out *after* `PlaybackRestart` already confirmed
+    /// genuine playback, and a `Play` arriving during that fade must queue,
+    /// not interrupt.
+    fn is_idle(&self) -> bool {
+        !self.webpage.is_active()
+            && (self.idle.current().is_some()
+                || (self.overlay.is_active() && !self.overlay.is_restarted()))
+    }
+
+    /// Move to the next/previous queue item (see `queue::Queue::jump_forward`/
+    /// `jump_backward`) and, if one exists, play it -- what the Android
+    /// task's Next/Previous buttons call (`Opcode::QueueJumpForward`/
+    /// `QueueJumpBackward` in `main.rs`). A no-op, not an error, when already
+    /// at either edge of the queue.
+    pub fn queue_jump_forward(&self) -> Result<()> {
+        let _operation = self.operation.lock().unwrap();
+        let item = self.queue.lock().unwrap().jump_forward().cloned();
+        self.play_jumped_item(item)
+    }
+
+    /// See `queue_jump_forward`.
+    pub fn queue_jump_backward(&self) -> Result<()> {
+        let _operation = self.operation.lock().unwrap();
+        let item = self.queue.lock().unwrap().jump_backward().cloned();
+        self.play_jumped_item(item)
+    }
+
+    /// Shared tail of `queue_jump_forward`/`queue_jump_backward`: publish the
+    /// queue's new position and, if a jump actually moved somewhere, play it.
+    /// Called with `self.operation` already held.
+    fn play_jumped_item(&self, item: Option<PlayMessage>) -> Result<()> {
+        let Some(item) = item else {
+            return Ok(());
+        };
+        self.persist_queue();
+        self.publish_queue_state();
+        let result = execute_play(&self.handles(), &item);
+        if result.is_ok() {
+            self.publish_status();
+        }
+        result
+    }
+
     /// Show `screen` (currently only `IdleScreen::Clock`) until the next
     /// `hide_idle_screen`/`show_idle_screen` call.
     pub fn show_idle_screen(&self, screen: IdleScreen) -> Result<()> {
         self.idle.show(screen)
     }
 
-    /// Clear whatever idle screen is currently shown, if any.
+    /// Clear whatever idle screen is currently shown, if any. Not called by
+    /// the daemon itself outside of tests any more: `play_media` (a free
+    /// function since the play queue was added) hides the idle screen via
+    /// its own `Handles` directly. Kept as a `Player` method for tests that
+    /// drive idle-screen state without a full `Play`.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn hide_idle_screen(&self) -> Result<()> {
         self.idle.hide()
     }
@@ -358,142 +563,45 @@ impl Player {
         self.overlay.is_active()
     }
 
+    /// Queue `msg` and, if nothing is currently playing or loading, play it
+    /// immediately (it then becomes the queue's current item); otherwise it
+    /// is only appended, to be reached by auto-advance or an explicit jump
+    /// later (`queue_jump_forward`/`queue_jump_backward`) -- see README's
+    /// "Queueing (private extension)". `msg` is validated up front either
+    /// way, so an invalid `Play` (e.g. inline `content` with no `url`) is
+    /// rejected synchronously rather than silently queued to fail later.
     pub fn play(&self, msg: &PlayMessage) -> Result<()> {
         // Hold the operation lock for the whole cross-resource handoff (see
         // the field's doc comment). The guard is released on every return
         // path, including errors.
         let _operation = self.operation.lock().unwrap();
-        let result = match msg.explicit_target() {
-            // The sender said what this is: honour it, with no fallback. A
-            // webpage `Play` with no `url` cannot be rendered, and inline
-            // `content` is still only accepted for media (below), so reject
-            // it here rather than pretending to start something.
-            Some(PlayTarget::Webpage) => {
-                let url = msg.url.as_deref().ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "Play message targets a web page (container {:?}) but has no `url`; \
-                         pass the page's http(s):// or file:// URL",
-                        msg.container.as_deref().unwrap_or("")
-                    )
-                })?;
-                // A direct page takes the screen immediately; any media
-                // attempt still being decided is cancelled (its own mpv event
-                // still resolves its entry, so it cannot resolve a later
-                // load).
-                self.routing.lock().unwrap().cancel();
-                self.play_webpage(url)
+        validate_play_message(msg)?;
+
+        let should_play_now = self.is_idle();
+        {
+            let mut queue = self.queue.lock().unwrap();
+            let index = queue.push(msg.clone());
+            if should_play_now {
+                queue.set_position(Some(index));
             }
-            // The sender classified this as media: honour it, with no
-            // fallback, but still track the submission so its own events are
-            // attributed to it and can never resolve an older probe.
-            Some(PlayTarget::Media) => self.play_media(msg, false),
-            // The sender did not say (the common case: an app that only knows
-            // a URL). The daemon decides for itself: try mpv first -- which is
-            // what makes YouTube, every other yt-dlp-supported source and
-            // plain media work with no client help -- and let
-            // `spawn_async_event_watcher` hand the URL to the browser if that
-            // attempt fails before the file loads. See README's routing
-            // rules.
-            None => self.play_media(msg, true),
+        }
+        self.persist_queue();
+        self.publish_queue_state();
+
+        let result = if should_play_now {
+            execute_play(&self.handles(), msg)
+        } else {
+            Ok(())
         };
-        // Publish on every path (media or web page). A media load may still
-        // report `Idle` at this instant -- mpv resolves `idle-active` off this
-        // call stack (see README's FCast notes) -- but the async
-        // `PlaybackRestart`/idle-screen paths publish the later `Playing`;
-        // a web-page `Play` is `Playing` here already.
+        // Publish on every path (media or web page, played now or only
+        // queued). A media load may still report `Idle` at this instant --
+        // mpv resolves `idle-active` off this call stack (see README's FCast
+        // notes) -- but the async `PlaybackRestart`/idle-screen paths publish
+        // the later `Playing`; a web-page `Play` is `Playing` here already.
         if result.is_ok() {
             self.publish_status();
         }
         result
-    }
-
-    /// The media path: hand `msg`'s URL to mpv. `probing` is true when the
-    /// sender did not classify the URL, i.e. this load is the daemon's own
-    /// media-vs-web-page probe (see `Routing`).
-    fn play_media(&self, msg: &PlayMessage, probing: bool) -> Result<()> {
-        let target = match (msg.url.as_deref(), msg.content.as_deref()) {
-            (Some(url), _) => url,
-            (None, Some(_)) => anyhow::bail!(
-                "Play message carries inline `content` (e.g. a DASH manifest) with no `url`; \
-                 inline manifest playback is not yet supported"
-            ),
-            (None, None) => anyhow::bail!("Play message has neither `url` nor `content`"),
-        };
-        // A page the browser engine is showing must not stay on top of the
-        // media: take it down before mpv takes the screen.
-        self.webpage.hide();
-        // Fade the old content (previous video or the idle clock) out to
-        // black, then put the spinner up over it, *before* submitting the
-        // load: the spinner must be visible for the whole wait, so it can't
-        // be raced by an instant `PlaybackRestart` from a fast load. It
-        // stays up until `spawn_lifecycle_watcher` sees playback genuinely
-        // restart (or the load fail), and redraws only until then. Any failure
-        // here rolls the overlay back to the idle clock, so a partial setup
-        // can't leave an opaque overlay with no spinner thread and no watcher
-        // event coming to clear it.
-        let begin_loading = || -> Result<()> {
-            self.overlay.conceal()?;
-            self.hide_idle_screen()?;
-            self.overlay.spawn_spinner()
-        };
-        if let Err(e) = begin_loading() {
-            let _ = self.abort_loading_to_idle();
-            return Err(e);
-        }
-        if let Err(e) = self.mpv.command("loadfile", &[target, "replace"]) {
-            // Nothing will load, so no async error/restart is coming to take
-            // the spinner down; do it here and fall back to the idle clock.
-            let _ = self.abort_loading_to_idle();
-            return Err(anyhow::anyhow!("loadfile failed for url {target:?}: {e:?}"));
-        }
-        // `loadfile` synchronously creates a playlist entry for the URL;
-        // read back its id so the background event watcher can attribute this
-        // load's `FileLoaded`/`EndFile` events to that exact entry instead of
-        // to whichever entry mpv reports next. (A playlist URL may already
-        // have been expanded by the time this runs; the id read then belongs
-        // to the first expanded entry, which is still this cast's media, and
-        // mpv's events for the remaining entries no longer match this
-        // submission.) `play` holds the operation lock across this and the
-        // `loadfile` call, so the watcher cannot drain an event for it before
-        // the entry exists.
-        let entry_id = match self.mpv.get_property::<i64>("playlist/0/id") {
-            Ok(id) => Some(id),
-            Err(e) => {
-                warn!(
-                    error = ?e,
-                    url = target,
-                    "could not read mpv's playlist entry id for the submitted load; this URL \
-                     will not be eligible for the web-page fallback"
-                );
-                None
-            }
-        };
-        self.routing
-            .lock()
-            .unwrap()
-            .submit(target, probing, entry_id);
-        // `keep-open=yes` (see `new()`) leaves `pause` set to `true` once a
-        // previous file hits EOF, and mpv does not reset that property on the
-        // next `loadfile`. Without this, a second Play call loads the new
-        // file but stays paused on its first frame forever: silent, endless
-        // black screen with no error, since `time-pos` never advances past 0.
-        if let Err(e) = self.mpv.set_property("pause", false) {
-            // The load is queued but nothing guarantees a `PlaybackRestart`
-            // (playback is still paused), so don't leave the spinner up over
-            // the opaque fade: clear it and fall back to the idle clock.
-            let _ = self.abort_loading_to_idle();
-            return Err(anyhow::anyhow!("failed to unpause after loadfile: {e:?}"));
-        }
-        if let Some(time) = msg.time {
-            let _ = self.mpv.set_property("start", time);
-        }
-        if let Some(volume) = msg.volume {
-            let _ = self.mpv.set_property("volume", to_mpv_volume(volume));
-        }
-        if let Some(speed) = msg.speed {
-            let _ = self.mpv.set_property("speed", speed);
-        }
-        Ok(())
     }
 
     pub fn pause(&self) -> Result<()> {
@@ -543,18 +651,18 @@ impl Player {
         let already_idle = clock_showing && !was_loading;
         if !already_idle && !was_loading {
             if let Err(e) = self.overlay.conceal() {
-                let _ = self.abort_loading_to_idle();
+                let _ = abort_loading_to_idle(&self.handles());
                 return Err(e);
             }
         }
         if let Err(e) = self.mpv.command("stop", &[]) {
-            let _ = self.abort_loading_to_idle();
+            let _ = abort_loading_to_idle(&self.handles());
             return Err(anyhow::anyhow!("stop failed: {e:?}"));
         }
         let result = if already_idle {
             self.show_idle_screen(IdleScreen::Clock)
         } else {
-            self.fade_in_idle_clock()
+            fade_in_idle_clock(&self.handles())
         };
         // Both branches already publish via `IdleScreenController`'s
         // `on_change` callback (`show_idle_screen`/`fade_in_idle_clock` end by
@@ -564,60 +672,6 @@ impl Player {
             self.publish_status();
         }
         result
-    }
-
-    /// Fade the idle clock in from black: drop the cover overlays (the screen
-    /// behind is already black from `conceal` or the loading overlay), ramp
-    /// the clock's own OSD alpha up, then install it as the current idle
-    /// screen. The clock cannot be revealed by fading a cover rect away: mpv
-    /// stacks overlays by recency, so a clock re-created after the rect would
-    /// sit above it and pop in instead of fading.
-    fn fade_in_idle_clock(&self) -> Result<()> {
-        // The clock is already the current screen, so `show`'s refresh thread
-        // is running and `render_at` must not be used alongside it (see its
-        // contract); there is also nothing to fade. Drop any overlay and
-        // re-assert the clock. This is the case a Stop after a clip reached
-        // end-of-file, or a `conceal` failure before `hide_idle_screen`, lands
-        // in -- keeping the alpha-fade path structurally out of reach rather
-        // than relying on a timing assumption.
-        if self.idle.current().is_some() {
-            self.overlay.clear()?;
-            return self.show_idle_screen(IdleScreen::Clock);
-        }
-        // Cancel/remove only the spinner; the opaque fade rect stays as the
-        // black backdrop (a not-yet-cleared video frame must not flash
-        // through). Draw the clock above it at zero opacity, ramp that alpha
-        // up, and only then drop the rect -- by then the clock's own opaque
-        // background covers the canvas, so removing the rect is invisible.
-        let fade = || -> Result<()> {
-            self.overlay.stop_spinner()?;
-            self.idle.render_at(IdleScreen::Clock, 0)?;
-            self.overlay
-                .fade_in(|opacity| self.idle.render_at(IdleScreen::Clock, opacity))?;
-            self.overlay.clear()?;
-            self.show_idle_screen(IdleScreen::Clock)
-        };
-        if let Err(e) = fade() {
-            // A failure partway through (spinner teardown, an OSD alpha draw,
-            // or dropping the opaque rect) would otherwise leave the overlay
-            // active with the black rect up and no watcher event coming to
-            // clear it: the screen stays opaque black until the next command.
-            // Roll back to a visible clock, best-effort.
-            let _ = self.overlay.clear();
-            let _ = self.show_idle_screen(IdleScreen::Clock);
-            return Err(e);
-        }
-        Ok(())
-    }
-
-    /// A load ended without ever starting playback: cancel the spinner (if
-    /// it's up) and fade back to the idle clock, so a failed Play ends on the
-    /// idle screen with the console error report rather than an endless
-    /// spinner. Used by the synchronous error paths in `play`/`stop`; clearing
-    /// the overlay and showing the clock are both idempotent, so it is safe to
-    /// call even when the overlay has already cleared itself.
-    fn abort_loading_to_idle(&self) -> Result<()> {
-        self.fade_in_idle_clock()
     }
 
     pub fn seek(&self, time: f64) -> Result<()> {
@@ -647,34 +701,272 @@ impl Player {
         snapshot_status(&self.mpv, &self.webpage)
     }
 
-    /// Hand the screen to the browser engine (`webpage`) while keeping the
-    /// daemon's own idle machinery running behind it: mpv stops (decode
-    /// pipeline dormant, boat power) and shows the idle clock, which is what
-    /// Cage reveals again when the page is stopped -- or when the engine
-    /// exits by itself.
-    fn play_webpage(&self, url: &str) -> Result<()> {
-        // Bring the engine up before touching mpv, so a failure to start one
-        // (no browser installed) is reported to the sender and leaves mpv's
-        // playback (if any) untouched.
-        self.webpage.show(url)?;
-        self.mpv
-            .command("stop", &[])
-            .map_err(|e| anyhow::anyhow!("stop before displaying a web page failed: {e:?}"))?;
-        // A media `Play` this page supersedes may have left the loading
-        // overlay (and its redraw thread) up. Take it down before drawing the
-        // clock that sits behind the page: otherwise the spinner would keep
-        // redrawing over the page -- and over the idle clock after the engine
-        // exits -- at its animation cadence, forever. `clear` is a no-op when
-        // nothing is up (see `overlay.rs`).
-        self.overlay.clear()?;
-        self.show_idle_screen(IdleScreen::Clock)
-    }
-
     /// Current volume on FCast's 0.0-1.0 scale.
     pub fn volume(&self) -> f64 {
         let v: f64 = self.mpv.get_property("volume").unwrap_or(0.0);
         v / 100.0
     }
+}
+
+/// `msg`'s validity as a `Play`, independent of whether it ends up playing
+/// immediately or only queued (see `Player::play`): a webpage target needs a
+/// `url`, and the media path (explicit or the daemon's own probe) needs a
+/// `url` or rejects inline `content`-only messages outright (not yet
+/// supported -- see README's roadmap).
+fn validate_play_message(msg: &PlayMessage) -> Result<()> {
+    if msg.explicit_target() == Some(PlayTarget::Webpage) {
+        if msg.url.is_none() {
+            anyhow::bail!(
+                "Play message targets a web page (container {:?}) but has no `url`; \
+                 pass the page's http(s):// or file:// URL",
+                msg.container.as_deref().unwrap_or("")
+            );
+        }
+        return Ok(());
+    }
+    match (msg.url.as_deref(), msg.content.as_deref()) {
+        (Some(_), _) => Ok(()),
+        (None, Some(_)) => anyhow::bail!(
+            "Play message carries inline `content` (e.g. a DASH manifest) with no `url`; \
+             inline manifest playback is not yet supported"
+        ),
+        (None, None) => anyhow::bail!("Play message has neither `url` nor `content`"),
+    }
+}
+
+/// Dispatch a (already-validated) `Play` to the media or web-page path,
+/// exactly as `Player::play` did inline before the play queue existed. Used
+/// both by `Player::play`'s "play now" branch and by the queue paths that
+/// replay an already-queued item (`Player::play_jumped_item`,
+/// `auto_advance_queue`) -- a free function (not a `Player` method) because
+/// the latter runs before a `Player` exists (see `Handles`).
+fn execute_play(h: &Handles, msg: &PlayMessage) -> Result<()> {
+    match msg.explicit_target() {
+        // The sender said what this is: honour it, with no fallback.
+        Some(PlayTarget::Webpage) => {
+            let url = msg
+                .url
+                .as_deref()
+                .expect("validate_play_message guarantees a webpage Play has a url");
+            // A direct page takes the screen immediately; any media attempt
+            // still being decided is cancelled (its own mpv event still
+            // resolves its entry, so it cannot resolve a later load).
+            h.routing.lock().unwrap().cancel();
+            play_webpage(h, url)
+        }
+        // The sender classified this as media: honour it, with no fallback,
+        // but still track the submission so its own events are attributed to
+        // it and can never resolve an older probe.
+        Some(PlayTarget::Media) => play_media(h, msg, false),
+        // The sender did not say (the common case: an app that only knows a
+        // URL). The daemon decides for itself: try mpv first -- which is
+        // what makes YouTube, every other yt-dlp-supported source and plain
+        // media work with no client help -- and let
+        // `spawn_async_event_watcher` hand the URL to the browser if that
+        // attempt fails before the file loads. See README's routing rules.
+        None => play_media(h, msg, true),
+    }
+}
+
+/// The media path: hand `msg`'s URL to mpv. `probing` is true when the
+/// sender did not classify the URL, i.e. this load is the daemon's own
+/// media-vs-web-page probe (see `Routing`).
+fn play_media(h: &Handles, msg: &PlayMessage, probing: bool) -> Result<()> {
+    let target = match (msg.url.as_deref(), msg.content.as_deref()) {
+        (Some(url), _) => url,
+        (None, Some(_)) => anyhow::bail!(
+            "Play message carries inline `content` (e.g. a DASH manifest) with no `url`; \
+             inline manifest playback is not yet supported"
+        ),
+        (None, None) => anyhow::bail!("Play message has neither `url` nor `content`"),
+    };
+    // A page the browser engine is showing must not stay on top of the
+    // media: take it down before mpv takes the screen.
+    h.webpage.hide();
+    // Fade the old content (previous video or the idle clock) out to black,
+    // then put the spinner up over it, *before* submitting the load: the
+    // spinner must be visible for the whole wait, so it can't be raced by an
+    // instant `PlaybackRestart` from a fast load. It stays up until
+    // `spawn_lifecycle_watcher` sees playback genuinely restart (or the load
+    // fail), and redraws only until then. Any failure here rolls the overlay
+    // back to the idle clock, so a partial setup can't leave an opaque
+    // overlay with no spinner thread and no watcher event coming to clear it.
+    let begin_loading = || -> Result<()> {
+        h.overlay.conceal()?;
+        h.idle.hide()?;
+        h.overlay.spawn_spinner()
+    };
+    if let Err(e) = begin_loading() {
+        let _ = abort_loading_to_idle(h);
+        return Err(e);
+    }
+    if let Err(e) = h.mpv.command("loadfile", &[target, "replace"]) {
+        // Nothing will load, so no async error/restart is coming to take the
+        // spinner down; do it here and fall back to the idle clock.
+        let _ = abort_loading_to_idle(h);
+        return Err(anyhow::anyhow!("loadfile failed for url {target:?}: {e:?}"));
+    }
+    // `loadfile` synchronously creates a playlist entry for the URL; read
+    // back its id so the background event watcher can attribute this load's
+    // `FileLoaded`/`EndFile` events to that exact entry instead of to
+    // whichever entry mpv reports next. (A playlist URL may already have
+    // been expanded by the time this runs; the id read then belongs to the
+    // first expanded entry, which is still this cast's media, and mpv's
+    // events for the remaining entries no longer match this submission.)
+    // Every caller holds the operation lock across this and the `loadfile`
+    // call, so the watcher cannot drain an event for it before the entry
+    // exists.
+    let entry_id = match h.mpv.get_property::<i64>("playlist/0/id") {
+        Ok(id) => Some(id),
+        Err(e) => {
+            warn!(
+                error = ?e,
+                url = target,
+                "could not read mpv's playlist entry id for the submitted load; this URL \
+                 will not be eligible for the web-page fallback"
+            );
+            None
+        }
+    };
+    h.routing.lock().unwrap().submit(target, probing, entry_id);
+    // `keep-open=yes` (see `new()`) leaves `pause` set to `true` once a
+    // previous file hits EOF, and mpv does not reset that property on the
+    // next `loadfile`. Without this, a second Play call loads the new file
+    // but stays paused on its first frame forever: silent, endless black
+    // screen with no error, since `time-pos` never advances past 0.
+    if let Err(e) = h.mpv.set_property("pause", false) {
+        // The load is queued but nothing guarantees a `PlaybackRestart`
+        // (playback is still paused), so don't leave the spinner up over the
+        // opaque fade: clear it and fall back to the idle clock.
+        let _ = abort_loading_to_idle(h);
+        return Err(anyhow::anyhow!("failed to unpause after loadfile: {e:?}"));
+    }
+    if let Some(time) = msg.time {
+        let _ = h.mpv.set_property("start", time);
+    }
+    if let Some(volume) = msg.volume {
+        let _ = h.mpv.set_property("volume", to_mpv_volume(volume));
+    }
+    if let Some(speed) = msg.speed {
+        let _ = h.mpv.set_property("speed", speed);
+    }
+    Ok(())
+}
+
+/// Hand the screen to the browser engine (`webpage`) while keeping the
+/// daemon's own idle machinery running behind it: mpv stops (decode pipeline
+/// dormant, boat power) and shows the idle clock, which is what Cage reveals
+/// again when the page is stopped -- or when the engine exits by itself.
+fn play_webpage(h: &Handles, url: &str) -> Result<()> {
+    // Bring the engine up before touching mpv, so a failure to start one (no
+    // browser installed) is reported to the sender and leaves mpv's
+    // playback (if any) untouched.
+    h.webpage.show(url)?;
+    h.mpv
+        .command("stop", &[])
+        .map_err(|e| anyhow::anyhow!("stop before displaying a web page failed: {e:?}"))?;
+    // A media `Play` this page supersedes may have left the loading overlay
+    // (and its redraw thread) up. Take it down before drawing the clock that
+    // sits behind the page: otherwise the spinner would keep redrawing over
+    // the page -- and over the idle clock after the engine exits -- at its
+    // animation cadence, forever. `clear` is a no-op when nothing is up (see
+    // `overlay.rs`).
+    h.overlay.clear()?;
+    h.idle.show(IdleScreen::Clock)
+}
+
+/// Fade the idle clock in from black: drop the cover overlays (the screen
+/// behind is already black from `conceal` or the loading overlay), ramp the
+/// clock's own OSD alpha up, then install it as the current idle screen. The
+/// clock cannot be revealed by fading a cover rect away: mpv stacks overlays
+/// by recency, so a clock re-created after the rect would sit above it and
+/// pop in instead of fading.
+fn fade_in_idle_clock(h: &Handles) -> Result<()> {
+    // The clock is already the current screen, so `show`'s refresh thread is
+    // running and `render_at` must not be used alongside it (see its
+    // contract); there is also nothing to fade. Drop any overlay and
+    // re-assert the clock. This is the case a Stop after a clip reached
+    // end-of-file, or a `conceal` failure before `hide`, lands in -- keeping
+    // the alpha-fade path structurally out of reach rather than relying on a
+    // timing assumption.
+    if h.idle.current().is_some() {
+        h.overlay.clear()?;
+        return h.idle.show(IdleScreen::Clock);
+    }
+    // Cancel/remove only the spinner; the opaque fade rect stays as the
+    // black backdrop (a not-yet-cleared video frame must not flash through).
+    // Draw the clock above it at zero opacity, ramp that alpha up, and only
+    // then drop the rect -- by then the clock's own opaque background covers
+    // the canvas, so removing the rect is invisible.
+    let fade = || -> Result<()> {
+        h.overlay.stop_spinner()?;
+        h.idle.render_at(IdleScreen::Clock, 0)?;
+        h.overlay
+            .fade_in(|opacity| h.idle.render_at(IdleScreen::Clock, opacity))?;
+        h.overlay.clear()?;
+        h.idle.show(IdleScreen::Clock)
+    };
+    if let Err(e) = fade() {
+        // A failure partway through (spinner teardown, an OSD alpha draw, or
+        // dropping the opaque rect) would otherwise leave the overlay active
+        // with the black rect up and no watcher event coming to clear it:
+        // the screen stays opaque black until the next command. Roll back to
+        // a visible clock, best-effort.
+        let _ = h.overlay.clear();
+        let _ = h.idle.show(IdleScreen::Clock);
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// A load ended without ever starting playback: cancel the spinner (if it's
+/// up) and fade back to the idle clock, so a failed Play ends on the idle
+/// screen with the console error report rather than an endless spinner.
+/// Used by the synchronous error paths in `play_media`/`Player::stop`;
+/// clearing the overlay and showing the clock are both idempotent, so it is
+/// safe to call even when the overlay has already cleared itself.
+fn abort_loading_to_idle(h: &Handles) -> Result<()> {
+    fade_in_idle_clock(h)
+}
+
+/// Called by the idle-screen eof watcher (`idle_screen.rs`'s `on_eof`) when
+/// mpv reaches end-of-file on its own, before it would otherwise show the
+/// idle clock: tries to advance to the next queued item instead. Returns
+/// whether it found (and successfully submitted a load for) one, so the eof
+/// watcher knows whether to fall back to showing the idle clock itself.
+///
+/// Takes the same field handles `Player`'s own methods use (`Handles`)
+/// rather than `&Player`, because this is built and threaded into
+/// `IdleScreenController::new` in `Player::build`, before a `Player` exists
+/// to borrow from.
+fn auto_advance_queue(
+    h: &Handles,
+    operation: &Mutex<()>,
+    queue: &Mutex<Queue>,
+    state_path: Option<&Path>,
+    status_tx: &watch::Sender<PlaybackUpdateMessage>,
+    queue_tx: &watch::Sender<QueueStateMessage>,
+) -> bool {
+    let _operation = operation.lock().unwrap();
+    let next = { queue.lock().unwrap().jump_forward().cloned() };
+    let Some(item) = next else {
+        return false;
+    };
+    {
+        let q = queue.lock().unwrap();
+        q.save(state_path);
+        let _ = queue_tx.send_replace(q.to_state_message());
+    }
+    if let Err(e) = execute_play(h, &item) {
+        error!(
+            error = %e,
+            url = item.url.as_deref().unwrap_or(""),
+            "queue auto-advance failed to start the next item; returning to the idle clock"
+        );
+        return false;
+    }
+    let _ = status_tx.send_replace(snapshot_status(h.mpv, h.webpage));
+    true
 }
 
 fn to_mpv_volume(fcast_volume: f64) -> f64 {
@@ -992,6 +1284,7 @@ fn handle_lifecycle_event(
         // everywhere else, a `Player` method's own `publish_status` call or
         // the idle-screen `on_change` callback already covers it.
         Event::PlaybackRestart => {
+            overlay.mark_restarted();
             let _ = overlay.reveal();
             let _ = status_tx.send_replace(snapshot_status(mpv, webpage));
         }
@@ -1966,13 +2259,22 @@ mod tests {
         let pid = stub_pid(&wait_for_stub_log(&dir));
         assert!(player.webpage_active());
 
+        // A displayed page counts as "currently playing" for queueing (see
+        // `Player::is_idle`), so this second `Play` only enqueues; jumping
+        // forward is what actually takes the screen back, the way the
+        // Android task's Next button would.
         let media_url = "av://lavfi:testsrc=size=64x64:rate=10:duration=1";
         player
             .play(&PlayMessage {
                 url: Some(media_url.to_string()),
                 ..Default::default()
             })
-            .expect("media play");
+            .expect("enqueue media play");
+        assert!(
+            player.webpage_active(),
+            "an enqueued Play must not itself take the screen"
+        );
+        player.queue_jump_forward().expect("jump to the media item");
 
         assert!(
             !player.webpage_active(),
@@ -2004,9 +2306,15 @@ mod tests {
             .expect("first webpage play");
         let first_pid = stub_pid(&wait_for_stub_log(&dir));
 
+        // The first page is still displayed, so this only enqueues (see
+        // `Player::is_idle`); jumping forward is what actually swaps the
+        // engine, the way the Android task's Next button would.
         player
             .play(&webpage_play("http://127.0.0.1:9/second"))
-            .expect("second webpage play");
+            .expect("enqueue second webpage play");
+        player
+            .queue_jump_forward()
+            .expect("jump to the second webpage");
 
         assert!(player.webpage_active());
         wait_until_process_gone(first_pid, "the first browser engine");
@@ -2042,8 +2350,17 @@ mod tests {
             .expect("first webpage play");
         let first_pid = stub_pid(&wait_for_stub_log(&dir));
 
+        // The first page is still displayed, so this only enqueues (see
+        // `Player::is_idle`) -- it returns immediately, without waiting on
+        // the first engine at all. The blocking wait-for-exit this test is
+        // about only happens once something actually asks to take the
+        // screen: the jump below.
+        player
+            .play(&webpage_play("http://127.0.0.1:9/second"))
+            .expect("enqueue second webpage play");
+
         let second_started_while_first_lingered = std::thread::scope(|scope| {
-            let second = scope.spawn(|| player.play(&webpage_play("http://127.0.0.1:9/second")));
+            let jump = scope.spawn(|| player.queue_jump_forward());
             // The first engine logs its SIGTERM only once `show` has asked it
             // to go away and is waiting for it; sample shortly after, while it
             // still lingers (its handler sleeps 2s), for the second engine's
@@ -2053,10 +2370,9 @@ mod tests {
             let started = std::fs::read_to_string(dir.join("stub.log"))
                 .unwrap_or_default()
                 .contains("--app=http://127.0.0.1:9/second");
-            second
-                .join()
-                .expect("second play thread")
-                .expect("second webpage play");
+            jump.join()
+                .expect("jump thread")
+                .expect("jump to the second webpage");
             started
         });
 
@@ -2420,8 +2736,7 @@ mod tests {
             .mpv
             .command("stop", &[])
             .expect("stop mpv while holding the operation lock");
-        player
-            .play_media(&unclassified_play(UNREACHABLE_URL), true)
+        play_media(&player.handles(), &unclassified_play(UNREACHABLE_URL), true)
             .expect("submit the page Play");
         drop(operation);
 
@@ -2882,14 +3197,195 @@ mod tests {
             "precondition: clock hidden and overlay gone -- screen would be black"
         );
 
-        player
-            .abort_loading_to_idle()
-            .expect("abort back to the idle clock");
+        abort_loading_to_idle(&player.handles()).expect("abort back to the idle clock");
 
         assert_eq!(
             player.idle_screen(),
             Some(IdleScreen::Clock),
             "the idle clock must be restored even when the overlay had already cleared"
+        );
+    }
+
+    /// The core of the queueing feature: a `Play` that arrives while
+    /// something is genuinely playing (past `PlaybackRestart`, not merely
+    /// loading) must not interrupt it -- it only joins the queue, to be
+    /// reached by auto-advance or an explicit jump later.
+    #[test]
+    fn play_while_playing_enqueues_instead_of_interrupting() {
+        let player = headless_player();
+        let first = PlayMessage {
+            url: Some("av://lavfi:testsrc=size=64x64:rate=10:duration=30".to_string()),
+            ..Default::default()
+        };
+        player.play(&first).expect("first play");
+        wait_until(
+            &player.mpv,
+            |mpv| mpv.get_property::<f64>("time-pos").unwrap_or(0.0) > 0.05,
+            "the first clip to start playing",
+        );
+
+        let second = PlayMessage {
+            url: Some("av://lavfi:testsrc=size=64x64:rate=10:duration=1".to_string()),
+            ..Default::default()
+        };
+        player.play(&second).expect("second play must be accepted (enqueued)");
+
+        // mpv must still be on the first clip: the second Play only queued.
+        let path: String = player.mpv.get_property("path").unwrap_or_default();
+        assert!(
+            path.contains("duration=30"),
+            "a Play while something is playing must not interrupt it, got path {path:?}"
+        );
+
+        let state = player.queue_state();
+        assert_eq!(state.items.len(), 2, "both items must be in the queue");
+        assert_eq!(
+            state.current_index,
+            Some(0),
+            "the currently playing item stays current; the second is only queued"
+        );
+    }
+
+    /// When the current item reaches genuine end-of-file, the daemon must
+    /// automatically start the next queued item instead of falling back to
+    /// the idle clock (see `auto_advance_queue`).
+    #[test]
+    fn eof_auto_advances_to_the_next_queued_item() {
+        let player = headless_player();
+        let first = PlayMessage {
+            url: Some("av://lavfi:testsrc=size=64x64:rate=10:duration=1".to_string()),
+            ..Default::default()
+        };
+        let second = PlayMessage {
+            url: Some("av://lavfi:testsrc=size=64x64:rate=10:duration=5".to_string()),
+            ..Default::default()
+        };
+        player.play(&first).expect("first play");
+        player.play(&second).expect("second play enqueues");
+        wait_until(
+            &player.mpv,
+            |mpv| mpv.get_property::<f64>("time-pos").unwrap_or(0.0) > 0.05,
+            "the first clip to start playing",
+        );
+
+        // Let the first clip run out on its own; auto-advance should move
+        // the queue's position to the second item without ever needing an
+        // incoming command.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut advanced = false;
+        while Instant::now() < deadline {
+            if player.queue_state().current_index == Some(1) {
+                advanced = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            advanced,
+            "the queue must auto-advance to the second item once the first reaches eof"
+        );
+        assert_eq!(
+            player.idle_screen(),
+            None,
+            "auto-advance must not fall back to the idle clock when a next item exists"
+        );
+    }
+
+    /// `QueueJumpForward`/`QueueJumpBackward` (`Player::queue_jump_forward`/
+    /// `queue_jump_backward`) move within the queue on demand, and are a
+    /// no-op (not an error) past either edge.
+    #[test]
+    fn queue_jump_forward_and_backward_move_between_queued_items() {
+        let player = headless_player();
+        let clip = || PlayMessage {
+            url: Some("av://lavfi:testsrc=size=64x64:rate=10:duration=30".to_string()),
+            ..Default::default()
+        };
+        player.play(&clip()).expect("first play");
+        wait_until(
+            &player.mpv,
+            |mpv| mpv.get_property::<f64>("time-pos").unwrap_or(0.0) > 0.05,
+            "the first clip to start playing",
+        );
+        player.play(&clip()).expect("second play enqueues");
+        assert_eq!(player.queue_state().current_index, Some(0));
+
+        player.queue_jump_forward().expect("jump forward");
+        assert_eq!(player.queue_state().current_index, Some(1));
+
+        player.queue_jump_backward().expect("jump backward");
+        assert_eq!(player.queue_state().current_index, Some(0));
+
+        // Past either edge, a jump changes nothing and is not an error.
+        player
+            .queue_jump_backward()
+            .expect("jump backward at the start is a no-op");
+        assert_eq!(player.queue_state().current_index, Some(0));
+    }
+
+    /// The queue (its items and current position) must survive a daemon
+    /// restart: `Player::build` reloads whatever `Queue::save` last wrote.
+    /// Simulates the restart by dropping one `Player` and constructing a
+    /// fresh one against the same state file, exactly as `main` would after
+    /// a real process restart -- mpv itself always starts fresh and idle
+    /// either way, so this also checks that a reload does not, by itself,
+    /// resume playback.
+    #[test]
+    fn queue_persists_across_a_simulated_restart() {
+        let dir = scratch_dir("queue-persistence");
+        let state_path = dir.join("queue.json");
+        let browser = "/nonexistent/castoff-test-browser";
+
+        let before = Player::with_browser_and_state(headless_mpv(), browser, state_path.clone())
+            .expect("create player");
+        before
+            .show_idle_screen(IdleScreen::Clock)
+            .expect("show initial idle screen");
+
+        let first = PlayMessage {
+            url: Some("av://lavfi:testsrc=size=64x64:rate=10:duration=30".to_string()),
+            ..Default::default()
+        };
+        let second = PlayMessage {
+            url: Some("av://lavfi:testsrc=size=64x64:rate=10:duration=30".to_string()),
+            ..Default::default()
+        };
+        before.play(&first).expect("first play");
+        wait_until(
+            &before.mpv,
+            |mpv| mpv.get_property::<f64>("time-pos").unwrap_or(0.0) > 0.05,
+            "the first clip to start playing",
+        );
+        before.play(&second).expect("second play enqueues");
+
+        let state_before = before.queue_state();
+        assert_eq!(state_before.items.len(), 2);
+        assert_eq!(state_before.current_index, Some(0));
+        drop(before);
+
+        let after = Player::with_browser_and_state(headless_mpv(), browser, state_path)
+            .expect("recreate player after simulated restart");
+        after
+            .show_idle_screen(IdleScreen::Clock)
+            .expect("show initial idle screen");
+
+        let state_after = after.queue_state();
+        assert_eq!(
+            state_after.items.len(),
+            state_before.items.len(),
+            "the reloaded queue must have the same items"
+        );
+        assert_eq!(
+            state_after.current_index, state_before.current_index,
+            "the reloaded queue must have the same current position"
+        );
+        for (before_item, after_item) in state_before.items.iter().zip(&state_after.items) {
+            assert_eq!(before_item.url, after_item.url);
+        }
+        assert_eq!(
+            after.idle_screen(),
+            Some(IdleScreen::Clock),
+            "a reload must not itself resume playback"
         );
     }
 }

@@ -92,6 +92,11 @@ struct State {
     active: bool,
     /// Current fade-rect opacity: 0 = fully transparent, 255 = opaque black.
     opacity: u8,
+    /// True once mpv has confirmed the in-flight load genuinely started
+    /// rendering (`PlaybackRestart`), even while `active` stays true for the
+    /// rest of `reveal`'s ~400ms cosmetic fade-out. Distinct from `active` on
+    /// purpose -- see `PlaybackOverlay::is_restarted`.
+    restarted: bool,
 }
 
 /// Owns the loading/fade overlays for one `Player`.
@@ -117,6 +122,25 @@ impl PlaybackOverlay {
     /// return the screen to the idle clock, and by tests.
     pub(crate) fn is_active(&self) -> bool {
         self.state.lock().unwrap().active
+    }
+
+    /// Whether the in-flight load has genuinely started rendering
+    /// (`PlaybackRestart`) -- unlike `is_active`, this flips true the instant
+    /// that event is confirmed, *not* after `reveal`'s ~400ms fade-out also
+    /// finishes. `Player::is_idle` uses this (not `is_active`) to decide
+    /// whether a `Play` should supersede an in-flight load or only queue
+    /// behind a load that has already succeeded -- otherwise a `Play`
+    /// arriving during the cosmetic fade-out would still wrongly interrupt
+    /// already-genuine playback instead of queueing behind it.
+    pub(crate) fn is_restarted(&self) -> bool {
+        self.state.lock().unwrap().restarted
+    }
+
+    /// Record that the in-flight load has genuinely started rendering. Called
+    /// by `handle_lifecycle_event`'s `PlaybackRestart` arm, before `reveal`'s
+    /// fade-out begins.
+    pub(crate) fn mark_restarted(&self) {
+        self.state.lock().unwrap().restarted = true;
     }
 
     /// Start an animation sequence: mark the overlay active and invalidate
@@ -179,6 +203,11 @@ impl PlaybackOverlay {
     /// loop runs on its own thread and idles otherwise.
     pub(crate) fn spawn_spinner(&self) -> Result<()> {
         let generation = self.begin();
+        // A fresh load has not restarted playback yet; clear any stale
+        // `true` left by a previous, already-finished load (see
+        // `is_restarted`'s doc comment) so a brand-new spinner is correctly
+        // superseded by a rapid re-Play instead of only queueing behind it.
+        self.state.lock().unwrap().restarted = false;
         match self.draw_if_current(generation, 255, Some(0.0)) {
             Ok(true) => {}
             Ok(false) => return Ok(()),

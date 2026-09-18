@@ -42,6 +42,9 @@ const CANVAS_HEIGHT: i64 = 1080;
 /// ~33% of the canvas height.
 const CLOCK_FONT_SIZE: i64 = 356;
 
+/// See `IdleScreenController`'s `on_eof` field.
+pub(crate) type OnEof = Arc<dyn Fn(&IdleScreenController) -> bool + Send + Sync>;
+
 /// Content shown while nothing is playing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IdleScreen {
@@ -150,14 +153,28 @@ pub(crate) struct IdleScreenController {
     /// directly, so this module doesn't need to know about FCast message
     /// types.
     on_change: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Called by the eof watcher when mpv reaches end-of-file on its own,
+    /// *before* it would otherwise show the idle screen -- lets `Player` try
+    /// to advance the play queue instead (see `player.rs`'s queue
+    /// auto-advance). Takes `&Self` (rather than capturing it) because this
+    /// closure is built and threaded in before this controller exists (see
+    /// `Player::build`). Returns whether it handled the end-of-file (started
+    /// something else playing): when `false` or unset, the eof watcher falls
+    /// back to showing the idle screen as before.
+    on_eof: Option<OnEof>,
 }
 
 impl IdleScreenController {
-    pub(crate) fn new(mpv: Arc<Mpv>, on_change: Option<Arc<dyn Fn() + Send + Sync>>) -> Self {
+    pub(crate) fn new(
+        mpv: Arc<Mpv>,
+        on_change: Option<Arc<dyn Fn() + Send + Sync>>,
+        on_eof: Option<OnEof>,
+    ) -> Self {
         Self {
             mpv,
             state: Arc::new(Mutex::new(State::default())),
             on_change,
+            on_eof,
         }
     }
 
@@ -260,7 +277,10 @@ impl IdleScreenController {
                     reply_userdata: EOF_WATCH_ID,
                     ..
                 })) => {
-                    let _ = this.show(IdleScreen::Clock);
+                    let handled = this.on_eof.as_ref().is_some_and(|cb| cb(&this));
+                    if !handled {
+                        let _ = this.show(IdleScreen::Clock);
+                    }
                 }
                 Some(Ok(Event::Shutdown)) => return,
                 _ => {}
