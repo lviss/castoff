@@ -105,6 +105,25 @@ struct Load {
     /// that read failed, in which case no mpv event matches this load and it
     /// is never re-routed.
     entry_id: Option<i64>,
+    /// If this load was submitted as the play queue's new current item, where
+    /// to revert `Queue`'s position if it ends up never playing (see
+    /// `revert_queue_position`). `None` for a load `execute_play` was not
+    /// asked to track against the queue.
+    queue_rollback: Option<QueueRollback>,
+}
+
+/// The queue position to restore if a load submitted as the queue's current
+/// item fails before ever playing -- an unreachable URL's mpv error surfaces
+/// off `Player::play`'s call stack (see `spawn_async_event_watcher`), well
+/// after the position was already committed and broadcast, so undoing it
+/// needs to travel with the load's own tracking rather than live on the call
+/// stack that submitted it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct QueueRollback {
+    /// The queue position this load was submitted as.
+    index: usize,
+    /// The position to restore if the load never plays.
+    previous: Option<usize>,
 }
 
 /// What the watcher should do with an mpv error that ended the submitted
@@ -113,10 +132,10 @@ struct Load {
 enum Resolution {
     /// The load was a probe that never loaded: hand its URL to the browser
     /// engine instead.
-    FallBack(String),
+    FallBack(String, Option<QueueRollback>),
     /// The load had already loaded, or the sender classified it as media: a
     /// genuine playback error, never re-routed.
-    PlaybackError(String),
+    PlaybackError(String, Option<QueueRollback>),
 }
 
 /// The daemon's media-vs-web-page decision in flight: the newest `loadfile`
@@ -153,12 +172,19 @@ impl Routing {
     /// Record a `loadfile` that has just been submitted to mpv, together with
     /// the `playlist_entry_id` mpv assigned it. Called under the `operation`
     /// lock, before the watcher can drain any event for it.
-    fn submit(&mut self, url: &str, probing: bool, entry_id: Option<i64>) {
+    fn submit(
+        &mut self,
+        url: &str,
+        probing: bool,
+        entry_id: Option<i64>,
+        queue_rollback: Option<QueueRollback>,
+    ) {
         self.current = Some(Load {
             url: url.to_string(),
             probing,
             loaded: false,
             entry_id,
+            queue_rollback,
         });
     }
 
@@ -200,9 +226,9 @@ impl Routing {
         }
         let load = self.current.take()?;
         if load.probing && !load.loaded {
-            Some(Resolution::FallBack(load.url))
+            Some(Resolution::FallBack(load.url, load.queue_rollback))
         } else {
-            Some(Resolution::PlaybackError(load.url))
+            Some(Resolution::PlaybackError(load.url, load.queue_rollback))
         }
     }
 
@@ -393,6 +419,9 @@ impl Player {
             Arc::clone(&routing),
             Arc::clone(&operation),
             status_tx.clone(),
+            Arc::clone(&queue),
+            state_path.clone(),
+            queue_tx.clone(),
         )?;
         spawn_lifecycle_watcher(
             Arc::clone(&mpv),
@@ -499,27 +528,42 @@ impl Player {
     /// at either edge of the queue.
     pub fn queue_jump_forward(&self) -> Result<()> {
         let _operation = self.operation.lock().unwrap();
-        let item = self.queue.lock().unwrap().jump_forward().cloned();
-        self.play_jumped_item(item)
+        let mut queue = self.queue.lock().unwrap();
+        let previous = queue.position();
+        let item = queue.jump_forward().cloned();
+        drop(queue);
+        self.play_jumped_item(item, previous)
     }
 
     /// See `queue_jump_forward`.
     pub fn queue_jump_backward(&self) -> Result<()> {
         let _operation = self.operation.lock().unwrap();
-        let item = self.queue.lock().unwrap().jump_backward().cloned();
-        self.play_jumped_item(item)
+        let mut queue = self.queue.lock().unwrap();
+        let previous = queue.position();
+        let item = queue.jump_backward().cloned();
+        drop(queue);
+        self.play_jumped_item(item, previous)
     }
 
     /// Shared tail of `queue_jump_forward`/`queue_jump_backward`: publish the
     /// queue's new position and, if a jump actually moved somewhere, play it.
-    /// Called with `self.operation` already held.
-    fn play_jumped_item(&self, item: Option<PlayMessage>) -> Result<()> {
+    /// Called with `self.operation` already held. `previous` is the position
+    /// the jump moved away from, so a load that fails without ever playing
+    /// can be rolled back to it (see `revert_queue_position`) instead of
+    /// leaving every client (and the persisted queue) reporting a failed
+    /// item as the current one.
+    fn play_jumped_item(&self, item: Option<PlayMessage>, previous: Option<usize>) -> Result<()> {
         let Some(item) = item else {
             return Ok(());
         };
+        let index = self.queue.lock().unwrap().position();
         self.persist_queue();
         self.publish_queue_state();
-        let result = execute_play(&self.handles(), &item);
+        let rollback = index.map(|index| QueueRollback { index, previous });
+        let result = execute_play(&self.handles(), &item, rollback);
+        if result.is_err() {
+            revert_queue_position(&self.queue, self.state_path.as_deref(), &self.queue_tx, rollback);
+        }
         if result.is_ok() {
             self.publish_status();
         }
@@ -578,10 +622,15 @@ impl Player {
         validate_play_message(msg)?;
 
         let should_play_now = self.is_idle();
+        let mut rollback = None;
         {
             let mut queue = self.queue.lock().unwrap();
             let index = queue.push(msg.clone());
             if should_play_now {
+                rollback = Some(QueueRollback {
+                    index,
+                    previous: queue.position(),
+                });
                 queue.set_position(Some(index));
             }
         }
@@ -589,10 +638,13 @@ impl Player {
         self.publish_queue_state();
 
         let result = if should_play_now {
-            execute_play(&self.handles(), msg)
+            execute_play(&self.handles(), msg, rollback)
         } else {
             Ok(())
         };
+        if result.is_err() {
+            revert_queue_position(&self.queue, self.state_path.as_deref(), &self.queue_tx, rollback);
+        }
         // Publish on every path (media or web page, played now or only
         // queued). A media load may still report `Idle` at this instant --
         // mpv resolves `idle-active` off this call stack (see README's FCast
@@ -740,7 +792,7 @@ fn validate_play_message(msg: &PlayMessage) -> Result<()> {
 /// replay an already-queued item (`Player::play_jumped_item`,
 /// `auto_advance_queue`) -- a free function (not a `Player` method) because
 /// the latter runs before a `Player` exists (see `Handles`).
-fn execute_play(h: &Handles, msg: &PlayMessage) -> Result<()> {
+fn execute_play(h: &Handles, msg: &PlayMessage, queue_rollback: Option<QueueRollback>) -> Result<()> {
     match msg.explicit_target() {
         // The sender said what this is: honour it, with no fallback.
         Some(PlayTarget::Webpage) => {
@@ -757,21 +809,29 @@ fn execute_play(h: &Handles, msg: &PlayMessage) -> Result<()> {
         // The sender classified this as media: honour it, with no fallback,
         // but still track the submission so its own events are attributed to
         // it and can never resolve an older probe.
-        Some(PlayTarget::Media) => play_media(h, msg, false),
+        Some(PlayTarget::Media) => play_media(h, msg, false, queue_rollback),
         // The sender did not say (the common case: an app that only knows a
         // URL). The daemon decides for itself: try mpv first -- which is
         // what makes YouTube, every other yt-dlp-supported source and plain
         // media work with no client help -- and let
         // `spawn_async_event_watcher` hand the URL to the browser if that
         // attempt fails before the file loads. See README's routing rules.
-        None => play_media(h, msg, true),
+        None => play_media(h, msg, true, queue_rollback),
     }
 }
 
 /// The media path: hand `msg`'s URL to mpv. `probing` is true when the
 /// sender did not classify the URL, i.e. this load is the daemon's own
-/// media-vs-web-page probe (see `Routing`).
-fn play_media(h: &Handles, msg: &PlayMessage, probing: bool) -> Result<()> {
+/// media-vs-web-page probe (see `Routing`). `queue_rollback`, if this load is
+/// the play queue's new current item, travels with the submission so a
+/// later async failure (see `spawn_async_event_watcher`) can undo the
+/// position it already committed.
+fn play_media(
+    h: &Handles,
+    msg: &PlayMessage,
+    probing: bool,
+    queue_rollback: Option<QueueRollback>,
+) -> Result<()> {
     let target = match (msg.url.as_deref(), msg.content.as_deref()) {
         (Some(url), _) => url,
         (None, Some(_)) => anyhow::bail!(
@@ -828,7 +888,10 @@ fn play_media(h: &Handles, msg: &PlayMessage, probing: bool) -> Result<()> {
             None
         }
     };
-    h.routing.lock().unwrap().submit(target, probing, entry_id);
+    h.routing
+        .lock()
+        .unwrap()
+        .submit(target, probing, entry_id, queue_rollback);
     // `keep-open=yes` (see `new()`) leaves `pause` set to `true` once a
     // previous file hits EOF, and mpv does not reset that property on the
     // next `loadfile`. Without this, a second Play call loads the new file
@@ -948,25 +1011,53 @@ fn auto_advance_queue(
     queue_tx: &watch::Sender<QueueStateMessage>,
 ) -> bool {
     let _operation = operation.lock().unwrap();
+    let previous = { queue.lock().unwrap().position() };
     let next = { queue.lock().unwrap().jump_forward().cloned() };
     let Some(item) = next else {
         return false;
     };
+    let index = { queue.lock().unwrap().position() };
     {
         let q = queue.lock().unwrap();
         q.save(state_path);
         let _ = queue_tx.send_replace(q.to_state_message());
     }
-    if let Err(e) = execute_play(h, &item) {
+    let rollback = index.map(|index| QueueRollback { index, previous });
+    if let Err(e) = execute_play(h, &item, rollback) {
         error!(
             error = %e,
             url = item.url.as_deref().unwrap_or(""),
             "queue auto-advance failed to start the next item; returning to the idle clock"
         );
+        revert_queue_position(queue, state_path, queue_tx, rollback);
         return false;
     }
     let _ = status_tx.send_replace(snapshot_status(h.mpv, h.webpage));
     true
+}
+
+/// Revert the queue's current position back to `rollback.previous` if it
+/// still points at the position the failed load was submitted as -- i.e.
+/// nothing else (a jump, or a newer `Play`) has moved the queue on since.
+/// Shared by every path that resolves a load which became the queue's
+/// current item without ever playing: `Player::play`/`play_jumped_item`'s
+/// own synchronous failures, `auto_advance_queue`'s, and the asynchronous
+/// ones `spawn_async_event_watcher`/`fall_back_to_browser` resolve well
+/// after the position was already committed and broadcast.
+fn revert_queue_position(
+    queue: &Mutex<Queue>,
+    state_path: Option<&Path>,
+    queue_tx: &watch::Sender<QueueStateMessage>,
+    rollback: Option<QueueRollback>,
+) {
+    let Some(rollback) = rollback else { return };
+    let mut queue = queue.lock().unwrap();
+    if queue.position() != Some(rollback.index) {
+        return;
+    }
+    queue.set_position(rollback.previous);
+    queue.save(state_path);
+    let _ = queue_tx.send_replace(queue.to_state_message());
 }
 
 fn to_mpv_volume(fcast_volume: f64) -> f64 {
@@ -1054,6 +1145,9 @@ fn spawn_async_event_watcher(
     routing: Arc<Mutex<Routing>>,
     operation: Arc<Mutex<()>>,
     status_tx: watch::Sender<PlaybackUpdateMessage>,
+    queue: Arc<Mutex<Queue>>,
+    state_path: Option<PathBuf>,
+    queue_tx: watch::Sender<QueueStateMessage>,
 ) -> Result<()> {
     let events = mpv
         .create_client(Some("castoff-event-watcher"))
@@ -1109,18 +1203,30 @@ fn spawn_async_event_watcher(
                     let _operation = operation.lock().unwrap();
                     let error = libmpv2::Error::Raw(end.error);
                     match routing.lock().unwrap().resolve_error(end.playlist_entry_id) {
-                        Some(Resolution::FallBack(url)) => {
-                            fall_back_to_browser(&url, &error, &events, &idle, &webpage, &status_tx)
-                        }
-                        Some(Resolution::PlaybackError(url)) => error!(
-                            url,
-                            error = ?error,
-                            reason = describe_playback_error(&error),
-                            "mpv reported an async playback error -- playback did not start; \
-                             see the mpv log line(s) above for the underlying cause (e.g. a \
-                             ytdl_hook/yt-dlp resolution failure or an HTTP error from the \
-                             media/CDN host)"
+                        Some(Resolution::FallBack(url, rollback)) => fall_back_to_browser(
+                            &url,
+                            &error,
+                            &events,
+                            &idle,
+                            &webpage,
+                            &status_tx,
+                            &queue,
+                            state_path.as_deref(),
+                            &queue_tx,
+                            rollback,
                         ),
+                        Some(Resolution::PlaybackError(url, rollback)) => {
+                            error!(
+                                url,
+                                error = ?error,
+                                reason = describe_playback_error(&error),
+                                "mpv reported an async playback error -- playback did not start; \
+                                 see the mpv log line(s) above for the underlying cause (e.g. a \
+                                 ytdl_hook/yt-dlp resolution failure or an HTTP error from the \
+                                 media/CDN host)"
+                            );
+                            revert_queue_position(&queue, state_path.as_deref(), &queue_tx, rollback);
+                        }
                         // An error for an entry the daemon did not submit
                         // (a load a newer Play superseded, or an extra entry
                         // mpv expanded a playlist URL into): it belongs to no
@@ -1165,6 +1271,10 @@ fn fall_back_to_browser(
     idle: &IdleScreenController,
     webpage: &WebpageController,
     status_tx: &watch::Sender<PlaybackUpdateMessage>,
+    queue: &Mutex<Queue>,
+    state_path: Option<&Path>,
+    queue_tx: &watch::Sender<QueueStateMessage>,
+    queue_rollback: Option<QueueRollback>,
 ) {
     warn!(
         url,
@@ -1184,6 +1294,7 @@ fn fall_back_to_browser(
             "URL could not be played as media and could not be displayed as a web page \
              either; the screen is back to the daemon's idle clock"
         );
+        revert_queue_position(queue, state_path, queue_tx, queue_rollback);
     }
     // This path never goes through a `Player` method: a successful `show`
     // flips `webpage.is_active()` from false to true, which is the
@@ -1520,6 +1631,21 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
             if player.idle_screen() == expected {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!("timed out waiting for: {what}");
+    }
+
+    /// Poll the queue's `current_index` for up to 30s until it equals
+    /// `expected`; panics on timeout. The same generous window as
+    /// `wait_until_loading_cleared`, since the queue position only settles
+    /// once the async load failure it depends on has resolved.
+    fn wait_until_queue_position(player: &Player, expected: Option<usize>, what: &str) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline {
+            if player.queue_state().current_index == expected {
                 return;
             }
             std::thread::sleep(Duration::from_millis(50));
@@ -2518,8 +2644,8 @@ mod tests {
         // A (unrouted media, entry 1) is submitted, then B (unrouted page,
         // entry 2) supersedes it before the watcher has drained A's
         // `FileLoaded`.
-        routing.submit(MEDIA, true, Some(1));
-        routing.submit(PAGE, true, Some(2));
+        routing.submit(MEDIA, true, Some(1), None);
+        routing.submit(PAGE, true, Some(2), None);
         routing.start_file(1);
         routing.file_loaded();
 
@@ -2527,7 +2653,7 @@ mod tests {
         // probe and still reaches the browser.
         assert_eq!(
             routing.resolve_error(2),
-            Some(Resolution::FallBack(PAGE.to_string())),
+            Some(Resolution::FallBack(PAGE.to_string(), None)),
             "a stale FileLoaded must not mark the newer Play's probe as loaded"
         );
     }
@@ -2540,12 +2666,12 @@ mod tests {
         const PAGE: &str = "http://127.0.0.1:1/page";
         let mut routing = Routing::default();
 
-        routing.submit(PAGE, true, Some(3));
+        routing.submit(PAGE, true, Some(3), None);
         assert_eq!(routing.resolve_error(2), None);
 
         assert_eq!(
             routing.resolve_error(3),
-            Some(Resolution::FallBack(PAGE.to_string()))
+            Some(Resolution::FallBack(PAGE.to_string(), None))
         );
     }
 
@@ -2560,8 +2686,8 @@ mod tests {
 
         // Probe A (entry 1) is superseded by a newer probe B (entry 2)
         // before A's error is drained.
-        routing.submit(FIRST, true, Some(1));
-        routing.submit(SECOND, true, Some(2));
+        routing.submit(FIRST, true, Some(1), None);
+        routing.submit(SECOND, true, Some(2), None);
 
         // A's error matches no tracked submission (only B is tracked), so it
         // is not a playback error for B.
@@ -2570,7 +2696,7 @@ mod tests {
         // B keeps its own probe and still reaches the browser.
         assert_eq!(
             routing.resolve_error(2),
-            Some(Resolution::FallBack(SECOND.to_string())),
+            Some(Resolution::FallBack(SECOND.to_string(), None)),
             "a superseded load's error must not consume or blame the newer probe"
         );
     }
@@ -2582,12 +2708,12 @@ mod tests {
         const URL: &str = "http://127.0.0.1:1/media";
         let mut routing = Routing::default();
 
-        routing.submit(URL, true, Some(1));
+        routing.submit(URL, true, Some(1), None);
         routing.start_file(1);
         routing.file_loaded();
         assert_eq!(
             routing.resolve_error(1),
-            Some(Resolution::PlaybackError(URL.to_string()))
+            Some(Resolution::PlaybackError(URL.to_string(), None))
         );
     }
 
@@ -2600,17 +2726,17 @@ mod tests {
         const URL: &str = "http://127.0.0.1:1/media";
         let mut routing = Routing::default();
 
-        routing.submit(URL, false, Some(1));
+        routing.submit(URL, false, Some(1), None);
         assert_eq!(
             routing.resolve_error(1),
-            Some(Resolution::PlaybackError(URL.to_string()))
+            Some(Resolution::PlaybackError(URL.to_string(), None))
         );
 
-        routing.submit(URL, true, Some(2));
+        routing.submit(URL, true, Some(2), None);
         routing.cancel();
         assert_eq!(
             routing.resolve_error(2),
-            Some(Resolution::PlaybackError(URL.to_string())),
+            Some(Resolution::PlaybackError(URL.to_string(), None)),
             "a cancelled probe must not fall back, but its own event still resolves its entry"
         );
     }
@@ -2625,16 +2751,16 @@ mod tests {
         const SECOND: &str = "http://127.0.0.1:1/page";
         let mut routing = Routing::default();
 
-        routing.submit(FIRST, true, Some(1));
+        routing.submit(FIRST, true, Some(1), None);
         routing.cancel();
-        routing.submit(SECOND, true, Some(2));
+        routing.submit(SECOND, true, Some(2), None);
 
         // mpv's non-error EndFile for FIRST (entry 1) arrives after SECOND
         // (entry 2) was queued.
         routing.resolve_end(1);
         assert_eq!(
             routing.resolve_error(2),
-            Some(Resolution::FallBack(SECOND.to_string())),
+            Some(Resolution::FallBack(SECOND.to_string(), None)),
             "a stale EndFile after cancel must not consume the newer Play's probe"
         );
     }
@@ -2647,9 +2773,9 @@ mod tests {
         const SECOND: &str = "http://127.0.0.1:1/page";
         let mut routing = Routing::default();
 
-        routing.submit(FIRST, true, Some(1));
+        routing.submit(FIRST, true, Some(1), None);
         routing.cancel();
-        routing.submit(SECOND, true, Some(2));
+        routing.submit(SECOND, true, Some(2), None);
 
         // mpv's FileLoaded for FIRST (entry 1) arrives after SECOND (entry 2)
         // was queued.
@@ -2657,7 +2783,7 @@ mod tests {
         routing.file_loaded();
         assert_eq!(
             routing.resolve_error(2),
-            Some(Resolution::FallBack(SECOND.to_string())),
+            Some(Resolution::FallBack(SECOND.to_string(), None)),
             "a stale FileLoaded after cancel must not mark the newer load as loaded"
         );
     }
@@ -2679,13 +2805,13 @@ mod tests {
 
         // A: the submitted playlist (entry 1). mpv redirects it to its first
         // expanded entry, id 2.
-        routing.submit(LIST, true, Some(1));
+        routing.submit(LIST, true, Some(1), None);
         routing.start_file(1);
         routing.resolve_end(1);
 
         // B: an unrouted page (entry 3), submitted while the playlist's
         // expanded entry 2 is still playing.
-        routing.submit(PAGE, true, Some(3));
+        routing.submit(PAGE, true, Some(3), None);
 
         // mpv stops entry 2 when B's `loadfile` replaces it, then a late
         // `StartFile`/`FileLoaded` for entry 2 still arrives. None of it may
@@ -2697,7 +2823,7 @@ mod tests {
         // B's own load fails, so it must still reach the browser.
         assert_eq!(
             routing.resolve_error(3),
-            Some(Resolution::FallBack(PAGE.to_string())),
+            Some(Resolution::FallBack(PAGE.to_string(), None)),
             "a playlist entry's events must not swallow the newer Play's probe"
         );
     }
@@ -2736,7 +2862,7 @@ mod tests {
             .mpv
             .command("stop", &[])
             .expect("stop mpv while holding the operation lock");
-        play_media(&player.handles(), &unclassified_play(UNREACHABLE_URL), true)
+        play_media(&player.handles(), &unclassified_play(UNREACHABLE_URL), true, None)
             .expect("submit the page Play");
         drop(operation);
 
@@ -3091,6 +3217,46 @@ mod tests {
             &player,
             Some(IdleScreen::Clock),
             "idle clock to return after the load fails",
+        );
+    }
+
+    /// Regression test: an unreachable URL becomes the queue's current item
+    /// synchronously (`Player::play` commits the position before the load
+    /// resolves), but the failure itself only surfaces asynchronously, well
+    /// after that position was already broadcast and persisted. The queue
+    /// must not go on reporting a failed load as the current item once the
+    /// daemon settles back on the idle clock.
+    #[test]
+    fn queue_position_reverts_after_an_async_load_failure() {
+        let player = headless_player();
+        let msg = PlayMessage {
+            url: Some("https://example.invalid/does-not-exist.mp4".to_string()),
+            ..Default::default()
+        };
+        player
+            .play(&msg)
+            .expect("play is accepted; the load fails asynchronously");
+        assert_eq!(
+            player.queue_state().current_index,
+            Some(0),
+            "the failing item is provisionally current while its load is in flight"
+        );
+
+        wait_until_loading_cleared(&player, "spinner to clear after the load fails");
+        wait_until_idle_screen(
+            &player,
+            Some(IdleScreen::Clock),
+            "idle clock to return after the load fails",
+        );
+        wait_until_queue_position(
+            &player,
+            None,
+            "queue position to revert once the failed load resolves",
+        );
+        assert_eq!(
+            player.queue_state().items.len(),
+            1,
+            "the failed item stays queued, just no longer marked current"
         );
     }
 

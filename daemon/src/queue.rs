@@ -41,10 +41,10 @@ impl Queue {
         self.position = position;
     }
 
-    /// Not read by the daemon itself outside of tests (`to_state_message`'s
-    /// `current_index` is what callers actually want); exists so tests can
-    /// assert on the position directly.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// The queue's current position, if any (`to_state_message`'s
+    /// `current_index` is the wire-shape equivalent). `player.rs` reads this
+    /// to capture a rollback point before moving the position, so a load
+    /// that fails before ever playing can be reverted to it.
     pub fn position(&self) -> Option<usize> {
         self.position
     }
