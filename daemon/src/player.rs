@@ -332,7 +332,11 @@ impl Player {
     /// the tests that do care.
     #[cfg(test)]
     fn with_browser(mpv: Arc<Mpv>, program: &str) -> Result<Self> {
-        Self::build(mpv, Arc::new(WebpageController::with_program(program)), None)
+        Self::build(
+            mpv,
+            Arc::new(WebpageController::with_program(program)),
+            None,
+        )
     }
 
     /// `with_browser`, but with queue persistence pointed at `state_path` --
@@ -562,7 +566,12 @@ impl Player {
         let rollback = index.map(|index| QueueRollback { index, previous });
         let result = execute_play(&self.handles(), &item, rollback);
         if result.is_err() {
-            revert_queue_position(&self.queue, self.state_path.as_deref(), &self.queue_tx, rollback);
+            revert_queue_position(
+                &self.queue,
+                self.state_path.as_deref(),
+                &self.queue_tx,
+                rollback,
+            );
         }
         if result.is_ok() {
             self.publish_status();
@@ -643,7 +652,12 @@ impl Player {
             Ok(())
         };
         if result.is_err() {
-            revert_queue_position(&self.queue, self.state_path.as_deref(), &self.queue_tx, rollback);
+            revert_queue_position(
+                &self.queue,
+                self.state_path.as_deref(),
+                &self.queue_tx,
+                rollback,
+            );
         }
         // Publish on every path (media or web page, played now or only
         // queued). A media load may still report `Idle` at this instant --
@@ -792,7 +806,11 @@ fn validate_play_message(msg: &PlayMessage) -> Result<()> {
 /// replay an already-queued item (`Player::play_jumped_item`,
 /// `auto_advance_queue`) -- a free function (not a `Player` method) because
 /// the latter runs before a `Player` exists (see `Handles`).
-fn execute_play(h: &Handles, msg: &PlayMessage, queue_rollback: Option<QueueRollback>) -> Result<()> {
+fn execute_play(
+    h: &Handles,
+    msg: &PlayMessage,
+    queue_rollback: Option<QueueRollback>,
+) -> Result<()> {
     match msg.explicit_target() {
         // The sender said what this is: honour it, with no fallback.
         Some(PlayTarget::Webpage) => {
@@ -1225,7 +1243,12 @@ fn spawn_async_event_watcher(
                                  ytdl_hook/yt-dlp resolution failure or an HTTP error from the \
                                  media/CDN host)"
                             );
-                            revert_queue_position(&queue, state_path.as_deref(), &queue_tx, rollback);
+                            revert_queue_position(
+                                &queue,
+                                state_path.as_deref(),
+                                &queue_tx,
+                                rollback,
+                            );
                         }
                         // An error for an entry the daemon did not submit
                         // (a load a newer Play superseded, or an extra entry
@@ -2862,8 +2885,13 @@ mod tests {
             .mpv
             .command("stop", &[])
             .expect("stop mpv while holding the operation lock");
-        play_media(&player.handles(), &unclassified_play(UNREACHABLE_URL), true, None)
-            .expect("submit the page Play");
+        play_media(
+            &player.handles(),
+            &unclassified_play(UNREACHABLE_URL),
+            true,
+            None,
+        )
+        .expect("submit the page Play");
         drop(operation);
 
         let invocation = wait_for_stub_log(&dir);
@@ -3394,7 +3422,9 @@ mod tests {
             url: Some("av://lavfi:testsrc=size=64x64:rate=10:duration=1".to_string()),
             ..Default::default()
         };
-        player.play(&second).expect("second play must be accepted (enqueued)");
+        player
+            .play(&second)
+            .expect("second play must be accepted (enqueued)");
 
         // mpv must still be on the first clip: the second Play only queued.
         let path: String = player.mpv.get_property("path").unwrap_or_default();

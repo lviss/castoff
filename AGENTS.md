@@ -241,7 +241,14 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   `dispatch`'s own handler separately replies with `send_queue_state` -- a test that reads exactly
   one `QueueState` frame per jump command risks consuming a leftover frame from the *previous* jump
   instead of the current one's (see `main.rs`'s `read_queue_state_until`, which loops until the
-  frame it wants shows up, rather than trusting a 1:1 command/frame correspondence).
+  frame it wants shows up, rather than trusting a 1:1 command/frame correspondence). `Player::play`,
+  `play_jumped_item` and `auto_advance_queue` all commit the queue's new position and broadcast it
+  *before* the load is confirmed, since a load failure can surface well after that call returns
+  (see the async-error notes above); each carries a `QueueRollback` (the position and what to
+  restore it to) through to wherever that load's outcome is actually resolved -- synchronously in
+  the same function, or later in `spawn_async_event_watcher`/`fall_back_to_browser` -- so
+  `revert_queue_position` can put the position back if it still points at the failed load and
+  nothing else has moved it since (`player.rs`'s `queue_position_reverts_after_an_async_load_failure`).
 
 - Chromium's process-singleton socket is created under the engine's **`TMPDIR`**
   (`<TMPDIR>/org.chromium.Chromium.<random>/SingletonSocket`), *not* under `--user-data-dir`:

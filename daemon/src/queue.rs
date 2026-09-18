@@ -199,9 +199,15 @@ mod tests {
         queue.push(item("c"));
         queue.set_position(Some(0));
 
-        assert_eq!(queue.jump_forward().and_then(|i| i.url.clone()), Some("b".to_string()));
+        assert_eq!(
+            queue.jump_forward().and_then(|i| i.url.clone()),
+            Some("b".to_string())
+        );
         assert_eq!(queue.position(), Some(1));
-        assert_eq!(queue.jump_forward().and_then(|i| i.url.clone()), Some("c".to_string()));
+        assert_eq!(
+            queue.jump_forward().and_then(|i| i.url.clone()),
+            Some("c".to_string())
+        );
         assert_eq!(queue.position(), Some(2));
         assert!(queue.jump_forward().is_none(), "no item after the last one");
         assert_eq!(
@@ -210,9 +216,18 @@ mod tests {
             "position must not move past the end"
         );
 
-        assert_eq!(queue.jump_backward().and_then(|i| i.url.clone()), Some("b".to_string()));
-        assert_eq!(queue.jump_backward().and_then(|i| i.url.clone()), Some("a".to_string()));
-        assert!(queue.jump_backward().is_none(), "no item before the first one");
+        assert_eq!(
+            queue.jump_backward().and_then(|i| i.url.clone()),
+            Some("b".to_string())
+        );
+        assert_eq!(
+            queue.jump_backward().and_then(|i| i.url.clone()),
+            Some("a".to_string())
+        );
+        assert!(
+            queue.jump_backward().is_none(),
+            "no item before the first one"
+        );
         assert_eq!(
             queue.position(),
             Some(0),
@@ -235,8 +250,7 @@ mod tests {
 
     #[test]
     fn persisted_queue_round_trips_through_a_file() {
-        let dir =
-            std::env::temp_dir().join(format!("castoff-queue-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("castoff-queue-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let path = dir.join("queue.json");
 

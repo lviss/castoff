@@ -138,6 +138,11 @@ other message. See [`daemon/src/fcast.rs`](daemon/src/fcast.rs) for the exact `Q
   `QueueState` is both that reply and, unprompted, pushed to every connected sender whenever the
   queue changes (an add, an auto-advance, or a jump) -- the same push-on-change model
   `PlaybackUpdate` already uses, and, like it, purely event-driven with no polling timer.
+- **A failed item does not stick as "current."** Becoming the queue's current item happens as soon
+  as a `Play`/jump/auto-advance is accepted, before the load is known to have succeeded. If that
+  item's load then fails (including an async failure discovered only after the daemon has already
+  moved on to showing the idle clock), the daemon reverts the queue's position to whatever it was
+  before -- the failed item stays in the queue, just no longer marked current.
 
 ### How YouTube playback works
 
