@@ -86,6 +86,17 @@ struct Handles<'a> {
     routing: &'a Mutex<Routing>,
 }
 
+/// The play queue state `spawn_async_event_watcher`'s background thread needs
+/// for the run's lifetime, bundled into one parameter (owned, since the
+/// thread's closure must move them in) rather than three -- the same reason
+/// `Handles` exists. `QueueContext` is the borrowed shape built from these for
+/// a single resolution (`fall_back_to_browser`).
+struct QueueHandles {
+    queue: Arc<Mutex<Queue>>,
+    state_path: Option<PathBuf>,
+    queue_tx: watch::Sender<QueueStateMessage>,
+}
+
 /// One `loadfile` submitted to mpv, tracked by the playlist entry mpv created
 /// for it so `spawn_async_event_watcher` can attribute mpv's
 /// `FileLoaded`/`EndFile` events to the submission they belong to instead of
@@ -124,6 +135,17 @@ struct QueueRollback {
     index: usize,
     /// The position to restore if the load never plays.
     previous: Option<usize>,
+}
+
+/// The queue handles plus the specific rollback for the load being resolved
+/// right now -- bundles what `fall_back_to_browser` needs about the queue
+/// into one parameter, borrowed from a `QueueHandles` for the duration of one
+/// resolution.
+struct QueueContext<'a> {
+    queue: &'a Mutex<Queue>,
+    state_path: Option<&'a Path>,
+    queue_tx: &'a watch::Sender<QueueStateMessage>,
+    rollback: Option<QueueRollback>,
 }
 
 /// What the watcher should do with an mpv error that ended the submitted
@@ -423,9 +445,11 @@ impl Player {
             Arc::clone(&routing),
             Arc::clone(&operation),
             status_tx.clone(),
-            Arc::clone(&queue),
-            state_path.clone(),
-            queue_tx.clone(),
+            QueueHandles {
+                queue: Arc::clone(&queue),
+                state_path: state_path.clone(),
+                queue_tx: queue_tx.clone(),
+            },
         )?;
         spawn_lifecycle_watcher(
             Arc::clone(&mpv),
@@ -1163,9 +1187,7 @@ fn spawn_async_event_watcher(
     routing: Arc<Mutex<Routing>>,
     operation: Arc<Mutex<()>>,
     status_tx: watch::Sender<PlaybackUpdateMessage>,
-    queue: Arc<Mutex<Queue>>,
-    state_path: Option<PathBuf>,
-    queue_tx: watch::Sender<QueueStateMessage>,
+    queue: QueueHandles,
 ) -> Result<()> {
     let events = mpv
         .create_client(Some("castoff-event-watcher"))
@@ -1228,10 +1250,12 @@ fn spawn_async_event_watcher(
                             &idle,
                             &webpage,
                             &status_tx,
-                            &queue,
-                            state_path.as_deref(),
-                            &queue_tx,
-                            rollback,
+                            QueueContext {
+                                queue: &queue.queue,
+                                state_path: queue.state_path.as_deref(),
+                                queue_tx: &queue.queue_tx,
+                                rollback,
+                            },
                         ),
                         Some(Resolution::PlaybackError(url, rollback)) => {
                             error!(
@@ -1244,9 +1268,9 @@ fn spawn_async_event_watcher(
                                  media/CDN host)"
                             );
                             revert_queue_position(
-                                &queue,
-                                state_path.as_deref(),
-                                &queue_tx,
+                                &queue.queue,
+                                queue.state_path.as_deref(),
+                                &queue.queue_tx,
                                 rollback,
                             );
                         }
@@ -1294,10 +1318,7 @@ fn fall_back_to_browser(
     idle: &IdleScreenController,
     webpage: &WebpageController,
     status_tx: &watch::Sender<PlaybackUpdateMessage>,
-    queue: &Mutex<Queue>,
-    state_path: Option<&Path>,
-    queue_tx: &watch::Sender<QueueStateMessage>,
-    queue_rollback: Option<QueueRollback>,
+    queue: QueueContext,
 ) {
     warn!(
         url,
@@ -1317,7 +1338,12 @@ fn fall_back_to_browser(
             "URL could not be played as media and could not be displayed as a web page \
              either; the screen is back to the daemon's idle clock"
         );
-        revert_queue_position(queue, state_path, queue_tx, queue_rollback);
+        revert_queue_position(
+            queue.queue,
+            queue.state_path,
+            queue.queue_tx,
+            queue.rollback,
+        );
     }
     // This path never goes through a `Player` method: a successful `show`
     // flips `webpage.is_active()` from false to true, which is the
