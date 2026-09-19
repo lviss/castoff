@@ -1,4 +1,4 @@
-{ lib, config, nixos-raspberrypi, ... }:
+{ config, nixos-raspberrypi, ... }:
 
 # The Raspberry Pi 4 half of the appliance config: real hardware modules
 # from `nixos-raspberrypi` (github:nvmd/nixos-raspberrypi) layered under
