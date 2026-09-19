@@ -19,12 +19,27 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   plain-`curl` fetch (no User-Agent) with no pattern tied to a specific crate; if a build fails
   with `curl: (22) ... 403` on a `crate-*.tar.gz.drv`, just retry the same `nix build` — it
   resumes from whatever already fetched successfully and has always succeeded within a few
-  retries. This is a `crates.io`-side bot-mitigation quirk, not a broken lockfile. The unit-test
-  binary (`--release`) was once seen to die with a bare `SIGSEGV`; that turned out to be a real,
-  reproducible defect, not sandbox flakiness -- see `daemon/.cargo/config.toml` and
-  `player.rs`'s `headless_mpv` doc comment for the two concurrency hazards found and fixed (a
-  fontconfig race and real mpv/ffmpeg cores alive concurrently). A `SIGSEGV` in this binary again
-  should be root-caused, not retried past.
+  retries. This is a `crates.io`-side bot-mitigation quirk, not a broken lockfile.
+- The unit-test binary (`--release`) has repeatedly been seen to die with a bare `SIGSEGV`; every
+  occurrence investigated so far turned out to be a real, reproducible defect, not sandbox
+  flakiness to retry past -- see `daemon/.cargo/config.toml` and `player.rs`'s `headless_mpv` doc
+  comment for the four concurrency hazards found and fixed so far (a fontconfig race; real
+  mpv/ffmpeg cores alive concurrently; a test-only background thread -- `spawn_metadata_lookup` --
+  left unjoined and racing a later test's real mpv core; and background watcher threads that never
+  observed mpv's `Event::Shutdown`, so a test's real mpv core and its threads leaked for the rest
+  of the process instead of being torn down -- fixed by a test-only `Player::Drop` that sends
+  mpv's `quit` command and joins those watcher threads). **None of these four fixes eliminates the
+  crash on its own** -- measured (2026-09-19) at roughly 12-20% of runs on plain `cargo test
+  --release` outside the sandbox, but a much higher ~40-57% inside the actual `nix build`
+  sandboxed `checkPhase`, both before and after all four fixes; the sandbox-specific amplification
+  is itself unexplained and is open follow-up work, not resolved. Do not treat a future SIGSEGV
+  here as already-explained by this history -- root-cause it, and expect it to reproduce more
+  reliably by running several `nix build --rebuild` attempts (or `nix develop -c cargo test
+  --release` in a loop, faster to iterate) than by trusting a single run either way. Note also that
+  this repo's CI (`.github/workflows/ci.yml`) retries its whole `nix flake check` step up to 5
+  times on *any* failure (originally to ride out the `crates.io` 403 above), so an intermittent
+  SIGSEGV at even a moderate per-run rate can pass CI by sheer retry odds while still failing a
+  plain local `nix build`; a CI-green PR is not proof a flaky crash like this is absent.
 - `nix build`/`nix flake check` see only *git-tracked* files (via the flake's `self` source
   filter) — a new source file left untracked compiles fine under a plain `cargo build` in
   `nix develop` but fails the flake build with a "file not found for module" error. `git add` new

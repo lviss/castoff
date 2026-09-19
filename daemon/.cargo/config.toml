@@ -8,5 +8,11 @@
 # and confirmed fixed (0 failures across repeated runs) by capping test
 # concurrency to 1. This is a real concurrency limit of the mpv/ffmpeg stack
 # in this environment, not a flaky test to retry around -- see AGENTS.md.
+# NOTE: this setting only serializes the test harness's own worker threads --
+# it does not join or wait on any *other* background thread a test's own code
+# spawns (e.g. `player.rs`'s `spawn_metadata_lookup`, before it gained a
+# test-only synchronous path). A leftover thread like that racing the next
+# test's real mpv-core creation reproduced this same bare SIGSEGV; see
+# `headless_mpv`'s doc comment for that third confirmed hazard.
 [env]
 RUST_TEST_THREADS = "1"
