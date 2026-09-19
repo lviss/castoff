@@ -406,6 +406,39 @@ This file is the project's committed home for project-intrinsic agent knowledge:
     acquiring it, not just before -- the same "operation lock serializes whole play/stop
     operations" discipline `player.rs` already documents, extended to this timer so a real
     `Play`/`Stop` racing the rotation can never be clobbered by a stale wallpaper swap.
+- `nixosConfigurations.tv-box-rpi4` / `packages.aarch64-linux.tv-box-rpi4-image` build a flashable
+  Raspberry Pi 4 SD image via [`nixos-raspberrypi`](https://github.com/nvmd/nixos-raspberrypi)
+  (github:nvmd/nixos-raspberrypi), a separate flake input from this project's main `nixpkgs` pin --
+  its hardware modules are validated against its own pinned nixpkgs, so it is deliberately not
+  `nixpkgs.follows`-ed. Its `lib.nixosInstaller` (not the plainer `nixosSystem`/`nixosSystemFull`)
+  is what makes the result both flashable installer media *and* a ready-to-boot system in one
+  image -- it layers that flake's own `sd-image`/`raspberrypi-installer` modules on top, whose
+  partition table auto-expands to fill the SD card on first boot, so no separate
+  `nixos-anywhere`/`disko` install step is needed for this use case (nixos-raspberrypi also
+  supports that combination separately, for installing onto other target disks -- not what this
+  project uses). `nixosInstaller` (like its siblings) automatically injects `nixos-raspberrypi`
+  itself into every module's `specialArgs`, so `nix/tv-box-rpi4.nix` can just reference it without
+  `flake.nix` wiring that by hand. `config.system.build.sdImage`'s output is the compressed image
+  file itself (`<name>.img.zst`), not a directory -- `nix build`'s `./result` symlink points
+  straight at it, decompress with `zstd -d` before `dd`.
+  `nix/tv-box.nix` (the shared kiosk config: Cage/`kiosk` user, the daemon service, audio,
+  firewall, avahi, power trimming) is target-independent; `nix/tv-box-x86_64.nix` and
+  `nix/tv-box-rpi4.nix` are the two per-target hardware/filesystem/bootloader layers on top of it
+  (generic x86_64 placeholders for `tv-box`/`tv-box-vm`, real Pi 4 hardware modules for
+  `tv-box-rpi4`), assembled per-target in `flake.nix`.
+  This sandbox has no `aarch64-linux` builder and no `aarch64-linux` QEMU user-mode emulation
+  configured (no `boot.binfmt.emulatedSystems`, nothing under `/proc/sys/fs/binfmt_misc`) -- a
+  direct, non-dry-run `nix build` of any `aarch64-linux` output fails with a genuine `error:
+  Cannot build ... Reason: platform mismatch, Required system: 'aarch64-linux', Current system:
+  'x86_64-linux'`. `nix flake check --all-systems` and `nix build --dry-run` still fully evaluate
+  every `aarch64-linux` output (including `nixosConfigurations.tv-box-rpi4`, which `nix flake
+  check` evaluates even without `--all-systems`, since NixOS-configuration evaluation isn't
+  system-gated the way `packages`/`checks` realization is) and resolve the whole build closure with
+  no errors -- `nix flake check --all-systems` reports "all checks passed!" for `aarch64-linux`
+  outputs on this basis alone, without ever realizing them (confirmed via `nix path-info` on the
+  resulting store path: not valid, i.e. never built). That distinction matters for honestly
+  reporting what was and wasn't actually verified here; a real Raspberry Pi 4 build/boot/playback
+  test needs real hardware or a genuine `aarch64-linux` builder.
 
 ## Maintaining this file
 

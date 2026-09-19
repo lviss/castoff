@@ -14,6 +14,15 @@
 # services stripped out) but using nixpkgs' own `services.cage` module
 # instead of hand-rolled `systemd.services."cage@"` units, since that
 # module has since landed upstream.
+#
+# This module is the *target-independent* half of the appliance config --
+# everything that doesn't care what's underneath it (Cage/kiosk setup, the
+# castoff-daemon service, audio, firewall, avahi, power trimming). Each
+# concrete target layers its own hardware/filesystem/bootloader glue on top
+# of this: `nix/tv-box-x86_64.nix` for the generic x86_64-linux placeholders
+# (VM + installable-to-any-"nixos"-labeled-disk), `nix/tv-box-rpi4.nix` for
+# the Raspberry Pi 4 hardware modules from `nixos-raspberrypi`. See
+# `flake.nix` for how each target's module list is assembled.
 {
   imports = [ ];
 
@@ -79,18 +88,6 @@
 
   time.timeZone = lib.mkDefault "UTC";
   system.stateVersion = lib.mkDefault "24.11";
-
-  # Generic x86_64-linux placeholders so this configuration is bootable and
-  # `nix build`-able on its own (`nix flake check`, `nixos-rebuild build-vm`,
-  # or installing to any disk labeled "nixos"). Flashing a real appliance
-  # image to specific hardware -- disko partitioning, nixos-generators, etc.
-  # -- is follow-up work; see README roadmap.
-  fileSystems."/" = lib.mkDefault {
-    device = "/dev/disk/by-label/nixos";
-    fsType = "ext4";
-  };
-  boot.loader.systemd-boot.enable = lib.mkDefault true;
-  boot.loader.efi.canTouchEfiVariables = lib.mkDefault true;
 
   # Everything below is the *VM-only* half of this module. NixOS's own
   # `virtualisation.vmVariant` (nixos/modules/virtualisation/build-vm.nix) is
