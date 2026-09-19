@@ -19,11 +19,12 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   plain-`curl` fetch (no User-Agent) with no pattern tied to a specific crate; if a build fails
   with `curl: (22) ... 403` on a `crate-*.tar.gz.drv`, just retry the same `nix build` — it
   resumes from whatever already fetched successfully and has always succeeded within a few
-  retries. This is a `crates.io`-side bot-mitigation quirk, not a broken lockfile. The sandboxed
-  `checkPhase`'s unit-test binary itself (`--release`) has also been seen to die with a bare
-  `SIGSEGV` once, with no repeat across an immediate retry of the same `nix flake check` or several
-  direct `cargo test --release` runs outside the sandbox -- treat a lone `SIGSEGV` there as sandbox
-  flakiness to retry too, and only escalate if it reproduces.
+  retries. This is a `crates.io`-side bot-mitigation quirk, not a broken lockfile. The unit-test
+  binary (`--release`) was once seen to die with a bare `SIGSEGV`; that turned out to be a real,
+  reproducible defect, not sandbox flakiness -- see `daemon/.cargo/config.toml` and
+  `player.rs`'s `headless_mpv` doc comment for the two concurrency hazards found and fixed (a
+  fontconfig race and real mpv/ffmpeg cores alive concurrently). A `SIGSEGV` in this binary again
+  should be root-caused, not retried past.
 - `nix build`/`nix flake check` see only *git-tracked* files (via the flake's `self` source
   filter) — a new source file left untracked compiles fine under a plain `cargo build` in
   `nix develop` but fails the flake build with a "file not found for module" error. `git add` new

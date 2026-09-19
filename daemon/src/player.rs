@@ -1484,6 +1484,28 @@ pub(crate) fn now_millis() -> u64 {
 /// the double-play regression test). `pub(crate)`, not private to this
 /// module's own `tests` submodule, so `main.rs`'s tests can build a real
 /// headless `Player` too rather than needing a second mock.
+///
+/// Two concurrency hazards showed up as this suite grew to two dozen-plus
+/// tests that each spin up one of these real cores: (1) libass's default
+/// `auto` OSD font provider (used by the idle clock/spinner overlays,
+/// `overlay.rs`) queries fontconfig, whose on-demand cache build is not safe
+/// against many threads racing its first initialization at once -- in a
+/// sandbox with no writable font cache directory (`nix build`'s checkPhase:
+/// `HOME=/homeless-shelter`, no `/var/cache/fontconfig`) that reliably
+/// crashed the whole test binary with a bare SIGSEGV inside fontconfig; (2)
+/// even past that, many real mpv cores genuinely *alive* at once (not just
+/// being created at once) still crashed the binary with an unrelated bare
+/// SIGSEGV inside libmpv/ffmpeg, reproduced under both `nix build`'s sandbox
+/// and plain `cargo test --release` outside it. `osd-font-provider=none`
+/// below removes the fontconfig dependency entirely (tests never assert on
+/// rendered glyphs -- no display to capture pixels from either, per
+/// `AGENTS.md` -- only on overlay command success and state transitions, so
+/// embedded/built-in fonts are sufficient); `.cargo/config.toml`'s
+/// `RUST_TEST_THREADS=1` addresses the second hazard by never letting two of
+/// these real cores be alive concurrently in the first place, which was
+/// confirmed to make the whole suite pass reliably. Production
+/// (`Player::new`) keeps the default `auto` font provider so the appliance
+/// still renders with a real matched system font.
 #[cfg(test)]
 pub(crate) fn headless_mpv() -> Arc<Mpv> {
     Arc::new(
@@ -1492,6 +1514,7 @@ pub(crate) fn headless_mpv() -> Arc<Mpv> {
             init.set_property("ao", "null")?;
             init.set_property("idle", "yes")?;
             init.set_property("keep-open", "yes")?;
+            init.set_property("osd-font-provider", "none")?;
             Ok(())
         })
         .expect("failed to initialize headless mpv for test"),
