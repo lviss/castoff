@@ -255,17 +255,20 @@ impl IdleScreenController {
     /// only ever loads a single file at a time -- and brings the idle
     /// screen back without needing an incoming FCast command to trigger it.
     /// Blocks on mpv's own event queue rather than polling, so it costs
-    /// nothing while playback is ongoing.
-    pub(crate) fn spawn_eof_watcher(self: &Arc<Self>) {
+    /// nothing while playback is ongoing. Returns the thread's `JoinHandle`
+    /// so a test-only teardown can join it (see `player.rs`'s `Player`
+    /// `Drop` impl); production never joins it; the thread runs for the
+    /// daemon's lifetime and exits on `Event::Shutdown` at process exit.
+    pub(crate) fn spawn_eof_watcher(self: &Arc<Self>) -> Option<std::thread::JoinHandle<()>> {
         let this = Arc::clone(self);
         if this
             .mpv
             .observe_property("eof-reached", Format::Flag, EOF_WATCH_ID)
             .is_err()
         {
-            return;
+            return None;
         }
-        std::thread::spawn(move || loop {
+        Some(std::thread::spawn(move || loop {
             // A negative timeout blocks until the next real event, but mpv's
             // own wakeup mechanism can also return `None` (its "no event"
             // sentinel) as a spurious wakeup with nothing queued -- looping
@@ -285,6 +288,6 @@ impl IdleScreenController {
                 Some(Ok(Event::Shutdown)) => return,
                 _ => {}
             }
-        });
+        }))
     }
 }

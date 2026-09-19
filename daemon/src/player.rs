@@ -77,6 +77,24 @@ pub struct Player {
     /// (see `with_browser_and_ytdlp`) without a process-wide env var racing
     /// against other tests.
     ytdlp_program: String,
+    /// Test-only (see `with_browser_and_ytdlp`): forces `spawn_metadata_lookup`
+    /// to run synchronously instead of on a background thread, so a
+    /// metadata-lookup test never leaves a real, untracked thread alive past
+    /// its own return -- see `spawn_metadata_lookup`'s doc comment and
+    /// `headless_mpv`'s.
+    metadata_lookup_inline: bool,
+    /// The three background watcher threads' handles (the idle screen's eof
+    /// watcher, `spawn_async_event_watcher`'s and
+    /// `spawn_lifecycle_watcher`'s). Joined by `Player`'s test-only `Drop`
+    /// impl; production never reads this (the daemon holds one `Player` for
+    /// its whole process lifetime, so these threads simply run until
+    /// process exit). Each watcher holds either the shared `mpv` handle or
+    /// its own `create_client`-derived one and only returns on
+    /// `Event::Shutdown`, so without joining them a test's real mpv core is
+    /// never actually torn down -- see `headless_mpv`'s doc comment's
+    /// second hazard.
+    #[cfg_attr(not(test), allow(dead_code))]
+    watcher_threads: Vec<std::thread::JoinHandle<()>>,
 }
 
 /// The handles play/queue operations need, grouped so the free functions
@@ -352,6 +370,7 @@ impl Player {
             Arc::new(WebpageController::from_env()),
             state_path,
             crate::metadata::ytdlp_program(),
+            false,
         )
     }
 
@@ -370,6 +389,7 @@ impl Player {
             Arc::new(WebpageController::with_program(program)),
             None,
             crate::metadata::ytdlp_program(),
+            false,
         )
     }
 
@@ -382,12 +402,16 @@ impl Player {
             Arc::new(WebpageController::with_program(program)),
             Some(state_path),
             crate::metadata::ytdlp_program(),
+            false,
         )
     }
 
     /// `with_browser`, but with `yt-dlp` also pointed at a caller-supplied
     /// stub -- for tests exercising `spawn_metadata_lookup` without a real
-    /// `yt-dlp`/network round-trip.
+    /// `yt-dlp`/network round-trip. Runs the lookup inline (see
+    /// `spawn_metadata_lookup`'s doc comment) rather than on a background
+    /// thread, so these tests never leave one racing a later test's real
+    /// headless mpv core.
     #[cfg(test)]
     fn with_browser_and_ytdlp(
         mpv: Arc<Mpv>,
@@ -399,6 +423,7 @@ impl Player {
             Arc::new(WebpageController::with_program(browser_program)),
             None,
             ytdlp_program.to_string(),
+            true,
         )
     }
 
@@ -407,6 +432,7 @@ impl Player {
         webpage: Arc<WebpageController>,
         state_path: Option<PathBuf>,
         ytdlp_program: String,
+        metadata_lookup_inline: bool,
     ) -> Result<Self> {
         let (status_tx, _status_rx) = watch::channel(snapshot_status(&mpv, &webpage));
         let queue = Arc::new(Mutex::new(Queue::load(state_path.as_deref())));
@@ -468,8 +494,8 @@ impl Player {
             Some(on_change),
             Some(on_eof),
         ));
-        idle.spawn_eof_watcher();
-        spawn_async_event_watcher(
+        let eof_watcher = idle.spawn_eof_watcher();
+        let async_watcher = spawn_async_event_watcher(
             &mpv,
             Arc::clone(&idle),
             Arc::clone(&webpage),
@@ -482,13 +508,17 @@ impl Player {
                 queue_tx: queue_tx.clone(),
             },
         )?;
-        spawn_lifecycle_watcher(
+        let lifecycle_watcher = spawn_lifecycle_watcher(
             Arc::clone(&mpv),
             Arc::clone(&idle),
             Arc::clone(&overlay),
             Arc::clone(&webpage),
             status_tx.clone(),
         )?;
+        let watcher_threads = eof_watcher
+            .into_iter()
+            .chain([async_watcher, lifecycle_watcher])
+            .collect();
         Ok(Self {
             mpv,
             idle,
@@ -501,6 +531,8 @@ impl Player {
             status_tx,
             queue_tx,
             ytdlp_program,
+            metadata_lookup_inline,
+            watcher_threads,
         })
     }
 
@@ -709,6 +741,7 @@ impl Player {
             &self.queue,
             self.state_path.as_deref(),
             &self.queue_tx,
+            self.metadata_lookup_inline,
         );
 
         let result = if should_play_now {
@@ -836,6 +869,33 @@ impl Player {
     pub fn volume(&self) -> f64 {
         let v: f64 = self.mpv.get_property("volume").unwrap_or(0.0);
         v / 100.0
+    }
+}
+
+/// Test-only: without this, a test's real headless mpv core (see
+/// `headless_mpv`) and its background watcher threads outlive the test --
+/// each watcher holds either the shared `mpv` handle or its own
+/// `create_client`-derived one and blocks in `wait_event` until
+/// `Event::Shutdown`, which nothing ever triggers on its own. Across a whole
+/// `cargo test` run that leaves dozens of real, fully-alive mpv/ffmpeg cores
+/// accumulating for the rest of the process (not just momentarily, at
+/// creation) -- the actual mechanism behind the "several dozen real headless
+/// mpv cores" hazard `headless_mpv`'s doc comment describes, which
+/// `RUST_TEST_THREADS=1` alone does not prevent: it only serializes
+/// concurrent *creation*, not this indefinite accumulation. Sending mpv's
+/// `quit` command triggers a real core shutdown, which broadcasts
+/// `Event::Shutdown` to every handle bound to it (the main one and every
+/// `create_client` one), waking each blocked watcher; joining them then
+/// guarantees the core is actually gone -- not just asked to go -- before
+/// the next test's `headless_mpv()` runs. Production never drops its one
+/// `Player` before process exit, so this never runs there.
+#[cfg(test)]
+impl Drop for Player {
+    fn drop(&mut self) {
+        let _ = self.mpv.command("quit", &[]);
+        for handle in self.watcher_threads.drain(..) {
+            let _ = handle.join();
+        }
     }
 }
 
@@ -1143,20 +1203,48 @@ fn revert_queue_position(
     let _ = queue_tx.send_replace(queue.to_state_message());
 }
 
-/// Looks up `msg`'s title/length in the background (`metadata::fetch_metadata`)
-/// and, once resolved, records it on the queue entry at `index` and
-/// republishes -- the same push-on-change model every other queue mutation
-/// uses (see `QueueStateMessage`'s doc comment). Scoped to URLs the daemon
+/// Looks up `msg`'s title/length (`metadata::fetch_metadata`) and, once
+/// resolved, records it on the queue entry at `index` and republishes -- the
+/// same push-on-change model every other queue mutation uses (see
+/// `QueueStateMessage`'s doc comment). A lookup that fails (bad URL,
+/// `yt-dlp` erroring) just leaves the fields absent rather than touching the
+/// queue entry at all. `index` stays valid even if the item is never
+/// actually played (e.g. its own load later fails and
+/// `revert_queue_position` moves `position` back): items are never removed
+/// from the queue, only reordered by position, so the entry the lookup was
+/// resolving for is always still there to update.
+fn run_metadata_lookup(
+    url: &str,
+    index: usize,
+    ytdlp_program: &str,
+    queue: &Arc<Mutex<Queue>>,
+    state_path: Option<&Path>,
+    queue_tx: &watch::Sender<QueueStateMessage>,
+) {
+    let Some(metadata) = crate::metadata::fetch_metadata(ytdlp_program, url) else {
+        return;
+    };
+    let mut queue = queue.lock().unwrap();
+    queue.set_metadata(index, metadata.title, metadata.duration_secs);
+    queue.save(state_path);
+    let _ = queue_tx.send_replace(queue.to_state_message());
+}
+
+/// Kicks off [`run_metadata_lookup`] for `msg`, scoped to URLs the daemon
 /// recognizes as YouTube (`metadata::is_youtube_url`) so a Jellyfin or
 /// local-file queue entry never shells out to `yt-dlp`; called
-/// unconditionally from `Player::play` otherwise, since queuing a video
-/// itself must never wait on this -- it runs on its own thread, and a
-/// lookup that fails (bad URL, `yt-dlp` erroring) just leaves the fields
-/// absent rather than touching the queue entry at all. `index` stays valid
-/// even if the item is never actually played (e.g. its own load later fails
-/// and `revert_queue_position` moves `position` back): items are never
-/// removed from the queue, only reordered by position, so the entry the
-/// lookup was resolving for is always still there to update.
+/// unconditionally from `Player::play` otherwise. In production
+/// (`inline: false`) it runs on its own thread, since queuing a video itself
+/// must never wait on this. Tests that need to exercise this path
+/// (`with_browser_and_ytdlp`) pass `inline: true` instead, running it
+/// synchronously on the calling thread: those tests shell out to a stub
+/// `yt-dlp`, and a real, untracked background thread doing that fork/exec
+/// can still be alive -- mid-teardown, unjoined -- when a *later* test spins
+/// up its own real headless mpv core, which is the same class of hazard
+/// `headless_mpv`'s doc comment already documents (a third confirmed
+/// instance, via this newly-introduced concurrency source rather than the
+/// first two). Running the lookup inline for tests removes that thread
+/// entirely rather than racing to join it.
 fn spawn_metadata_lookup(
     msg: &PlayMessage,
     index: usize,
@@ -1164,9 +1252,14 @@ fn spawn_metadata_lookup(
     queue: &Arc<Mutex<Queue>>,
     state_path: Option<&Path>,
     queue_tx: &watch::Sender<QueueStateMessage>,
+    inline: bool,
 ) {
     let Some(url) = msg.url.clone() else { return };
     if !crate::metadata::is_youtube_url(&url) {
+        return;
+    }
+    if inline {
+        run_metadata_lookup(&url, index, ytdlp_program, queue, state_path, queue_tx);
         return;
     }
     let program = ytdlp_program.to_string();
@@ -1174,13 +1267,7 @@ fn spawn_metadata_lookup(
     let state_path = state_path.map(Path::to_path_buf);
     let queue_tx = queue_tx.clone();
     std::thread::spawn(move || {
-        let Some(metadata) = crate::metadata::fetch_metadata(&program, &url) else {
-            return;
-        };
-        let mut queue = queue.lock().unwrap();
-        queue.set_metadata(index, metadata.title, metadata.duration_secs);
-        queue.save(state_path.as_deref());
-        let _ = queue_tx.send_replace(queue.to_state_message());
+        run_metadata_lookup(&url, index, &program, &queue, state_path.as_deref(), &queue_tx);
     });
 }
 
@@ -1270,7 +1357,7 @@ fn spawn_async_event_watcher(
     operation: Arc<Mutex<()>>,
     status_tx: watch::Sender<PlaybackUpdateMessage>,
     queue: QueueHandles,
-) -> Result<()> {
+) -> Result<std::thread::JoinHandle<()>> {
     let events = mpv
         .create_client(Some("castoff-event-watcher"))
         .map_err(|e| anyhow::anyhow!("failed to create mpv event client: {e:?}"))?;
@@ -1285,7 +1372,7 @@ fn spawn_async_event_watcher(
             .enable_event(event)
             .map_err(|e| anyhow::anyhow!("failed to enable mpv event: {e:?}"))?;
     }
-    std::thread::spawn(move || loop {
+    let handle = std::thread::spawn(move || loop {
         // SAFETY: `events` owns a live mpv handle. The returned pointer is
         // valid until the next `mpv_wait_event` call on that handle, which
         // cannot happen until this iteration has finished using it (one
@@ -1383,7 +1470,7 @@ fn spawn_async_event_watcher(
             _ => {}
         }
     });
-    Ok(())
+    Ok(handle)
 }
 
 /// The daemon's own routing decision came back "not media": display `url` in
@@ -1457,7 +1544,7 @@ fn spawn_lifecycle_watcher(
     overlay: Arc<PlaybackOverlay>,
     webpage: Arc<WebpageController>,
     status_tx: watch::Sender<PlaybackUpdateMessage>,
-) -> Result<()> {
+) -> Result<std::thread::JoinHandle<()>> {
     let events = mpv
         .create_client(Some("castoff-lifecycle"))
         .map_err(|e| anyhow::anyhow!("failed to create mpv lifecycle client: {e:?}"))?;
@@ -1471,7 +1558,7 @@ fn spawn_lifecycle_watcher(
             .enable_event(event)
             .map_err(|e| anyhow::anyhow!("failed to enable mpv event: {e:?}"))?;
     }
-    std::thread::spawn(move || loop {
+    let handle = std::thread::spawn(move || loop {
         match events.wait_event(-1.0) {
             Some(Ok(event)) => {
                 if !handle_lifecycle_event(event, &idle, &overlay, &mpv, &webpage, &status_tx) {
@@ -1486,7 +1573,7 @@ fn spawn_lifecycle_watcher(
             None => {}
         }
     });
-    Ok(())
+    Ok(handle)
 }
 
 /// Put the idle clock back and tear the spinner down because the in-flight
@@ -1567,9 +1654,9 @@ pub(crate) fn now_millis() -> u64 {
 /// module's own `tests` submodule, so `main.rs`'s tests can build a real
 /// headless `Player` too rather than needing a second mock.
 ///
-/// Two concurrency hazards showed up as this suite grew to two dozen-plus
-/// tests that each spin up one of these real cores: (1) libass's default
-/// `auto` OSD font provider (used by the idle clock/spinner overlays,
+/// Several concurrency hazards have shown up as this suite grew to two
+/// dozen-plus tests that each spin up one of these real cores: (1) libass's
+/// default `auto` OSD font provider (used by the idle clock/spinner overlays,
 /// `overlay.rs`) queries fontconfig, whose on-demand cache build is not safe
 /// against many threads racing its first initialization at once -- in a
 /// sandbox with no writable font cache directory (`nix build`'s checkPhase:
@@ -1588,6 +1675,24 @@ pub(crate) fn now_millis() -> u64 {
 /// confirmed to make the whole suite pass reliably. Production
 /// (`Player::new`) keeps the default `auto` font provider so the appliance
 /// still renders with a real matched system font.
+///
+/// (3) A third, distinct source of the same class of hazard: `Player::play`'s
+/// `spawn_metadata_lookup` (added for the play queue's title/length lookup)
+/// used to fire an untracked, never-joined `std::thread::spawn` -- shelling
+/// out to `yt-dlp` -- whenever a test queued a YouTube URL against a stub
+/// `yt-dlp` (`with_browser_and_ytdlp`). `RUST_TEST_THREADS=1` only
+/// serializes the test harness's own worker threads; it does nothing to stop
+/// that leftover thread's fork/exec from still being in flight while the
+/// *next* test's `headless_mpv()` initializes a fresh real core, which
+/// reliably reproduced the same bare SIGSEGV (confirmed both under `nix
+/// build`'s sandbox and plain `cargo test --release` outside it, same as
+/// (2)). Fixed by giving `with_browser_and_ytdlp` a test-only synchronous
+/// path (`spawn_metadata_lookup`'s `inline` parameter) that runs the lookup
+/// on the calling thread instead of spawning one at all, rather than trying
+/// to join a background thread the tests never captured a handle to; see
+/// `metadata_lookup_never_leaves_a_background_thread_racing_a_later_real_mpv_core`.
+/// Production (`Player::play`) still spawns the real background thread, since
+/// queuing a video must never block on the lookup.
 #[cfg(test)]
 pub(crate) fn headless_mpv() -> Arc<Mpv> {
     Arc::new(
@@ -3854,6 +3959,63 @@ mod tests {
             item.duration_secs, None,
             "a failed lookup must leave the duration absent"
         );
+    }
+
+    /// Regression test for `spawn_metadata_lookup`'s third concurrency
+    /// hazard (see `headless_mpv`'s doc comment): before the fix, a queued
+    /// YouTube URL's metadata lookup ran on an untracked, never-joined
+    /// background thread even under `with_browser_and_ytdlp`, so a real
+    /// headless mpv core created immediately afterward -- exactly this
+    /// test's shape -- could initialize while that leftover thread was still
+    /// forking/execing the stub `yt-dlp`, intermittently crashing the whole
+    /// test binary with a bare SIGSEGV. `with_browser_and_ytdlp` now runs
+    /// the lookup inline (no thread at all), so `play` resolving the title
+    /// synchronously, with no polling needed, is itself proof the hazard is
+    /// gone; spinning up a second real core straight afterward is what would
+    /// have raced the old leftover thread.
+    #[test]
+    fn metadata_lookup_never_leaves_a_background_thread_racing_a_later_real_mpv_core() {
+        let dir = scratch_dir("metadata-no-leftover-thread");
+        let ytdlp = stub_ytdlp(
+            &dir,
+            "yt-dlp",
+            r#"{"title": "A Charming Video", "duration": 212.5}"#,
+            0,
+        );
+        let player =
+            headless_player_with_ytdlp(Path::new("/nonexistent/castoff-test-browser"), &ytdlp);
+
+        let first = PlayMessage {
+            url: Some("av://lavfi:testsrc=size=64x64:rate=10:duration=30".to_string()),
+            ..Default::default()
+        };
+        player.play(&first).expect("first play");
+        wait_until(
+            &player.mpv,
+            |mpv| mpv.get_property::<f64>("time-pos").unwrap_or(0.0) > 0.05,
+            "the first clip to start playing",
+        );
+
+        let youtube = PlayMessage {
+            url: Some("https://www.youtube.com/watch?v=jNQXAC9IVRw".to_string()),
+            ..Default::default()
+        };
+        player.play(&youtube).expect("youtube play enqueues");
+
+        let state = player.queue_state();
+        let item = state
+            .items
+            .get(1)
+            .expect("the youtube item to be queued");
+        assert_eq!(
+            item.title.as_deref(),
+            Some("A Charming Video"),
+            "the inline lookup must have already resolved by the time play() returns"
+        );
+
+        // Immediately spin up a second real headless mpv core: this is the
+        // shape that used to race the old leftover background thread.
+        let _second = headless_player();
     }
 
     /// The queue (its items and current position) must survive a daemon
