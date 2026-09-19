@@ -132,6 +132,8 @@ other message. See [`daemon/src/fcast.rs`](daemon/src/fcast.rs) for the exact `Q
   small JSON file and reloaded at startup, so it survives a restart -- see
   `queue::default_state_path`'s doc comment in `daemon/src/queue.rs` for exactly where that file
   lives (`CASTOFF_STATE_DIR`, then systemd's `STATE_DIRECTORY`, then XDG's state-home convention).
+  A restart does not by itself resume playback: mpv always starts fresh and idle, and only a
+  client command (a `Play`, or a jump) starts anything playing again.
 - **YouTube title/length lookup.** Queuing a YouTube URL (recognized by host, see
   `metadata::is_youtube_url` in `daemon/src/metadata.rs`) kicks off a background `yt-dlp -j`
   lookup for its title and length; `QueueItemMessage.title`/`durationSecs` start absent and are
@@ -139,8 +141,6 @@ other message. See [`daemon/src/fcast.rs`](daemon/src/fcast.rs) for the exact `Q
   fails -- queuing itself never waits on it, and a failed lookup never fails the enqueue. This is
   a separate concern from playback: mpv's own `ytdl_hook` still resolves and plays the URL
   independently (see [How YouTube playback works](#how-youtube-playback-works)).
-  A restart does not by itself resume playback: mpv always starts fresh and idle, and only a
-  client command (a `Play`, or a jump) starts anything playing again.
 - **Seeing and being notified of the queue.** `RequestQueue` asks for the current queue on demand;
   `QueueState` is both that reply and, unprompted, pushed to every connected sender whenever the
   queue changes (an add, an auto-advance, or a jump) -- the same push-on-change model
@@ -158,12 +158,16 @@ URL -- no new opcode or protocol change, and no bespoke YouTube API integration 
 emulation. This works because mpv (and therefore `libmpv2`, since it's the same core) ships a
 built-in `ytdl_hook` Lua script that automatically shells out to
 [`yt-dlp`](https://github.com/yt-dlp/yt-dlp) to resolve a direct, playable stream URL whenever it's
-given a URL it doesn't recognize as directly playable media. This is unconditional: no
-daemon-side code detects YouTube URLs, spawns `yt-dlp`, or parses its output -- `Player::play`
-(`daemon/src/player.rs`) just hands `url` to mpv's `loadfile` exactly as it already did for a
-direct remote mp4, and mpv/`ytdl_hook` do the rest, as verified by a real (non-mocked) test against
-a real public YouTube URL (`real_youtube_url_resolves_and_plays_via_ytdl_hook`, gated `#[ignore]`
-since it needs network access and `yt-dlp` on `PATH` -- see that test's doc comment to run it).
+given a URL it doesn't recognize as directly playable media. This is unconditional for playback:
+no daemon-side code detects YouTube URLs, spawns `yt-dlp`, or parses its output in order to play
+one -- `Player::play` (`daemon/src/player.rs`) just hands `url` to mpv's `loadfile` exactly as it
+already did for a direct remote mp4, and mpv/`ytdl_hook` do the rest, as verified by a real
+(non-mocked) test against a real public YouTube URL
+(`real_youtube_url_resolves_and_plays_via_ytdl_hook`, gated `#[ignore]` since it needs network
+access and `yt-dlp` on `PATH` -- see that test's doc comment to run it). The daemon does run
+`yt-dlp` itself for one unrelated purpose -- a background title/length lookup for the queue, see
+[Queueing (private extension)](#queueing-private-extension) -- which is independent of and never
+blocks this playback path.
 No Google login is needed for public videos, matching `yt-dlp`'s own no-auth-required default for
 public content. `yt-dlp` is declared as a runtime dependency of the `castoff-daemon` Nix package
 (`flake.nix`): the built binary is wrapped (`makeWrapper`) to prepend `yt-dlp`'s Nix store path to
