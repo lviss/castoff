@@ -44,17 +44,25 @@ pub(crate) fn is_youtube_url(url: &str) -> bool {
     YOUTUBE_HOSTS.contains(&host)
 }
 
-/// A queued video's title and length, as resolved by `fetch_metadata`.
+/// A queued video's title and/or length, as resolved by `fetch_metadata`.
+/// The two are independent: a live stream's `duration` is `null` in
+/// `yt-dlp`'s JSON while its `title` resolves fine, so either field alone
+/// may be present.
 pub(crate) struct VideoMetadata {
-    pub title: String,
-    pub duration_secs: f64,
+    pub title: Option<String>,
+    pub duration_secs: Option<f64>,
 }
 
 /// Run `yt-dlp -j` (JSON metadata dump, no download) on `url` and pull out
-/// its `title`/`duration`. `None` on any failure -- `program` missing,
-/// non-zero exit, unparseable/incomplete JSON -- since a failed lookup must
-/// leave the queue entry intact with the fields merely absent (see
-/// `player.rs`'s `spawn_metadata_lookup`), never fail the enqueue itself.
+/// its `title`/`duration`. `None` on a failure to even get/parse JSON --
+/// `program` missing, non-zero exit, unparseable output -- since a failed
+/// lookup must leave the queue entry intact with the fields merely absent
+/// (see `player.rs`'s `spawn_metadata_lookup`), never fail the enqueue
+/// itself. Once the JSON parses, `title` and `duration` are extracted
+/// independently and `Some` is returned as long as at least one resolved --
+/// e.g. a live stream's `title` resolves with `duration: null` -- so a
+/// resolvable title is never discarded just because duration isn't
+/// available yet.
 pub(crate) fn fetch_metadata(program: &str, url: &str) -> Option<VideoMetadata> {
     let output = Command::new(program)
         .args(["-j", "--no-playlist", "--no-warnings", "--skip-download"])
@@ -84,8 +92,14 @@ pub(crate) fn fetch_metadata(program: &str, url: &str) -> Option<VideoMetadata> 
             return None;
         }
     };
-    let title = value.get("title")?.as_str()?.to_string();
-    let duration_secs = value.get("duration")?.as_f64()?;
+    let title = value
+        .get("title")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let duration_secs = value.get("duration").and_then(|v| v.as_f64());
+    if title.is_none() && duration_secs.is_none() {
+        return None;
+    }
     Some(VideoMetadata {
         title,
         duration_secs,

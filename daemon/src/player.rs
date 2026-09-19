@@ -1178,7 +1178,7 @@ fn spawn_metadata_lookup(
             return;
         };
         let mut queue = queue.lock().unwrap();
-        queue.set_metadata(index, Some(metadata.title), Some(metadata.duration_secs));
+        queue.set_metadata(index, metadata.title, metadata.duration_secs);
         queue.save(state_path.as_deref());
         let _ = queue_tx.send_replace(queue.to_state_message());
     });
@@ -3743,6 +3743,58 @@ mod tests {
         let item = item.expect("the queued youtube item to eventually report a title");
         assert_eq!(item.title.as_deref(), Some("A Charming Video"));
         assert_eq!(item.duration_secs, Some(212.5));
+    }
+
+    /// A live stream's `yt-dlp -j` output has a real `title` but
+    /// `"duration": null` (duration is unknown while the stream is still
+    /// live). That must not discard the title: the two fields resolve
+    /// independently, so the queue entry ends up with the title populated
+    /// and the duration left absent, rather than both absent.
+    #[test]
+    fn queued_youtube_live_stream_reports_title_with_absent_duration() {
+        let dir = scratch_dir("metadata-live-stream");
+        let ytdlp = stub_ytdlp(
+            &dir,
+            "yt-dlp",
+            r#"{"title": "Live Right Now", "duration": null}"#,
+            0,
+        );
+        let player =
+            headless_player_with_ytdlp(Path::new("/nonexistent/castoff-test-browser"), &ytdlp);
+
+        let first = PlayMessage {
+            url: Some("av://lavfi:testsrc=size=64x64:rate=10:duration=30".to_string()),
+            ..Default::default()
+        };
+        player.play(&first).expect("first play");
+        wait_until(
+            &player.mpv,
+            |mpv| mpv.get_property::<f64>("time-pos").unwrap_or(0.0) > 0.05,
+            "the first clip to start playing",
+        );
+
+        let youtube = PlayMessage {
+            url: Some("https://www.youtube.com/watch?v=jNQXAC9IVRw".to_string()),
+            ..Default::default()
+        };
+        player.play(&youtube).expect("youtube play enqueues");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut item = None;
+        while Instant::now() < deadline {
+            let state = player.queue_state();
+            if let Some(found) = state.items.get(1).filter(|i| i.title.is_some()) {
+                item = Some(found.clone());
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let item = item.expect("the queued youtube item to eventually report a title");
+        assert_eq!(item.title.as_deref(), Some("Live Right Now"));
+        assert_eq!(
+            item.duration_secs, None,
+            "a live stream's unknown duration must stay absent, not block the title"
+        );
     }
 
     /// A metadata lookup failure (`yt-dlp` erroring) must leave the queue
