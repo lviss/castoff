@@ -1,5 +1,6 @@
 mod fcast;
 mod idle_screen;
+mod metadata;
 mod overlay;
 mod player;
 mod queue;

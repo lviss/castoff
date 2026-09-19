@@ -20,21 +20,55 @@ use crate::player::now_millis;
 
 const STATE_FILE_NAME: &str = "queue.json";
 
+/// One queued item: the exact `PlayMessage` it was enqueued with (so
+/// replaying it -- auto-advance, a jump, or a reload after restart -- plays
+/// it identically to how a fresh `Play` would have), plus whatever title and
+/// length `player.rs`'s background metadata lookup has resolved for it, if
+/// any (see `set_metadata`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct QueueEntry {
+    message: PlayMessage,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    duration_secs: Option<f64>,
+}
+
 /// The play queue: every item ever queued, in queue order, plus the index of
-/// the current one. A queued item is stored as the exact `PlayMessage` it was
-/// enqueued with, so replaying it (auto-advance, a jump, or a reload after
-/// restart) plays it identically to how a fresh `Play` would have.
+/// the current one.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Queue {
-    items: Vec<PlayMessage>,
+    items: Vec<QueueEntry>,
     position: Option<usize>,
 }
 
 impl Queue {
-    /// Append `item` to the queue and return its index.
+    /// Append `item` to the queue and return its index. Its title/length
+    /// start absent -- `player.rs`'s `spawn_metadata_lookup` fills them in
+    /// later via `set_metadata`, if at all.
     pub fn push(&mut self, item: PlayMessage) -> usize {
-        self.items.push(item);
+        self.items.push(QueueEntry {
+            message: item,
+            title: None,
+            duration_secs: None,
+        });
         self.items.len() - 1
+    }
+
+    /// Record the title/length resolved for the item at `index` (see
+    /// `player.rs`'s `spawn_metadata_lookup`). A no-op if `index` is out of
+    /// range -- items are never removed today, but a lookup that resolves
+    /// after this queue was somehow rebuilt shorter must not panic.
+    pub fn set_metadata(
+        &mut self,
+        index: usize,
+        title: Option<String>,
+        duration_secs: Option<f64>,
+    ) {
+        if let Some(entry) = self.items.get_mut(index) {
+            entry.title = title;
+            entry.duration_secs = duration_secs;
+        }
     }
 
     pub fn set_position(&mut self, position: Option<usize>) {
@@ -60,7 +94,7 @@ impl Queue {
             return None;
         }
         self.position = Some(next);
-        self.items.get(next)
+        self.items.get(next).map(|entry| &entry.message)
     }
 
     /// Move to the item before the current one, if any. Same "no-op past the
@@ -68,7 +102,7 @@ impl Queue {
     pub fn jump_backward(&mut self) -> Option<&PlayMessage> {
         let prev = self.position?.checked_sub(1)?;
         self.position = Some(prev);
-        self.items.get(prev)
+        self.items.get(prev).map(|entry| &entry.message)
     }
 
     /// This queue's state as the wire shape sent to FCast senders (see
@@ -79,9 +113,11 @@ impl Queue {
             items: self
                 .items
                 .iter()
-                .map(|item| QueueItemMessage {
-                    url: item.url.clone().unwrap_or_default(),
-                    container: item.container.clone(),
+                .map(|entry| QueueItemMessage {
+                    url: entry.message.url.clone().unwrap_or_default(),
+                    container: entry.message.container.clone(),
+                    title: entry.title.clone(),
+                    duration_secs: entry.duration_secs,
                 })
                 .collect(),
             current_index: self.position,
