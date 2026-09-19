@@ -2,6 +2,7 @@ mod fcast;
 mod idle_screen;
 mod overlay;
 mod player;
+mod queue;
 mod webpage;
 
 use std::net::SocketAddr;
@@ -16,8 +17,8 @@ use tokio::time::MissedTickBehavior;
 use tracing::{debug, error, info, warn};
 
 use fcast::{
-    Opcode, PlayMessage, PlaybackErrorMessage, PlaybackState, PlaybackUpdateMessage, SeekMessage,
-    SetSpeedMessage, SetVolumeMessage, VersionMessage,
+    Opcode, PlayMessage, PlaybackErrorMessage, PlaybackState, PlaybackUpdateMessage,
+    QueueStateMessage, SeekMessage, SetSpeedMessage, SetVolumeMessage, VersionMessage,
 };
 use player::Player;
 
@@ -34,6 +35,10 @@ use player::Player;
 struct ConnectionWriter {
     write: OwnedWriteHalf,
     last_generation: u64,
+    /// Same staleness guard as `last_generation`, for `QueueState`: it is
+    /// also both an immediate command reply (to `RequestQueue`/a jump) and a
+    /// broadcast push, so the same reordering race applies.
+    last_queue_generation: u64,
 }
 
 impl ConnectionWriter {
@@ -45,6 +50,16 @@ impl ConnectionWriter {
         }
         self.last_generation = status.generation_time;
         fcast::write_message(&mut self.write, Opcode::PlaybackUpdate, status).await?;
+        Ok(true)
+    }
+
+    /// `write_playback_update`'s counterpart for `QueueState`.
+    async fn write_queue_state(&mut self, state: &QueueStateMessage) -> Result<bool> {
+        if state.generation_time < self.last_queue_generation {
+            return Ok(false);
+        }
+        self.last_queue_generation = state.generation_time;
+        fcast::write_message(&mut self.write, Opcode::QueueState, state).await?;
         Ok(true)
     }
 }
@@ -101,6 +116,7 @@ async fn handle_connection(socket: TcpStream, player: Arc<Player>) -> Result<()>
     let writer: SharedWriter = Arc::new(AsyncMutex::new(ConnectionWriter {
         write: write_half,
         last_generation: 0,
+        last_queue_generation: 0,
     }));
 
     let push_task = tokio::spawn(push_updates(Arc::clone(&writer), Arc::clone(&player)));
@@ -144,6 +160,11 @@ async fn handle_connection(socket: TcpStream, player: Arc<Player>) -> Result<()>
 async fn push_updates(writer: SharedWriter, player: Arc<Player>) {
     let mut rx = player.subscribe_status();
     let mut last_state = rx.borrow().state;
+    // The queue push has no periodic tick of its own: unlike playback
+    // position, the queue only ever changes on a discrete event (an add, an
+    // auto-advance, or a jump), so it is purely event-driven, consistent
+    // with the daemon's no-polling design principle.
+    let mut queue_rx = player.subscribe_queue();
 
     let mut interval = tokio::time::interval(PUSH_TICK_INTERVAL);
     interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -201,6 +222,15 @@ async fn push_updates(writer: SharedWriter, player: Arc<Player>) {
                     rx.borrow().state
                 };
             }
+            changed = queue_rx.changed() => {
+                if changed.is_err() {
+                    return; // Player dropped (daemon shutting down).
+                }
+                let state = queue_rx.borrow_and_update().clone();
+                if write_queue_state(&writer, &state).await.is_err() {
+                    return;
+                }
+            }
         }
     }
 }
@@ -208,6 +238,11 @@ async fn push_updates(writer: SharedWriter, player: Arc<Player>) {
 async fn write_update(writer: &SharedWriter, status: &PlaybackUpdateMessage) -> Result<bool> {
     let mut w = writer.lock().await;
     w.write_playback_update(status).await
+}
+
+async fn write_queue_state(writer: &SharedWriter, state: &QueueStateMessage) -> Result<bool> {
+    let mut w = writer.lock().await;
+    w.write_queue_state(state).await
 }
 
 async fn dispatch(writer: &SharedWriter, player: &Arc<Player>, frame: fcast::Frame) -> Result<()> {
@@ -262,6 +297,22 @@ async fn dispatch(writer: &SharedWriter, player: &Arc<Player>, frame: fcast::Fra
             tokio::task::spawn_blocking(move || p.set_speed(msg.speed)).await??;
             send_status(writer, player).await
         }
+        Opcode::RequestQueue => {
+            debug!("received RequestQueue");
+            send_queue_state(writer, player).await
+        }
+        Opcode::QueueJumpForward => {
+            info!("received QueueJumpForward");
+            let p = Arc::clone(player);
+            tokio::task::spawn_blocking(move || p.queue_jump_forward()).await??;
+            send_queue_state(writer, player).await
+        }
+        Opcode::QueueJumpBackward => {
+            info!("received QueueJumpBackward");
+            let p = Arc::clone(player);
+            tokio::task::spawn_blocking(move || p.queue_jump_backward()).await??;
+            send_queue_state(writer, player).await
+        }
         Opcode::Version => {
             debug!("received Version");
             let reply = VersionMessage {
@@ -297,6 +348,18 @@ async fn send_status(writer: &SharedWriter, player: &Arc<Player>) -> Result<()> 
     let player = Arc::clone(player);
     let status = tokio::task::spawn_blocking(move || player.status()).await?;
     w.write_playback_update(&status).await?;
+    Ok(())
+}
+
+async fn send_queue_state(writer: &SharedWriter, player: &Arc<Player>) -> Result<()> {
+    // Snapshot under the writer lock for the same reason `send_status` does:
+    // `dispatch`'s reply and `push_updates`' unprompted push share this lock
+    // and the generation check in `ConnectionWriter`, keeping this
+    // connection's `QueueState` frames monotonically fresh.
+    let mut w = writer.lock().await;
+    let player = Arc::clone(player);
+    let state = tokio::task::spawn_blocking(move || player.queue_state()).await?;
+    w.write_queue_state(&state).await?;
     Ok(())
 }
 
@@ -354,17 +417,68 @@ mod tests {
         addr
     }
 
+    /// Reads frames until the next `PlaybackUpdate`, discarding any
+    /// `QueueState` frames along the way: a `Play` now also enqueues (see
+    /// `Player::play`), which pushes one of those to every connection
+    /// alongside the `PlaybackUpdate` these tests care about, in whichever
+    /// order the two broadcasts happen to interleave in.
     async fn read_update(client: &mut ClientStream) -> PlaybackUpdateMessage {
-        let frame = fcast::read_frame(client)
-            .await
-            .expect("read frame")
-            .expect("frame present, not EOF");
-        assert_eq!(
-            frame.opcode,
-            Opcode::PlaybackUpdate,
-            "expected PlaybackUpdate"
-        );
-        serde_json::from_slice(&frame.body).expect("decode PlaybackUpdate body")
+        loop {
+            let frame = fcast::read_frame(client)
+                .await
+                .expect("read frame")
+                .expect("frame present, not EOF");
+            if frame.opcode == Opcode::QueueState {
+                continue;
+            }
+            assert_eq!(
+                frame.opcode,
+                Opcode::PlaybackUpdate,
+                "expected PlaybackUpdate"
+            );
+            return serde_json::from_slice(&frame.body).expect("decode PlaybackUpdate body");
+        }
+    }
+
+    /// `read_update`'s counterpart: reads frames until the next
+    /// `QueueState`, discarding any `PlaybackUpdate` frames along the way.
+    async fn read_queue_state(client: &mut ClientStream) -> QueueStateMessage {
+        loop {
+            let frame = fcast::read_frame(client)
+                .await
+                .expect("read frame")
+                .expect("frame present, not EOF");
+            if frame.opcode == Opcode::PlaybackUpdate {
+                continue;
+            }
+            assert_eq!(frame.opcode, Opcode::QueueState, "expected QueueState");
+            return serde_json::from_slice(&frame.body).expect("decode QueueState body");
+        }
+    }
+
+    /// A jump (`QueueJumpForward`/`QueueJumpBackward`) legitimately produces
+    /// *two* `QueueState` frames, not one: `Player::play_jumped_item`
+    /// publishes the new position via the queue-changed watch channel
+    /// (picked up by `push_updates`), and `dispatch`'s own handler then also
+    /// replies with `send_queue_state` -- both carrying the same position.
+    /// Reading exactly one frame per jump therefore risks consuming a
+    /// leftover frame from the *previous* jump instead of this one's. Read
+    /// frames until `current_index` matches `expected`, bounded so a
+    /// genuine mismatch still fails instead of hanging.
+    async fn read_queue_state_until(
+        client: &mut ClientStream,
+        expected: Option<usize>,
+    ) -> QueueStateMessage {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let state = tokio::time::timeout(remaining, read_queue_state(client))
+                .await
+                .expect("a QueueState with the expected position should arrive");
+            if state.current_index == expected {
+                return state;
+            }
+        }
     }
 
     /// A second connection that never sends a command of its own must still
@@ -585,6 +699,84 @@ mod tests {
             quiet.is_err(),
             "no PlaybackUpdate should be pushed once playback has ended"
         );
+
+        client.shutdown().await.ok();
+    }
+
+    /// The queue opcodes (castoff's private FCast extension, see README's
+    /// "Queueing (private extension)") end-to-end over a real TCP
+    /// connection: `RequestQueue` replies with the current `QueueState`, a
+    /// `Play` while something is already playing only enqueues (pushing an
+    /// unprompted `QueueState`, not a change to what's on screen), and
+    /// `QueueJumpForward`/`QueueJumpBackward` move within the queue and
+    /// reply with the new state.
+    #[tokio::test]
+    async fn queue_opcodes_round_trip_over_the_wire() {
+        let player = Arc::new(headless_player());
+        let addr = spawn_server(player).await;
+
+        let mut client = ClientStream::connect(addr).await.expect("connect");
+
+        fcast::write_empty(&mut client, Opcode::RequestQueue)
+            .await
+            .expect("send RequestQueue");
+        let state = read_queue_state(&mut client).await;
+        assert!(state.items.is_empty(), "queue must start empty");
+        assert_eq!(state.current_index, None);
+
+        // A long clip so it's still playing when the second Play arrives.
+        let first = fcast::PlayMessage {
+            url: Some("av://lavfi:testsrc=size=64x64:rate=10:duration=30".to_string()),
+            ..Default::default()
+        };
+        let body = serde_json::to_vec(&first).expect("encode Play");
+        fcast::write_frame(&mut client, Opcode::Play, &body)
+            .await
+            .expect("send first Play");
+        // `state == Playing` alone is not enough here: it flips as soon as
+        // mpv's own idle-active/pause properties settle, which can race ahead
+        // of the daemon's internal "genuinely rendering, not merely loading"
+        // signal (`Player::is_idle`, gated on `overlay.rs`'s
+        // `PlaybackRestart` -> `reveal` fade completing) that queueing
+        // decisions actually use. Wait for `time` to actually be advancing
+        // (mirroring the in-process queue tests' `time-pos > 0.05` wait) so
+        // the second Play below deterministically arrives once the first
+        // item is genuinely current, not merely reported Playing.
+        let mut saw_playing = false;
+        for _ in 0..20 {
+            let update = tokio::time::timeout(Duration::from_secs(3), read_update(&mut client))
+                .await
+                .expect("an update should arrive while Play is starting");
+            if update.state == PlaybackState::Playing && update.time.unwrap_or(0.0) > 0.05 {
+                saw_playing = true;
+                break;
+            }
+        }
+        assert!(saw_playing, "expected the first Play to start playing");
+
+        let second = fcast::PlayMessage {
+            url: Some("av://lavfi:testsrc=size=64x64:rate=10:duration=1".to_string()),
+            ..Default::default()
+        };
+        let body = serde_json::to_vec(&second).expect("encode Play");
+        fcast::write_frame(&mut client, Opcode::Play, &body)
+            .await
+            .expect("send second Play");
+
+        // The second Play only enqueues; some frame reports the two-item
+        // queue with the first item still current.
+        let state = read_queue_state_until(&mut client, Some(0)).await;
+        assert_eq!(state.items.len(), 2, "both items must be in the queue");
+
+        fcast::write_empty(&mut client, Opcode::QueueJumpForward)
+            .await
+            .expect("send QueueJumpForward");
+        read_queue_state_until(&mut client, Some(1)).await;
+
+        fcast::write_empty(&mut client, Opcode::QueueJumpBackward)
+            .await
+            .expect("send QueueJumpBackward");
+        read_queue_state_until(&mut client, Some(0)).await;
 
         client.shutdown().await.ok();
     }

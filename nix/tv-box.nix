@@ -23,6 +23,16 @@
     program = "${castoffDaemon}/bin/castoff-daemon";
   };
 
+  # The daemon persists its play queue (items + current position, see
+  # `daemon/src/queue.rs`) so it survives a restart. `StateDirectory=` makes
+  # systemd create `/var/lib/castoff` (owned by the `cage-tty1` service's own
+  # user, i.e. `kiosk`) before the daemon starts and sets `STATE_DIRECTORY`
+  # to it, which `queue::default_state_path` checks for exactly this --
+  # without it the daemon falls back to `kiosk`'s `$HOME/.local/state`, which
+  # works but isn't the dedicated, systemd-managed state path this appliance
+  # otherwise uses for that purpose.
+  systemd.services.cage-tty1.serviceConfig.StateDirectory = "castoff";
+
   users.users.kiosk = {
     isNormalUser = true;
     description = "castoff kiosk session user";

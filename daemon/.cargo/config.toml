@@ -1,0 +1,12 @@
+# `cargo test` creates several dozen real headless mpv cores across this
+# crate's test suite (see `player.rs`'s `headless_mpv`). Many of those cores
+# being genuinely alive at once -- not just being created at once -- reliably
+# crashes the test binary with a bare SIGSEGV inside libmpv/ffmpeg once the
+# suite is big enough to schedule enough of them concurrently under `cargo
+# test`'s default one-thread-per-core runner; confirmed under both `nix
+# build`'s sandboxed checkPhase and plain `cargo test --release` outside it,
+# and confirmed fixed (0 failures across repeated runs) by capping test
+# concurrency to 1. This is a real concurrency limit of the mpv/ffmpeg stack
+# in this environment, not a flaky test to retry around -- see AGENTS.md.
+[env]
+RUST_TEST_THREADS = "1"

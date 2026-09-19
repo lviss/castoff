@@ -34,6 +34,23 @@ pub enum Opcode {
     Version = 11,
     Ping = 12,
     Pong = 13,
+    // --- castoff private extension: the play queue. FCast v2 itself has no
+    // queue concept; these opcodes live beyond its reserved 0-13 range, on
+    // this daemon's own single-user control API (see README's "Queueing
+    // (private extension)"). Every message shape is documented on its own
+    // struct below.
+    /// sender -> receiver: ask for the current queue; replies `QueueState`.
+    RequestQueue = 14,
+    /// receiver -> sender: the full queue and the current position in it.
+    /// Sent both as `RequestQueue`'s reply and, unprompted, to every
+    /// connected sender whenever the queue changes.
+    QueueState = 15,
+    /// sender -> receiver: move to the next queue item, if any; replies
+    /// `QueueState`. A no-op (still replies) when already on the last item.
+    QueueJumpForward = 16,
+    /// sender -> receiver: move to the previous queue item, if any; replies
+    /// `QueueState`. A no-op (still replies) when already on the first item.
+    QueueJumpBackward = 17,
 }
 
 impl Opcode {
@@ -53,6 +70,10 @@ impl Opcode {
             11 => Opcode::Version,
             12 => Opcode::Ping,
             13 => Opcode::Pong,
+            14 => Opcode::RequestQueue,
+            15 => Opcode::QueueState,
+            16 => Opcode::QueueJumpForward,
+            17 => Opcode::QueueJumpBackward,
             _ => return None,
         })
     }
@@ -247,6 +268,38 @@ pub struct PlaybackUpdateMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlaybackErrorMessage {
     pub message: String,
+}
+
+/// castoff private extension (see `Opcode::QueueState`): one item in the play
+/// queue, as shown to a sender (e.g. the Android app's queue list).
+/// Deliberately smaller than what the daemon actually replays a queued item
+/// with -- the queue itself stores the original `PlayMessage` (`queue.rs`) --
+/// since a sender's list only needs enough to display and identify each
+/// entry, not `volume`/`speed`/`headers`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QueueItemMessage {
+    pub url: String,
+    #[serde(default)]
+    pub container: Option<String>,
+}
+
+/// castoff private extension: the full play queue and the sender's position
+/// within it. Sent both as `RequestQueue`'s reply and, unprompted, to every
+/// connected sender whenever the queue changes (an item is added, playback
+/// auto-advances past one, or a client jumps forward/backward) -- the same
+/// push-on-change model `PlaybackUpdate` already uses (see README's Design
+/// principles and `daemon/src/main.rs`'s `push_updates`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QueueStateMessage {
+    pub generation_time: u64,
+    pub items: Vec<QueueItemMessage>,
+    /// Index into `items` of the current (playing, paused, or
+    /// most-recently-played) item. `None` when the queue is empty or nothing
+    /// has ever played from it yet.
+    #[serde(default)]
+    pub current_index: Option<usize>,
 }
 
 #[cfg(test)]
