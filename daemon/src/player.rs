@@ -1654,9 +1654,9 @@ pub(crate) fn now_millis() -> u64 {
 /// module's own `tests` submodule, so `main.rs`'s tests can build a real
 /// headless `Player` too rather than needing a second mock.
 ///
-/// Two concurrency hazards showed up as this suite grew to two dozen-plus
-/// tests that each spin up one of these real cores: (1) libass's default
-/// `auto` OSD font provider (used by the idle clock/spinner overlays,
+/// Several concurrency hazards have shown up as this suite grew to two
+/// dozen-plus tests that each spin up one of these real cores: (1) libass's
+/// default `auto` OSD font provider (used by the idle clock/spinner overlays,
 /// `overlay.rs`) queries fontconfig, whose on-demand cache build is not safe
 /// against many threads racing its first initialization at once -- in a
 /// sandbox with no writable font cache directory (`nix build`'s checkPhase:
