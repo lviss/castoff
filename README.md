@@ -715,14 +715,47 @@ which is what makes the result a single image that's both flashable installation
 ready-to-use booted system -- the partition table auto-expands to fill the SD card on first boot,
 so there's no separate `nixos-anywhere`/`disko` install step.
 
-Build it (on an `aarch64-linux` machine, or a machine with an `aarch64-linux` builder configured --
-this repo's own sandbox has neither, see below):
+Build it (on an `aarch64-linux` machine, or an `x86_64-linux` machine with `aarch64-linux` cross
+build support enabled -- see below; this repo's own sandbox has neither, see further down):
 
 ```sh
 # --accept-flake-config trusts nixos-raspberrypi's binary cache (see its own README), which
-# avoids rebuilding the Raspberry Pi kernel from source.
-nix build --accept-flake-config .#tv-box-rpi4-image
+# avoids rebuilding the Raspberry Pi kernel from source. --system aarch64-linux is required:
+# the bare flake shorthand `.#tv-box-rpi4-image` resolves against the CALLING machine's own
+# system first (i.e. `packages.<caller's system>.tv-box-rpi4-image`), so on any non-aarch64
+# machine it fails with "does not provide attribute packages.x86_64-linux.tv-box-rpi4-image"
+# without this flag -- confirmed against a real x86_64-linux laptop.
+nix build --accept-flake-config --system aarch64-linux .#packages.aarch64-linux.tv-box-rpi4-image
 ```
+
+**Building on an `x86_64-linux` machine** (the common case) additionally needs `aarch64-linux`
+cross build support enabled on that machine, or the build fails at the same platform-mismatch
+error this project's own sandbox hits (see further down) -- `--system aarch64-linux` alone only
+selects *which* output to build, it doesn't grant the ability to build it. On NixOS, add this to
+your system configuration and `sudo nixos-rebuild switch`:
+
+```nix
+boot.binfmt.emulatedSystems = [ "aarch64-linux" ];
+```
+
+This registers QEMU user-mode emulation so the build actually runs (slowly -- it's emulating
+another CPU architecture) instead of hard-failing at the platform-mismatch check. On a non-NixOS
+distro, the equivalent is installing `qemu-user-static` and registering it with `binfmt_misc`
+(package name and exact steps vary by distro); a genuine `aarch64-linux` remote builder is an
+alternative to either.
+
+**If you see `warning: ignoring untrusted substituter ... you are not a trusted user`**: passing
+`--accept-flake-config` only *offers* trust in nixos-raspberrypi's binary cache -- Nix itself still
+refuses to use a substituter or its trusted public keys unless your user is in `trusted-users`.
+Without that, the build still succeeds, just slower (it compiles the Raspberry Pi kernel from
+source instead of fetching a prebuilt one). On NixOS, add yourself and rebuild:
+
+```nix
+nix.settings.trusted-users = [ "root" "your-username" ];
+```
+
+(non-NixOS: add the same to `trusted-users` in `/etc/nix/nix.conf` and restart the `nix-daemon`
+service).
 
 That produces `./result`, a compressed image (`nixos-image-rpi4-uboot.img.zst`). Flash it to an SD
 card (**this overwrites the entire card** -- double-check `of=`):
