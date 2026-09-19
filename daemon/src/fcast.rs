@@ -282,6 +282,19 @@ pub struct QueueItemMessage {
     pub url: String,
     #[serde(default)]
     pub container: Option<String>,
+    /// The video's title, if known. Resolved asynchronously in the
+    /// background for YouTube/yt-dlp-style URLs (see `metadata.rs`) and left
+    /// absent -- rather than blocking the item from appearing in the queue
+    /// at all -- until that lookup resolves, or forever if it fails. A
+    /// client should show a placeholder until an update with this field
+    /// present arrives, the same push-on-change model documented on
+    /// `QueueStateMessage`.
+    #[serde(default)]
+    pub title: Option<String>,
+    /// The video's length in seconds, if known. Same async/optional
+    /// contract as `title`.
+    #[serde(default)]
+    pub duration_secs: Option<f64>,
 }
 
 /// castoff private extension: the full play queue and the sender's position

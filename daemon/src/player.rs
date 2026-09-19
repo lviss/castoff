@@ -71,6 +71,12 @@ pub struct Player {
     /// forward/backward) -- the same push-on-change model `status_tx` uses
     /// for `PlaybackUpdate` (see `main.rs`'s `push_updates`).
     queue_tx: watch::Sender<QueueStateMessage>,
+    /// `yt-dlp`'s program name, for `spawn_metadata_lookup`'s background
+    /// title/length lookup on a newly-queued YouTube URL. A field (not read
+    /// from the environment at call time) so tests can point it at a stub
+    /// (see `with_browser_and_ytdlp`) without a process-wide env var racing
+    /// against other tests.
+    ytdlp_program: String,
 }
 
 /// The handles play/queue operations need, grouped so the free functions
@@ -341,7 +347,12 @@ impl Player {
                  restart this run"
             );
         }
-        Self::build(mpv, Arc::new(WebpageController::from_env()), state_path)
+        Self::build(
+            mpv,
+            Arc::new(WebpageController::from_env()),
+            state_path,
+            crate::metadata::ytdlp_program(),
+        )
     }
 
     /// `from_mpv` with a caller-supplied browser program, so tests can drive
@@ -358,6 +369,7 @@ impl Player {
             mpv,
             Arc::new(WebpageController::with_program(program)),
             None,
+            crate::metadata::ytdlp_program(),
         )
     }
 
@@ -369,6 +381,24 @@ impl Player {
             mpv,
             Arc::new(WebpageController::with_program(program)),
             Some(state_path),
+            crate::metadata::ytdlp_program(),
+        )
+    }
+
+    /// `with_browser`, but with `yt-dlp` also pointed at a caller-supplied
+    /// stub -- for tests exercising `spawn_metadata_lookup` without a real
+    /// `yt-dlp`/network round-trip.
+    #[cfg(test)]
+    fn with_browser_and_ytdlp(
+        mpv: Arc<Mpv>,
+        browser_program: &str,
+        ytdlp_program: &str,
+    ) -> Result<Self> {
+        Self::build(
+            mpv,
+            Arc::new(WebpageController::with_program(browser_program)),
+            None,
+            ytdlp_program.to_string(),
         )
     }
 
@@ -376,6 +406,7 @@ impl Player {
         mpv: Arc<Mpv>,
         webpage: Arc<WebpageController>,
         state_path: Option<PathBuf>,
+        ytdlp_program: String,
     ) -> Result<Self> {
         let (status_tx, _status_rx) = watch::channel(snapshot_status(&mpv, &webpage));
         let queue = Arc::new(Mutex::new(Queue::load(state_path.as_deref())));
@@ -469,6 +500,7 @@ impl Player {
             state_path,
             status_tx,
             queue_tx,
+            ytdlp_program,
         })
     }
 
@@ -656,9 +688,10 @@ impl Player {
 
         let should_play_now = self.is_idle();
         let mut rollback = None;
+        let index;
         {
             let mut queue = self.queue.lock().unwrap();
-            let index = queue.push(msg.clone());
+            index = queue.push(msg.clone());
             if should_play_now {
                 rollback = Some(QueueRollback {
                     index,
@@ -669,6 +702,14 @@ impl Player {
         }
         self.persist_queue();
         self.publish_queue_state();
+        spawn_metadata_lookup(
+            msg,
+            index,
+            &self.ytdlp_program,
+            &self.queue,
+            self.state_path.as_deref(),
+            &self.queue_tx,
+        );
 
         let result = if should_play_now {
             execute_play(&self.handles(), msg, rollback)
@@ -1100,6 +1141,47 @@ fn revert_queue_position(
     queue.set_position(rollback.previous);
     queue.save(state_path);
     let _ = queue_tx.send_replace(queue.to_state_message());
+}
+
+/// Looks up `msg`'s title/length in the background (`metadata::fetch_metadata`)
+/// and, once resolved, records it on the queue entry at `index` and
+/// republishes -- the same push-on-change model every other queue mutation
+/// uses (see `QueueStateMessage`'s doc comment). Scoped to URLs the daemon
+/// recognizes as YouTube (`metadata::is_youtube_url`) so a Jellyfin or
+/// local-file queue entry never shells out to `yt-dlp`; called
+/// unconditionally from `Player::play` otherwise, since queuing a video
+/// itself must never wait on this -- it runs on its own thread, and a
+/// lookup that fails (bad URL, `yt-dlp` erroring) just leaves the fields
+/// absent rather than touching the queue entry at all. `index` stays valid
+/// even if the item is never actually played (e.g. its own load later fails
+/// and `revert_queue_position` moves `position` back): items are never
+/// removed from the queue, only reordered by position, so the entry the
+/// lookup was resolving for is always still there to update.
+fn spawn_metadata_lookup(
+    msg: &PlayMessage,
+    index: usize,
+    ytdlp_program: &str,
+    queue: &Arc<Mutex<Queue>>,
+    state_path: Option<&Path>,
+    queue_tx: &watch::Sender<QueueStateMessage>,
+) {
+    let Some(url) = msg.url.clone() else { return };
+    if !crate::metadata::is_youtube_url(&url) {
+        return;
+    }
+    let program = ytdlp_program.to_string();
+    let queue = Arc::clone(queue);
+    let state_path = state_path.map(Path::to_path_buf);
+    let queue_tx = queue_tx.clone();
+    std::thread::spawn(move || {
+        let Some(metadata) = crate::metadata::fetch_metadata(&program, &url) else {
+            return;
+        };
+        let mut queue = queue.lock().unwrap();
+        queue.set_metadata(index, Some(metadata.title), Some(metadata.duration_secs));
+        queue.save(state_path.as_deref());
+        let _ = queue_tx.send_replace(queue.to_state_message());
+    });
 }
 
 fn to_mpv_volume(fcast_volume: f64) -> f64 {
@@ -1559,6 +1641,25 @@ mod tests {
         player
     }
 
+    /// [`headless_player_with_browser`], but also pointing `yt-dlp` at a
+    /// caller-supplied stub (see `stub_ytdlp`) instead of a real `yt-dlp`.
+    fn headless_player_with_ytdlp(browser_program: &Path, ytdlp_program: &Path) -> Player {
+        let player = Player::with_browser_and_ytdlp(
+            headless_mpv(),
+            browser_program
+                .to_str()
+                .expect("stub browser path must be UTF-8"),
+            ytdlp_program
+                .to_str()
+                .expect("stub yt-dlp path must be UTF-8"),
+        )
+        .expect("create player");
+        player
+            .show_idle_screen(IdleScreen::Clock)
+            .expect("show initial idle screen");
+        player
+    }
+
     /// A fresh scratch directory: tests share one process, so stub files
     /// must not be shared between them.
     fn scratch_dir(name: &str) -> PathBuf {
@@ -1588,6 +1689,32 @@ mod tests {
         .expect("write stub browser");
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
             .expect("make stub browser executable");
+        script
+    }
+
+    /// Writes an executable stub standing in for `yt-dlp`, so
+    /// `spawn_metadata_lookup`'s tests can drive it without a real `yt-dlp`
+    /// binary or network access. Records its invocation to `<dir>/ytdlp.log`
+    /// (so a test can wait for the (async) lookup to have actually run),
+    /// prints `stdout_json` (a `yt-dlp -j`-shaped JSON line) and exits with
+    /// `exit_code`.
+    fn stub_ytdlp(dir: &Path, name: &str, stdout_json: &str, exit_code: i32) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let script = dir.join(name);
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n\
+                 echo \"$@\" >> \"{log}\"\n\
+                 cat <<'EOF'\n{stdout_json}\nEOF\n\
+                 exit {exit_code}\n",
+                log = dir.join("ytdlp.log").display(),
+            ),
+        )
+        .expect("write stub yt-dlp");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("make stub yt-dlp executable");
         script
     }
 
@@ -3566,6 +3693,115 @@ mod tests {
             .queue_jump_backward()
             .expect("jump backward at the start is a no-op");
         assert_eq!(player.queue_state().current_index, Some(0));
+    }
+
+    /// A queued YouTube URL must eventually report a non-empty title and
+    /// length in `QueueStateMessage`, resolved via `spawn_metadata_lookup`
+    /// running a stub `yt-dlp` (`stub_ytdlp`) -- never a real one, no
+    /// network. The first clip occupies playback so the YouTube `Play` only
+    /// enqueues: mpv itself never touches the URL, isolating this test to
+    /// the metadata path.
+    #[test]
+    fn queued_youtube_url_eventually_reports_title_and_duration() {
+        let dir = scratch_dir("metadata-success");
+        let ytdlp = stub_ytdlp(
+            &dir,
+            "yt-dlp",
+            r#"{"title": "A Charming Video", "duration": 212.5}"#,
+            0,
+        );
+        let player =
+            headless_player_with_ytdlp(Path::new("/nonexistent/castoff-test-browser"), &ytdlp);
+
+        let first = PlayMessage {
+            url: Some("av://lavfi:testsrc=size=64x64:rate=10:duration=30".to_string()),
+            ..Default::default()
+        };
+        player.play(&first).expect("first play");
+        wait_until(
+            &player.mpv,
+            |mpv| mpv.get_property::<f64>("time-pos").unwrap_or(0.0) > 0.05,
+            "the first clip to start playing",
+        );
+
+        let youtube = PlayMessage {
+            url: Some("https://www.youtube.com/watch?v=jNQXAC9IVRw".to_string()),
+            ..Default::default()
+        };
+        player.play(&youtube).expect("youtube play enqueues");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut item = None;
+        while Instant::now() < deadline {
+            let state = player.queue_state();
+            if let Some(found) = state.items.get(1).filter(|i| i.title.is_some()) {
+                item = Some(found.clone());
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let item = item.expect("the queued youtube item to eventually report a title");
+        assert_eq!(item.title.as_deref(), Some("A Charming Video"));
+        assert_eq!(item.duration_secs, Some(212.5));
+    }
+
+    /// A metadata lookup failure (`yt-dlp` erroring) must leave the queue
+    /// entry intact -- still present, with `title`/`durationSecs` simply
+    /// absent -- rather than failing the enqueue or ever populating those
+    /// fields.
+    #[test]
+    fn metadata_lookup_failure_leaves_queue_entry_intact_with_fields_absent() {
+        let dir = scratch_dir("metadata-failure");
+        let ytdlp = stub_ytdlp(&dir, "yt-dlp", "not json", 1);
+        let player =
+            headless_player_with_ytdlp(Path::new("/nonexistent/castoff-test-browser"), &ytdlp);
+
+        let first = PlayMessage {
+            url: Some("av://lavfi:testsrc=size=64x64:rate=10:duration=30".to_string()),
+            ..Default::default()
+        };
+        player.play(&first).expect("first play");
+        wait_until(
+            &player.mpv,
+            |mpv| mpv.get_property::<f64>("time-pos").unwrap_or(0.0) > 0.05,
+            "the first clip to start playing",
+        );
+
+        let youtube = PlayMessage {
+            url: Some("https://youtu.be/jNQXAC9IVRw".to_string()),
+            ..Default::default()
+        };
+        player
+            .play(&youtube)
+            .expect("youtube play enqueues even though its metadata lookup will fail");
+
+        // Wait for the stub to actually have run (proves the lookup was
+        // attempted, not merely scheduled), then confirm it never populated
+        // the fields it failed to resolve.
+        let log = dir.join("ytdlp.log");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && !log.exists() {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(log.exists(), "the stub yt-dlp was never invoked");
+        std::thread::sleep(Duration::from_millis(200));
+
+        let state = player.queue_state();
+        assert_eq!(
+            state.items.len(),
+            2,
+            "the failed lookup must not remove the queue entry"
+        );
+        let item = &state.items[1];
+        assert_eq!(item.url, "https://youtu.be/jNQXAC9IVRw");
+        assert_eq!(
+            item.title, None,
+            "a failed lookup must leave the title absent"
+        );
+        assert_eq!(
+            item.duration_secs, None,
+            "a failed lookup must leave the duration absent"
+        );
     }
 
     /// The queue (its items and current position) must survive a daemon

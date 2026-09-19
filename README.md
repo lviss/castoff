@@ -132,6 +132,13 @@ other message. See [`daemon/src/fcast.rs`](daemon/src/fcast.rs) for the exact `Q
   small JSON file and reloaded at startup, so it survives a restart -- see
   `queue::default_state_path`'s doc comment in `daemon/src/queue.rs` for exactly where that file
   lives (`CASTOFF_STATE_DIR`, then systemd's `STATE_DIRECTORY`, then XDG's state-home convention).
+- **YouTube title/length lookup.** Queuing a YouTube URL (recognized by host, see
+  `metadata::is_youtube_url` in `daemon/src/metadata.rs`) kicks off a background `yt-dlp -j`
+  lookup for its title and length; `QueueItemMessage.title`/`durationSecs` start absent and are
+  filled in (via another unprompted `QueueState`) once that lookup resolves, or stay absent if it
+  fails -- queuing itself never waits on it, and a failed lookup never fails the enqueue. This is
+  a separate concern from playback: mpv's own `ytdl_hook` still resolves and plays the URL
+  independently (see [How YouTube playback works](#how-youtube-playback-works)).
   A restart does not by itself resume playback: mpv always starts fresh and idle, and only a
   client command (a `Play`, or a jump) starts anything playing again.
 - **Seeing and being notified of the queue.** `RequestQueue` asks for the current queue on demand;
