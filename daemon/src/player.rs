@@ -14,7 +14,8 @@ use tracing::{debug, error, warn};
 use crate::fcast::{
     PlayMessage, PlayTarget, PlaybackState, PlaybackUpdateMessage, QueueStateMessage,
 };
-use crate::idle_screen::{IdleScreen, IdleScreenController};
+use crate::idle_screen::{IdleScreen, IdleScreenController, OnChange};
+use crate::images::ImageStore;
 use crate::overlay::PlaybackOverlay;
 use crate::queue::Queue;
 use crate::webpage::WebpageController;
@@ -53,6 +54,11 @@ pub struct Player {
     /// then stays in-memory only for this run (logged once at startup by
     /// `Player::new`).
     state_path: Option<PathBuf>,
+    /// Uploaded images and their wallpaper tag (`images.rs`), shared with the
+    /// upload HTTP endpoint (`upload.rs`, via `image_store`) and the
+    /// idle-screen wallpaper rotation timer (`idle_screen.rs`, via the
+    /// `on_wallpaper_tick` callback built in `build`).
+    images: Arc<ImageStore>,
     /// Broadcasts the latest `PlaybackUpdate`-shaped snapshot whenever any
     /// method below changes playback state, or an async transition does (a
     /// `PlaybackRestart`, an idle-screen show/hide, or the browser fallback
@@ -336,6 +342,23 @@ impl Player {
             init.set_property("input-default-bindings", "no")?;
             init.set_property("input-vo-keyboard", "no")?;
             init.set_property("osc", "no")?;
+            // mpv's own default is 5 seconds (verified against the pinned
+            // 0.41.0: `--list-options` shows `--image-display-duration`
+            // "Double (0 to inf) (default: 5)"), after which mpv reaches
+            // end-of-file on its own -- which would trigger this daemon's
+            // queue auto-advance (`player.rs`'s `auto_advance_queue`, wired
+            // through the idle-screen eof watcher) exactly as if the sender
+            // had queued something after it. An image queue item must
+            // instead sit indefinitely until the queue is explicitly
+            // advanced, the same way a web page does -- so every image (both
+            // a queued one and an idle-screen wallpaper, `idle_screen.rs`)
+            // is held up forever unless something else supersedes it.
+            // Confirmed empirically (`mpv --image-display-duration=inf`
+            // never reaches EOF/exits on a still image under `--keep-open`)
+            // rather than assumed; harmless for genuine video, since mpv
+            // only consults this property when it has detected the input as
+            // a single still image.
+            init.set_property("image-display-duration", "inf")?;
             // Print mpv's own warning/error log lines to the daemon's stderr
             // (journald/console on the appliance). libmpv defaults to
             // `terminal=no`, so without this a failed asynchronous load --
@@ -369,6 +392,7 @@ impl Player {
             mpv,
             Arc::new(WebpageController::from_env()),
             state_path,
+            Arc::new(ImageStore::from_env()),
             crate::metadata::ytdlp_program(),
             false,
         )
@@ -388,6 +412,7 @@ impl Player {
             mpv,
             Arc::new(WebpageController::with_program(program)),
             None,
+            Arc::new(ImageStore::ephemeral_for_test()),
             crate::metadata::ytdlp_program(),
             false,
         )
@@ -401,6 +426,7 @@ impl Player {
             mpv,
             Arc::new(WebpageController::with_program(program)),
             Some(state_path),
+            Arc::new(ImageStore::ephemeral_for_test()),
             crate::metadata::ytdlp_program(),
             false,
         )
@@ -422,6 +448,7 @@ impl Player {
             mpv,
             Arc::new(WebpageController::with_program(browser_program)),
             None,
+            Arc::new(ImageStore::ephemeral_for_test()),
             ytdlp_program.to_string(),
             true,
         )
@@ -431,10 +458,12 @@ impl Player {
         mpv: Arc<Mpv>,
         webpage: Arc<WebpageController>,
         state_path: Option<PathBuf>,
+        images: Arc<ImageStore>,
         ytdlp_program: String,
         metadata_lookup_inline: bool,
     ) -> Result<Self> {
-        let (status_tx, _status_rx) = watch::channel(snapshot_status(&mpv, &webpage));
+        let (status_tx, _status_rx) =
+            watch::channel(snapshot_status(&mpv, &webpage, false));
         let queue = Arc::new(Mutex::new(Queue::load(state_path.as_deref())));
         let (queue_tx, _queue_rx) = watch::channel(queue.lock().unwrap().to_state_message());
         // Fires whenever `IdleScreenController` shows/hides a screen (idle <->
@@ -442,18 +471,34 @@ impl Player {
         // cover, e.g. the eof-watcher bringing the clock back on a natural
         // end-of-file with nothing queued next, or a Stop/`play_webpage`
         // re-asserting it). Kept as a generic callback so `idle_screen.rs`
-        // doesn't need to know about FCast message types.
-        let on_change: Arc<dyn Fn() + Send + Sync> = {
+        // doesn't need to know about FCast message types. Takes `&self`
+        // (rather than capturing an `Arc<IdleScreenController>`) for the same
+        // reason `on_eof` does: this closure is built and threaded into
+        // `IdleScreenController::new` below, before that controller exists.
+        let on_change: OnChange = {
             let status_tx = status_tx.clone();
             let mpv = Arc::clone(&mpv);
             let webpage = Arc::clone(&webpage);
-            Arc::new(move || {
-                let _ = status_tx.send_replace(snapshot_status(&mpv, &webpage));
+            Arc::new(move |idle: &IdleScreenController| {
+                let _ = status_tx.send_replace(snapshot_status(
+                    &mpv,
+                    &webpage,
+                    idle.is_wallpaper_active(),
+                ));
             })
         };
         let overlay = Arc::new(PlaybackOverlay::new(Arc::clone(&mpv)));
         let operation = Arc::new(Mutex::new(()));
         let routing = Arc::new(Mutex::new(Routing::default()));
+        // Picks the next idle-screen wallpaper image (`idle_screen.rs`'s
+        // rotation timer calls this on its own cadence); `None` when nothing
+        // is tagged, in which case the timer leaves the plain background
+        // alone. Kept as a generic callback (like `on_eof`) so
+        // `idle_screen.rs` doesn't need to know about `ImageStore`.
+        let on_wallpaper_tick: crate::idle_screen::OnWallpaperTick = {
+            let images = Arc::clone(&images);
+            Arc::new(move || images.pick_next_wallpaper())
+        };
         // Tries to advance the play queue instead of letting the eof watcher
         // show the idle screen; built here (not as a `Player` method) because
         // it has to be threaded into `IdleScreenController::new` below,
@@ -491,8 +536,10 @@ impl Player {
         };
         let idle = Arc::new(IdleScreenController::new(
             Arc::clone(&mpv),
+            Arc::clone(&operation),
             Some(on_change),
             Some(on_eof),
+            Some(on_wallpaper_tick),
         ));
         let eof_watcher = idle.spawn_eof_watcher();
         let async_watcher = spawn_async_event_watcher(
@@ -528,6 +575,7 @@ impl Player {
             routing,
             queue,
             state_path,
+            images,
             status_tx,
             queue_tx,
             ytdlp_program,
@@ -907,13 +955,30 @@ impl Player {
 
     /// Snapshot current mpv state as an FCast PlaybackUpdate.
     pub fn status(&self) -> PlaybackUpdateMessage {
-        snapshot_status(&self.mpv, &self.webpage)
+        snapshot_status(&self.mpv, &self.webpage, self.idle.is_wallpaper_active())
     }
 
     /// Current volume on FCast's 0.0-1.0 scale.
     pub fn volume(&self) -> f64 {
         let v: f64 = self.mpv.get_property("volume").unwrap_or(0.0);
         v / 100.0
+    }
+
+    /// The uploaded-image store, shared with the upload HTTP endpoint
+    /// (`upload.rs`, spawned from `main.rs`).
+    pub fn image_store(&self) -> Arc<ImageStore> {
+        Arc::clone(&self.images)
+    }
+
+    /// Tag or untag a previously uploaded image for idle-screen wallpaper
+    /// rotation (`Opcode::SetImageWallpaper`). Errors when `id` is not a
+    /// known uploaded image.
+    pub fn set_image_wallpaper(&self, id: &str, wallpaper: bool) -> Result<()> {
+        if self.images.set_wallpaper(id, wallpaper) {
+            Ok(())
+        } else {
+            anyhow::bail!("no uploaded image with id {id:?}")
+        }
     }
 }
 
@@ -1220,7 +1285,7 @@ fn auto_advance_queue(
         revert_queue_position(queue, state_path, queue_tx, rollback);
         return false;
     }
-    let _ = status_tx.send_replace(snapshot_status(h.mpv, h.webpage));
+    let _ = status_tx.send_replace(snapshot_status(h.mpv, h.webpage, h.idle.is_wallpaper_active()));
     true
 }
 
@@ -1346,13 +1411,21 @@ fn to_mpv_volume(fcast_volume: f64) -> f64 {
 /// idle-screen `on_change` callback, the async-event watcher's browser
 /// fallback, and the lifecycle watcher thread -- can publish the exact same
 /// shape as `Player::status`.
-fn snapshot_status(mpv: &Mpv, webpage: &WebpageController) -> PlaybackUpdateMessage {
+fn snapshot_status(
+    mpv: &Mpv,
+    webpage: &WebpageController,
+    wallpaper_active: bool,
+) -> PlaybackUpdateMessage {
     let paused: bool = mpv.get_property("pause").unwrap_or(false);
     let idle: bool = mpv.get_property("idle-active").unwrap_or(true);
     let time: Option<f64> = mpv.get_property("time-pos").ok();
     let duration: Option<f64> = mpv.get_property("duration").ok();
     let speed: Option<f64> = mpv.get_property("speed").ok();
     let webpage_active = webpage.is_active();
+    // No timeline to report for a web page, and none worth reporting for an
+    // idle-screen wallpaper image either -- it's the idle screen, not
+    // content the sender asked to play.
+    let hide_timeline = webpage_active || wallpaper_active;
 
     let state = if webpage_active {
         // A displayed web page is live content the sender asked for, not
@@ -1360,7 +1433,11 @@ fn snapshot_status(mpv: &Mpv, webpage: &WebpageController) -> PlaybackUpdateMess
         // engine's window (see `play_webpage`), so mpv's own state must
         // not make this look like nothing is playing.
         PlaybackState::Playing
-    } else if idle {
+    } else if idle || wallpaper_active {
+        // A loaded wallpaper image (`idle_screen.rs`'s rotation timer) makes
+        // mpv's own `idle-active` go false, but it is still the idle screen
+        // from an FCast client's point of view, not content anyone asked to
+        // play.
         PlaybackState::Idle
     } else if paused {
         PlaybackState::Paused
@@ -1371,9 +1448,8 @@ fn snapshot_status(mpv: &Mpv, webpage: &WebpageController) -> PlaybackUpdateMess
     PlaybackUpdateMessage {
         generation_time: now_millis(),
         state,
-        // A web page has no mpv timeline to report.
-        time: if webpage_active { None } else { time },
-        duration: if webpage_active { None } else { duration },
+        time: if hide_timeline { None } else { time },
+        duration: if hide_timeline { None } else { duration },
         speed,
     }
 }
@@ -1586,7 +1662,7 @@ fn fall_back_to_browser(
     // `idle.show` just above sent, and -- since the push task only starts
     // its ~1s tick once it has seen `Playing` -- would never be corrected
     // until some unrelated later state change.
-    let _ = status_tx.send_replace(snapshot_status(mpv, webpage));
+    let _ = status_tx.send_replace(snapshot_status(mpv, webpage, idle.is_wallpaper_active()));
 }
 
 /// Spawn the background thread that tracks *playback lifecycle* on a second
@@ -1680,7 +1756,7 @@ fn handle_lifecycle_event(
         Event::PlaybackRestart => {
             overlay.mark_restarted();
             let _ = overlay.reveal();
-            let _ = status_tx.send_replace(snapshot_status(mpv, webpage));
+            let _ = status_tx.send_replace(snapshot_status(mpv, webpage, idle.is_wallpaper_active()));
         }
         Event::EndFile(libmpv2::mpv_end_file_reason::Eof) => restore_idle_clock(idle, overlay),
         Event::Shutdown => return false,
@@ -1715,7 +1791,9 @@ pub(crate) fn now_millis() -> u64 {
 /// A headless mpv core (`vo=null`/`ao=null`, no window or audio device),
 /// sufficient to drive real `Player` behavior in a sandbox with no display
 /// or sound hardware. Mirrors `Player::new`'s `keep-open` setting (needed for
-/// the double-play regression test). `pub(crate)`, not private to this
+/// the double-play regression test) and its `image-display-duration=inf`
+/// (needed for the image-queue-item tests to see the same indefinite-hold
+/// behavior production gets). `pub(crate)`, not private to this
 /// module's own `tests` submodule, so `main.rs`'s tests can build a real
 /// headless `Player` too rather than needing a second mock.
 ///
@@ -1766,6 +1844,7 @@ pub(crate) fn headless_mpv() -> Arc<Mpv> {
             init.set_property("ao", "null")?;
             init.set_property("idle", "yes")?;
             init.set_property("keep-open", "yes")?;
+            init.set_property("image-display-duration", "inf")?;
             init.set_property("osd-font-provider", "none")?;
             Ok(())
         })
@@ -2147,6 +2226,18 @@ mod tests {
         }
         video
     }
+
+    /// A real, decodable 1x1 PNG (the minimal valid PNG byte stream), so
+    /// image-routing tests exercise mpv actually opening and displaying a
+    /// static image file, not just an explicit `container` skipping the
+    /// browser regardless of whether the "media" attempt itself succeeds.
+    const MINIMAL_PNG: &[u8] = &[
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x04, 0x00, 0x00, 0x00, 0xb5,
+        0x1c, 0x0c, 0x02, 0x00, 0x00, 0x00, 0x0b, 0x49, 0x44, 0x41, 0x54, 0x78, 0xda, 0x63, 0x64,
+        0x60, 0x00, 0x00, 0x00, 0x06, 0x00, 0x02, 0x30, 0x81, 0xd0, 0x2f, 0x00, 0x00, 0x00, 0x00,
+        0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+    ];
 
     /// A loopback HTTP server that serves `body` with a `Content-Length`, like
     /// a plain media file host. Returns the port it is listening on.
@@ -3410,6 +3501,111 @@ mod tests {
         assert!(
             !dir.join("stub.log").exists(),
             "the browser engine must never have been started"
+        );
+    }
+
+    /// An `image/*` container (an uploaded image, see README's "Image
+    /// uploads") is not in `WEBPAGE_CONTAINERS`, so it already falls into
+    /// `PlayTarget::Media` -- this confirms it end-to-end against a real,
+    /// decodable image file: mpv actually opens it (idle-active goes false)
+    /// and the browser is never started.
+    #[test]
+    fn explicit_image_container_routes_to_mpv_and_plays_natively() {
+        let dir = scratch_dir("image-container-routes-to-mpv");
+        let browser = stub_browser(&dir, "browser-waiting", "sleep 300");
+        let player = headless_player_with_browser(&browser);
+        let port = serve_media(MINIMAL_PNG.to_vec());
+
+        player
+            .play(&PlayMessage {
+                container: Some("image/png".to_string()),
+                url: Some(format!("http://127.0.0.1:{port}/photo.png")),
+                ..Default::default()
+            })
+            .expect("an explicit image/* play must be accepted");
+
+        wait_until(
+            &player.mpv,
+            |mpv| !mpv.get_property::<bool>("idle-active").unwrap_or(true),
+            "mpv to load the image",
+        );
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            !player.webpage_active(),
+            "an image/* container must route to mpv, not the browser"
+        );
+        assert!(
+            !dir.join("stub.log").exists(),
+            "the browser engine must never have been started for an image/* container"
+        );
+    }
+
+    /// The whole point of `Player::new` setting `image-display-duration=inf`:
+    /// a queued image must sit up indefinitely like a web page, not
+    /// auto-advance on its own like a fixed-duration slideshow. mpv's own
+    /// unconfigured default is 5 seconds, so waiting past that point is what
+    /// actually exercises the override rather than just not-yet-expiring.
+    #[test]
+    fn queued_image_is_held_up_indefinitely_not_a_fixed_duration_slideshow() {
+        let player = headless_player();
+        let port = serve_media(MINIMAL_PNG.to_vec());
+
+        player
+            .play(&PlayMessage {
+                container: Some("image/png".to_string()),
+                url: Some(format!("http://127.0.0.1:{port}/photo.png")),
+                ..Default::default()
+            })
+            .expect("an explicit image/* play must be accepted");
+
+        wait_until(
+            &player.mpv,
+            |mpv| !mpv.get_property::<bool>("idle-active").unwrap_or(true),
+            "mpv to load the image",
+        );
+
+        std::thread::sleep(Duration::from_secs(6));
+        assert!(
+            !player.mpv.get_property::<bool>("idle-active").unwrap_or(true),
+            "an image queue item must not auto-advance/return to idle on its own"
+        );
+        assert_eq!(
+            player.idle_screen(),
+            None,
+            "the image must still be the active content, not the idle clock"
+        );
+    }
+
+    /// End-to-end wiring for idle-screen wallpaper rotation
+    /// (`idle_screen.rs`'s `maybe_rotate_wallpaper`, via the `on_wallpaper_tick`
+    /// callback `Player::build` gives it): a tagged image is picked up by the
+    /// existing ~1s Clock refresh thread and loaded into mpv while idle, and
+    /// is still reported as `Idle` to FCast clients even though mpv itself
+    /// now has a file loaded. `State::last_wallpaper_change` starts `None`,
+    /// so this rotates on the very first tick rather than waiting a full
+    /// `WALLPAPER_ROTATION_INTERVAL` -- what makes this a fast test.
+    #[test]
+    fn idle_wallpaper_rotation_loads_a_tagged_image_while_idle() {
+        let player = headless_player();
+        let images = player.image_store();
+        let stored = images.store(MINIMAL_PNG, "image/png").expect("store test image");
+        assert!(images.set_wallpaper(&stored.id, true), "id must be found");
+
+        wait_until(
+            &player.mpv,
+            |mpv| !mpv.get_property::<bool>("idle-active").unwrap_or(true),
+            "the idle-screen rotation to load the tagged wallpaper image",
+        );
+
+        assert_eq!(
+            player.status().state,
+            PlaybackState::Idle,
+            "a rotated wallpaper must still report Idle, not Playing"
+        );
+        assert_eq!(
+            player.idle_screen(),
+            Some(IdleScreen::Clock),
+            "the idle clock stays the current idle screen while a wallpaper rotates behind it"
         );
     }
 

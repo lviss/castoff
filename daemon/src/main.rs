@@ -1,9 +1,11 @@
 mod fcast;
 mod idle_screen;
+mod images;
 mod metadata;
 mod overlay;
 mod player;
 mod queue;
+mod upload;
 mod webpage;
 
 use std::net::SocketAddr;
@@ -18,9 +20,9 @@ use tokio::time::MissedTickBehavior;
 use tracing::{debug, error, info, warn};
 
 use fcast::{
-    Opcode, PlayMessage, PlaybackErrorMessage, PlaybackState, PlaybackUpdateMessage,
-    QueueJumpToIndexMessage, QueueStateMessage, SeekMessage, SetSpeedMessage, SetVolumeMessage,
-    VersionMessage,
+    ImageWallpaperUpdateMessage, Opcode, PlayMessage, PlaybackErrorMessage, PlaybackState,
+    PlaybackUpdateMessage, QueueJumpToIndexMessage, QueueStateMessage, SeekMessage,
+    SetImageWallpaperMessage, SetSpeedMessage, SetVolumeMessage, VersionMessage,
 };
 use player::Player;
 
@@ -92,6 +94,15 @@ async fn main() -> Result<()> {
 
     let player = Arc::new(Player::new()?);
     info!("mpv core ready");
+
+    let image_port: u16 = std::env::var("CASTOFF_IMAGE_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(upload::DEFAULT_UPLOAD_PORT);
+    // Own background thread, independent of the FCast TCP server above (see
+    // `upload.rs`'s doc comment for why images travel over their own HTTP
+    // port rather than a chunked FCast frame extension).
+    upload::spawn(player.image_store(), image_port)?;
 
     let listener = TcpListener::bind(addr).await?;
     info!(%addr, "FCast control server listening");
@@ -327,6 +338,22 @@ async fn dispatch(writer: &SharedWriter, player: &Arc<Player>, frame: fcast::Fra
             let p = Arc::clone(player);
             tokio::task::spawn_blocking(move || p.queue_clear()).await??;
             send_queue_state(writer, player).await
+        }
+        Opcode::SetImageWallpaper => {
+            let msg: SetImageWallpaperMessage = serde_json::from_slice(&frame.body)?;
+            info!(id = %msg.id, wallpaper = msg.wallpaper, "received SetImageWallpaper");
+            let p = Arc::clone(player);
+            let id = msg.id.clone();
+            let wallpaper = msg.wallpaper;
+            tokio::task::spawn_blocking(move || p.set_image_wallpaper(&id, wallpaper)).await??;
+            let reply = ImageWallpaperUpdateMessage {
+                generation_time: player::now_millis(),
+                id: msg.id,
+                wallpaper: msg.wallpaper,
+            };
+            let mut w = writer.lock().await;
+            fcast::write_message(&mut w.write, Opcode::ImageWallpaperUpdate, &reply).await?;
+            Ok(())
         }
         Opcode::Version => {
             debug!("received Version");

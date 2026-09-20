@@ -58,6 +58,19 @@ pub enum Opcode {
     /// (`QueueJumpToIndexMessage`), if in range; replies `QueueState`. A
     /// no-op (still replies) for an out-of-range index.
     QueueJumpToIndex = 19,
+    // --- castoff private extension: image wallpaper tagging. An uploaded
+    // image (see `upload.rs`'s `/images` HTTP endpoint -- a separate
+    // transport from this TCP framing, since FCast's own frame cap is 32 KiB,
+    // nowhere near enough for a phone photo) is tagged/untagged for
+    // idle-screen wallpaper rotation independent of the play queue; see
+    // README's "Image uploads (private extension)".
+    /// sender -> receiver: tag or untag a previously uploaded image (by the
+    /// id the upload endpoint returned) for idle-screen wallpaper rotation.
+    /// Replies with `ImageWallpaperUpdate`.
+    SetImageWallpaper = 20,
+    /// receiver -> sender: confirms the wallpaper tag `SetImageWallpaper`
+    /// just set.
+    ImageWallpaperUpdate = 21,
 }
 
 impl Opcode {
@@ -83,6 +96,8 @@ impl Opcode {
             17 => Opcode::QueueJumpBackward,
             18 => Opcode::ClearQueue,
             19 => Opcode::QueueJumpToIndex,
+            20 => Opcode::SetImageWallpaper,
+            21 => Opcode::ImageWallpaperUpdate,
             _ => return None,
         })
     }
@@ -331,6 +346,26 @@ pub struct QueueStateMessage {
 #[serde(rename_all = "camelCase")]
 pub struct QueueJumpToIndexMessage {
     pub index: usize,
+}
+
+/// castoff private extension (see `Opcode::SetImageWallpaper`): tag or untag
+/// an uploaded image (`id` is the id `upload.rs`'s `/images` endpoint
+/// returned) for idle-screen wallpaper rotation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetImageWallpaperMessage {
+    pub id: String,
+    pub wallpaper: bool,
+}
+
+/// castoff private extension: `SetImageWallpaper`'s reply, confirming the tag
+/// that was just set.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageWallpaperUpdateMessage {
+    pub generation_time: u64,
+    pub id: String,
+    pub wallpaper: bool,
 }
 
 #[cfg(test)]

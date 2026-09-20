@@ -8,27 +8,32 @@ scaffold: the TV-box daemon and its NixOS packaging. Nothing else exists yet -- 
 
 ## What works today
 
-Right now the supported playback sources are a direct media URL, YouTube, and a web page. Send
-the daemon an FCast `Play` command with a URL, and it works out what to do with it:
+Right now the supported playback sources are a direct media URL, YouTube, a web page, and an image
+uploaded from a phone. Send the daemon an FCast `Play` command with a URL, and it works out what to
+do with it:
 
 - a media URL -- a remote (`http(s)://`) or local (`file://`) file, or a `youtube.com`/`youtu.be`
   watch URL -- is loaded and played via mpv (see
   [How YouTube playback works](#how-youtube-playback-works));
 - a web page URL is displayed fullscreen in a real browser engine (Chromium) running as a second
   client of the same Cage session (see
-  [How webpage (dashboard) display works](#how-webpage-dashboard-display-works)).
+  [How webpage (dashboard) display works](#how-webpage-dashboard-display-works));
+- an image (uploaded via the daemon's own HTTP endpoint, e.g. from the Android app's Share flow)
+  is displayed fullscreen via mpv, held up indefinitely until the queue advances, and can also be
+  tagged to rotate through as the idle-screen wallpaper (see
+  [Image uploads (private extension)](#image-uploads-private-extension)).
 
-The daemon decides between those two itself -- it tries media first and hands the URL to the
-browser if that fails -- so a client only needs to know the URL. A sender that wants to be certain
-can still say so with FCast's `container` MIME type (`text/html` forces the browser, any other
-value forces mpv): see
+The daemon decides between media and a web page itself -- it tries media first and hands the URL to
+the browser if that fails -- so a client only needs to know the URL. A sender that wants to be
+certain can still say so with FCast's `container` MIME type (`text/html` forces the browser, any
+`image/*` value or any other value forces mpv): see
 [How the daemon decides between media and a web page](#how-the-daemon-decides-between-media-and-a-web-page).
 A `Play` that is still loading shows an on-screen spinner, and starts/stops are wrapped in a
 short fade (see
 [On-screen feedback](#on-screen-feedback-loading-indicator-and-startstop-fade)).
 
-That's it: no Jellyfin, no images. See [Not yet implemented](#not-yet-implemented-follow-up-work)
-below for what's planned but not built.
+That's it: no Jellyfin, no Immich/local-folder slideshows. See
+[Not yet implemented](#not-yet-implemented-follow-up-work) below for what's planned but not built.
 
 ## What's here
 
@@ -84,6 +89,8 @@ Implemented opcodes (all of FCast v2's playback-control surface):
 | `QueueJumpBackward` (17, private extension) | sender -> receiver | moves to the previous queue item, if any, and plays it; replies with `QueueState`. A no-op (still replies) at the first item |
 | `ClearQueue` (18, private extension) | sender -> receiver | empties the play queue, stopping playback first if its current item is actively playing; replies with `QueueState` |
 | `QueueJumpToIndex` (19, private extension) | sender -> receiver | moves straight to an arbitrary queue index (`QueueJumpToIndexMessage`) and plays it; replies with `QueueState`. A no-op (still replies) for an out-of-range index |
+| `SetImageWallpaper` (20, private extension) | sender -> receiver | tags or untags a previously-uploaded image (by the id the upload endpoint returned) for idle-screen wallpaper rotation; replies with `ImageWallpaperUpdate` (see [Image uploads (private extension)](#image-uploads-private-extension)) |
+| `ImageWallpaperUpdate` (21, private extension) | receiver -> sender | confirms the wallpaper tag `SetImageWallpaper` just set |
 
 Every connected sender keeps its FCast TCP connection open (`daemon/src/main.rs`'s
 `handle_connection` reads one persistent socket per sender, not a reconnect-per-command model),
@@ -161,6 +168,56 @@ length-prefixed-opcode-plus-JSON-body framing as every other message. See
   moved on to showing the idle clock), the daemon reverts the queue's position to whatever it was
   before -- the failed item stays in the queue, just no longer marked current.
 
+### Image uploads (private extension)
+
+Images shared from the Android app (or any other sender) don't fit through the FCast TCP
+connection at all: every FCast frame is capped at 32 KiB (see [Why FCast, and what's
+implemented](#why-fcast-and-whats-implemented) above), nowhere near enough for a phone photo. So an
+uploaded image travels over its own small local HTTP server instead of a new FCast frame format,
+and only the resulting id/URL crosses FCast, in an ordinary `Play`:
+
+- **Upload.** `POST /images` to the daemon on port `46900` (override with `CASTOFF_IMAGE_PORT`,
+  same pattern as `CASTOFF_PORT`) with the raw image bytes as the body and an `image/*`
+  `Content-Type` header -- one request per image; a multi-image share is one request per image, not
+  a batch endpoint. See [`daemon/src/upload.rs`](daemon/src/upload.rs). A non-`image/*` content
+  type or a body over 32 MiB is rejected (`400`/`413`); a successful upload replies `200` with:
+  ```json
+  {"id": "<stable id>", "url": "file://<path>", "container": "image/<type>"}
+  ```
+  `url`/`container` are already shaped for the sender to drop straight into a `Play` message (see
+  below); `id` is what a later `SetImageWallpaper` tags.
+- **Storage.** Each uploaded image is written under an `images/` subdirectory next to the queue's
+  own persistence file, using the same state-directory resolution as
+  `queue::default_state_path`/`Queue::save` (`CASTOFF_STATE_DIR`, then systemd's
+  `STATE_DIRECTORY`, then XDG's state-home convention) -- see
+  [`daemon/src/images.rs`](daemon/src/images.rs). Which images are tagged for wallpaper rotation is
+  tracked in a small JSON manifest (`images.json`) alongside them, following the same
+  write-then-rename/missing-file-loads-as-empty pattern `queue.rs` uses for the play queue.
+- **Displaying an uploaded image as a queue item.** The sender takes the upload response's `url`
+  and `container` and sends an ordinary `Play` -- no new opcode needed. An `image/*` `container` is
+  not a web MIME type, so it already routes to mpv like any other explicit media container (see
+  [How the daemon decides between media and a web page](#how-the-daemon-decides-between-media-and-a-web-page));
+  mpv displays it natively as a still image. The daemon sets mpv's `image-display-duration` to
+  infinite, so an image queue item sits up indefinitely -- exactly like a web page -- until the
+  queue is explicitly advanced, rather than auto-advancing on its own after mpv's unconfigured
+  5-second default. Multiple shared images become multiple queue entries, played through one at a
+  time like any other queue item (see [Queueing (private extension)](#queueing-private-extension)).
+- **Tagging an image for idle-screen wallpaper rotation.** `SetImageWallpaper` (opcode 20) tags or
+  untags a previously-uploaded image (by its `id`) for wallpaper rotation, independent of the play
+  queue; the daemon replies `ImageWallpaperUpdate` (opcode 21) confirming the tag. See
+  [`daemon/src/fcast.rs`](daemon/src/fcast.rs) for the exact `SetImageWallpaperMessage`/
+  `ImageWallpaperUpdateMessage` shapes.
+- **Idle-screen wallpaper rotation.** While idle (no active queue playback) and at least one image
+  is tagged, the idle clock's existing redraw timer also rotates the on-screen background through
+  the tagged images in random order (never immediately repeating the previous pick when more than
+  one is tagged), on a fixed one-minute cadence (`idle_screen::WALLPAPER_ROTATION_INTERVAL` -- one
+  named constant, so a future configurable-interval follow-up only needs to change it in one place;
+  not implemented now). The clock itself keeps drawing on top exactly as it does over the plain
+  black idle background -- rotating in a wallpaper never removes or replaces the clock. mpv's own
+  `idle-active` property goes false once a wallpaper image is loaded, but FCast clients still see
+  `PlaybackUpdate.state = Idle`: this is the idle screen, not content anyone asked to play. See
+  [`daemon/src/idle_screen.rs`](daemon/src/idle_screen.rs).
+
 ### How YouTube playback works
 
 A `Play` message's `url` can be a `youtube.com`/`youtu.be` watch URL, not just a direct media
@@ -214,9 +271,11 @@ A client only has to know a URL; the daemon decides what it is. The rules, in or
 
 1. **The sender said so.** FCast's `container` MIME type is an explicit override:
    `text/html` or `application/xhtml+xml` (case-insensitive, MIME parameters ignored) means the
-   browser engine; any other MIME type means mpv. Nothing is guessed and nothing falls
-   back -- a sender that classifies its URL keeps control either way (a `video/mp4` URL that
-   fails is an error, not a page).
+   browser engine; any other MIME type means mpv, including `image/*` -- an uploaded image (see
+   [Image uploads (private extension)](#image-uploads-private-extension)) is just another explicit
+   media container; mpv displays it natively as a still image, no separate code path. Nothing is
+   guessed and nothing falls back -- a sender that classifies its URL keeps control either way (a
+   `video/mp4` or `image/png` URL that fails is an error, not a page).
 2. **Otherwise the daemon tries media first, and falls back to the web page.** The URL goes to
    mpv, which is what makes YouTube, every other yt-dlp-supported source, and plain media work
    with no client help. If mpv reports the load failed *before it loaded the file* (an HTTP
@@ -387,7 +446,8 @@ what is measured here is the daemon's redraw cadence, which is what the animatio
 
 ```sh
 nix build .#castoff-daemon
-./result/bin/castoff-daemon        # listens on 0.0.0.0:46899 (override with CASTOFF_PORT)
+./result/bin/castoff-daemon        # FCast on 0.0.0.0:46899 (override with CASTOFF_PORT),
+                                    # image uploads on 0.0.0.0:46900 (override with CASTOFF_IMAGE_PORT)
 ```
 
 This works on any machine with Nix (no NixOS, no TV hardware needed) since it only needs
@@ -437,6 +497,28 @@ perl -e '
   my $body = q({"container":"text/html","url":"http://127.0.0.1:8000/dashboard.html"});
   print pack("V", length($body) + 1), chr(1), $body;
 ' | socat - TCP:127.0.0.1:46899 | xxd
+```
+
+or upload and display an image (see [Image uploads (private extension)](#image-uploads-private-extension)):
+
+```sh
+resp=$(curl -s -X POST --data-binary @photo.jpg -H 'Content-Type: image/jpeg' \
+  http://127.0.0.1:46900/images)
+echo "$resp"   # -> {"id":"...","url":"file://...","container":"image/jpeg"}
+
+# Feed the response's url/container straight into an ordinary Play:
+perl -e '
+  my $body = shift;
+  print pack("V", length($body) + 1), chr(1), $body;
+' "$(echo "$resp" | jq -c '{url, container}')" | socat - TCP:127.0.0.1:46899 | xxd
+
+# Tag that same id for idle-screen wallpaper rotation (opcode 20):
+id=$(echo "$resp" | jq -r .id)
+perl -e '
+  my $body = shift;
+  print pack("V", length($body) + 1), chr(20), $body;
+' "{\"id\":\"$id\",\"wallpaper\":true}" | socat - TCP:127.0.0.1:46899 | xxd
+# -> ImageWallpaperUpdate reply (opcode 21): {"generationTime":...,"id":"...","wallpaper":true}
 ```
 
 ### Whole-system checks
@@ -642,10 +724,11 @@ this scaffold yet, but they should carry forward into every later task on this c
   no active playback (at startup, after `Stop`, or after a clip reaches end-of-file with nothing
   queued next -- see [`daemon/src/idle_screen.rs`](daemon/src/idle_screen.rs)), the daemon shows
   an on-screen clock via mpv's own OSD instead of a black screen, redrawn on a ~1s
-  `std::thread::sleep` timer rather than a busy loop or a second rendering stack. `IdleScreen` is
-  a small seam (`Clock` is the only variant today) meant to grow a static-wallpaper variant later
-  without restructuring; web pages do not go through it, because a real engine cannot be an mpv
-  OSD overlay -- see [How webpage (dashboard) display works](#how-webpage-dashboard-display-works).
+  `std::thread::sleep` timer rather than a busy loop or a second rendering stack. That same timer
+  also rotates in an idle-screen wallpaper image when one is tagged (see
+  [Image uploads (private extension)](#image-uploads-private-extension)), rather than a second
+  timer of its own; web pages do not go through `IdleScreen` at all, because a real engine cannot be
+  an mpv OSD overlay -- see [How webpage (dashboard) display works](#how-webpage-dashboard-display-works).
   The loading spinner and the start/stop
   fade live in `daemon/src/overlay.rs` and follow the same rule: the spinner redraws at ~30
   frames/s only while a `Play` is genuinely in flight, stops the moment playback starts or the
@@ -669,10 +752,14 @@ this scaffold yet, but they should carry forward into every later task on this c
 Out of scope for this scaffold, deliberately:
 
 - Playback sources: Jellyfin (authenticated via Jellyfin's Quick Connect flow -- never a typed
-  password) and images from Immich or a local folder. (YouTube and web pages are implemented -- see
-  [How YouTube playback works](#how-youtube-playback-works) and
-  [How webpage (dashboard) display works](#how-webpage-dashboard-display-works).)
-- The native Android control app, including handling Android `Share` intents.
+  password) and a slideshow pulled from Immich or a local folder. (YouTube, web pages, and images
+  uploaded from a phone are implemented -- see
+  [How YouTube playback works](#how-youtube-playback-works),
+  [How webpage (dashboard) display works](#how-webpage-dashboard-display-works), and
+  [Image uploads (private extension)](#image-uploads-private-extension).)
+- The native Android control app, including handling Android `Share` intents and the upload
+  client for [Image uploads (private extension)](#image-uploads-private-extension)'s HTTP
+  endpoint -- the daemon-side upload contract exists, but nothing in this repo sends to it yet.
 - Appliance disk-image generation (e.g. via `nixos-generators`/`disko`) for a flashable image;
   today's `tv-box` configuration needs a real `fileSystems."/"` and bootloader target to install
   to actual hardware (the flake ships placeholder values for `nix flake check`/VM use).

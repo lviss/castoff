@@ -376,6 +376,37 @@ This file is the project's committed home for project-intrinsic agent knowledge:
     real boot. Entirely VM-only: `wlr-randr` and the udev rule are not part of the appliance's
     runtime closure, since the real box has no virtio-gpu resize event to react to.
 
+- Image uploads (`daemon/src/images.rs`, `daemon/src/upload.rs`) and idle-screen wallpaper
+  rotation (`daemon/src/idle_screen.rs`) reuse existing seams rather than adding new machinery --
+  see README's "Image uploads (private extension)" for the feature; these are the sharp edges that
+  were not obvious going in:
+  - `--image-display-duration=inf` (`Player::new`, see its own doc comment for why mpv's 5s default
+    is wrong for a queued/wallpaper image) has to be set in **both** `Player::new` and the test
+    suite's separate `headless_mpv()` constructor -- they are two independent
+    `Mpv::with_initializer` calls, not one shared init path, so a property added to only one is
+    silently absent from every test. Caught by `queued_image_is_held_up_indefinitely_not_a_fixed_duration_slideshow`
+    initially failing (the test's mpv reached EOF at ~5s and the eof watcher brought the idle clock
+    back) until `headless_mpv()` got the same property.
+  - The wallpaper rotation's own `loadfile` (a plain background-image swap, not a real `Play`)
+    still fires a genuine mpv `PlaybackRestart` event, which `handle_lifecycle_event` reacts to
+    unconditionally. This turns out to be harmless without any special-casing: `PlaybackOverlay::reveal`
+    early-returns when `is_active()` is false (true only during a real `Play`'s spinner/fade), so a
+    wallpaper's restart never runs the loading-overlay fade-out; `mark_restarted()` does still flip
+    `PlaybackOverlay::is_restarted`, but `Player::is_idle` only inspects that flag when
+    `idle.current()` is `None`, and it stays `Some(Clock)` throughout wallpaper rotation, so this
+    never affects whether a real `Play` interrupts vs. queues. Any *new* consumer of
+    `PlaybackRestart` should re-check this reasoning rather than assume it's still moot.
+  - mpv's `osd-overlay` stacks by recency, not id (see the loading-spinner entry above) -- so once a
+    wallpaper image is the video frame, the clock's own opaque background rect (used over the plain
+    black backdrop) would otherwise sit on top of and hide it. `IdleScreen::render_over_wallpaper`
+    clears that rect outright (`format="none"`, same as `IdleScreenController::hide`) instead of
+    drawing it at zero opacity, and draws only the clock text on top.
+  - The rotation timer's `loadfile` call takes `Player::operation`'s lock (now threaded into
+    `IdleScreenController::new`) around itself and re-checks `IdleScreen` generation/current *after*
+    acquiring it, not just before -- the same "operation lock serializes whole play/stop
+    operations" discipline `player.rs` already documents, extended to this timer so a real
+    `Play`/`Stop` racing the rotation can never be clobbered by a stale wallpaper swap.
+
 ## Maintaining this file
 
 Keep this file for knowledge useful to almost every future agent session in this project.
