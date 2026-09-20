@@ -22,6 +22,14 @@ tracing = "0.1"
 tracing-subscriber = "0.3"
 anyhow = "1"
 libc = "0.2"
+# Small synchronous HTTP server for the image upload endpoint (see
+# `daemon/src/upload.rs`): FCast's own TCP framing caps a frame at 32 KiB
+# (`fcast.rs`), nowhere near enough for a phone photo, so uploads get their
+# own tiny local HTTP port instead of a new FCast opcode. Chosen over pulling
+# in a full async web framework as a better fit for this crate's existing
+# minimal-dependency style; runs on its own thread, independent of the
+# tokio runtime the FCast server uses.
+tiny_http = "0.12"
 
 [dev-dependencies]
 # Only used by `tests/webpage_display.rs`, which decodes the compositor's

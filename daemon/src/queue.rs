@@ -222,8 +222,7 @@ impl Queue {
     }
 }
 
-/// Default queue persistence file: `queue.json` under the daemon's state
-/// directory, resolved (first match wins):
+/// The daemon's state directory, resolved (first match wins):
 /// 1. `CASTOFF_STATE_DIR` -- explicit override, matching this daemon's other
 ///    `CASTOFF_*` env knobs.
 /// 2. `STATE_DIRECTORY` -- set automatically by systemd when the unit
@@ -234,29 +233,34 @@ impl Queue {
 /// 4. `$HOME/.local/state/castoff` (XDG's own fallback for an unset
 ///    `XDG_STATE_HOME`).
 ///
-/// `None` when none of these resolve (no `HOME` either) -- the queue then
-/// stays in-memory only for that run; `Player::new` logs this once at
-/// startup rather than on every save.
-pub fn default_state_path() -> Option<PathBuf> {
+/// `None` when none of these resolve (no `HOME` either). Shared by
+/// `default_state_path` (the queue's own JSON file) and `images.rs`'s
+/// `default_images_dir`/`default_manifest_path`, so there is one
+/// state-directory knob for the whole daemon, not one per subsystem.
+pub fn default_state_dir() -> Option<PathBuf> {
     if let Ok(dir) = std::env::var("CASTOFF_STATE_DIR") {
-        return Some(PathBuf::from(dir).join(STATE_FILE_NAME));
+        return Some(PathBuf::from(dir));
     }
     if let Ok(dirs) = std::env::var("STATE_DIRECTORY") {
         if let Some(first) = dirs.split(':').find(|s| !s.is_empty()) {
-            return Some(PathBuf::from(first).join(STATE_FILE_NAME));
+            return Some(PathBuf::from(first));
         }
     }
     if let Ok(xdg) = std::env::var("XDG_STATE_HOME") {
-        return Some(PathBuf::from(xdg).join("castoff").join(STATE_FILE_NAME));
+        return Some(PathBuf::from(xdg).join("castoff"));
     }
     if let Ok(home) = std::env::var("HOME") {
-        return Some(
-            PathBuf::from(home)
-                .join(".local/state/castoff")
-                .join(STATE_FILE_NAME),
-        );
+        return Some(PathBuf::from(home).join(".local/state/castoff"));
     }
     None
+}
+
+/// Default queue persistence file: `queue.json` under [`default_state_dir`].
+/// `None` when that resolves to nothing -- the queue then stays in-memory
+/// only for that run; `Player::new` logs this once at startup rather than on
+/// every save.
+pub fn default_state_path() -> Option<PathBuf> {
+    default_state_dir().map(|dir| dir.join(STATE_FILE_NAME))
 }
 
 #[cfg(test)]
