@@ -235,8 +235,8 @@ impl Queue {
 ///
 /// `None` when none of these resolve (no `HOME` either). Shared by
 /// `default_state_path` (the queue's own JSON file) and `images.rs`'s
-/// `default_images_dir`/`default_manifest_path`, so there is one
-/// state-directory knob for the whole daemon, not one per subsystem.
+/// `ImageStore::from_env`, so there is one state-directory knob for the
+/// whole daemon, not one per subsystem.
 pub fn default_state_dir() -> Option<PathBuf> {
     if let Ok(dir) = std::env::var("CASTOFF_STATE_DIR") {
         return Some(PathBuf::from(dir));

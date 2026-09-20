@@ -14,7 +14,7 @@ use tracing::{debug, error, warn};
 use crate::fcast::{
     PlayMessage, PlayTarget, PlaybackState, PlaybackUpdateMessage, QueueStateMessage,
 };
-use crate::idle_screen::{IdleScreen, IdleScreenController};
+use crate::idle_screen::{IdleScreen, IdleScreenController, OnChange};
 use crate::images::ImageStore;
 use crate::overlay::PlaybackOverlay;
 use crate::queue::Queue;
@@ -475,7 +475,7 @@ impl Player {
         // (rather than capturing an `Arc<IdleScreenController>`) for the same
         // reason `on_eof` does: this closure is built and threaded into
         // `IdleScreenController::new` below, before that controller exists.
-        let on_change: Arc<dyn Fn(&IdleScreenController) + Send + Sync> = {
+        let on_change: OnChange = {
             let status_tx = status_tx.clone();
             let mpv = Arc::clone(&mpv);
             let webpage = Arc::clone(&webpage);

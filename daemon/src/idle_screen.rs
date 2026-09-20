@@ -52,6 +52,9 @@ const CLOCK_FONT_SIZE: i64 = 356;
 /// See `IdleScreenController`'s `on_eof` field.
 pub(crate) type OnEof = Arc<dyn Fn(&IdleScreenController) -> bool + Send + Sync>;
 
+/// See `IdleScreenController`'s `on_change` field.
+pub(crate) type OnChange = Arc<dyn Fn(&IdleScreenController) + Send + Sync>;
+
 /// See `IdleScreenController`'s `on_wallpaper_tick` field.
 pub(crate) type OnWallpaperTick = Arc<dyn Fn() -> Option<PathBuf> + Send + Sync>;
 
@@ -199,7 +202,7 @@ pub(crate) struct IdleScreenController {
     /// controller exists (see `Player::build`). A plain callback, not a
     /// `PlaybackUpdateMessage` sender directly, so this module doesn't need
     /// to know about FCast message types.
-    on_change: Option<Arc<dyn Fn(&IdleScreenController) + Send + Sync>>,
+    on_change: Option<OnChange>,
     /// Called by the eof watcher when mpv reaches end-of-file on its own,
     /// *before* it would otherwise show the idle screen -- lets `Player` try
     /// to advance the play queue instead (see `player.rs`'s queue
@@ -223,7 +226,7 @@ impl IdleScreenController {
     pub(crate) fn new(
         mpv: Arc<Mpv>,
         operation: Arc<Mutex<()>>,
-        on_change: Option<Arc<dyn Fn(&IdleScreenController) + Send + Sync>>,
+        on_change: Option<OnChange>,
         on_eof: Option<OnEof>,
         on_wallpaper_tick: Option<OnWallpaperTick>,
     ) -> Self {
