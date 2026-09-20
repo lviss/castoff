@@ -1296,6 +1296,11 @@ fn run_metadata_lookup(
 /// instance, via this newly-introduced concurrency source rather than the
 /// first two). Running the lookup inline for tests removes that thread
 /// entirely rather than racing to join it.
+// Arg count predates this change (pre-existing YouTube-metadata feature) and
+// grew past clippy's default threshold when `id` was added for entry-identity
+// tracking; bundling these into a struct is a real signature refactor left
+// for a future pass, not a mechanical lint fix.
+#[allow(clippy::too_many_arguments)]
 fn spawn_metadata_lookup(
     msg: &PlayMessage,
     index: usize,
