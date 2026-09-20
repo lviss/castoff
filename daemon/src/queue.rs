@@ -57,8 +57,8 @@ impl Queue {
 
     /// Record the title/length resolved for the item at `index` (see
     /// `player.rs`'s `spawn_metadata_lookup`). A no-op if `index` is out of
-    /// range -- items are never removed today, but a lookup that resolves
-    /// after this queue was somehow rebuilt shorter must not panic.
+    /// range -- e.g. `clear` emptied the queue, or it was otherwise rebuilt
+    /// shorter, while the lookup was still in flight; it must not panic.
     pub fn set_metadata(
         &mut self,
         index: usize,
@@ -103,6 +103,26 @@ impl Queue {
         let prev = self.position?.checked_sub(1)?;
         self.position = Some(prev);
         self.items.get(prev).map(|entry| &entry.message)
+    }
+
+    /// Move directly to the item at `index` and return it. Same "no-op past
+    /// the edge" contract as `jump_forward`/`jump_backward`: an out-of-range
+    /// index (e.g. a sender tapping a stale queue list) leaves `position`
+    /// unchanged and returns `None` rather than panicking or erroring.
+    pub fn jump_to(&mut self, index: usize) -> Option<&PlayMessage> {
+        if index >= self.items.len() {
+            return None;
+        }
+        self.position = Some(index);
+        self.items.get(index).map(|entry| &entry.message)
+    }
+
+    /// Empty the queue and forget the current position -- see
+    /// `Player::queue_clear`. The first operation that actually removes
+    /// items from the queue (see the module doc comment).
+    pub fn clear(&mut self) {
+        self.items.clear();
+        self.position = None;
     }
 
     /// This queue's state as the wire shape sent to FCast senders (see
@@ -269,6 +289,48 @@ mod tests {
             Some(0),
             "position must not move before the start"
         );
+    }
+
+    #[test]
+    fn jump_to_moves_directly_to_a_valid_index() {
+        let mut queue = Queue::default();
+        queue.push(item("a"));
+        queue.push(item("b"));
+        queue.push(item("c"));
+        queue.set_position(Some(0));
+
+        assert_eq!(
+            queue.jump_to(2).and_then(|i| i.url.clone()),
+            Some("c".to_string())
+        );
+        assert_eq!(queue.position(), Some(2));
+    }
+
+    #[test]
+    fn jump_to_an_out_of_range_index_is_a_no_op() {
+        let mut queue = Queue::default();
+        queue.push(item("a"));
+        queue.set_position(Some(0));
+
+        assert!(queue.jump_to(5).is_none());
+        assert_eq!(
+            queue.position(),
+            Some(0),
+            "position must not move for an out-of-range index"
+        );
+    }
+
+    #[test]
+    fn clear_empties_items_and_resets_position() {
+        let mut queue = Queue::default();
+        queue.push(item("a"));
+        queue.push(item("b"));
+        queue.set_position(Some(1));
+
+        queue.clear();
+
+        assert_eq!(queue.position(), None);
+        assert!(queue.to_state_message().items.is_empty());
     }
 
     #[test]
