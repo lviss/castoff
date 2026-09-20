@@ -32,6 +32,10 @@ struct QueueEntry {
     title: Option<String>,
     #[serde(default)]
     duration_secs: Option<f64>,
+    /// Stable identity for this entry, distinct from its (reusable) vector
+    /// index -- see `Queue::push` and `set_metadata`.
+    #[serde(default)]
+    id: u64,
 }
 
 /// The play queue: every item ever queued, in queue order, plus the index of
@@ -40,34 +44,53 @@ struct QueueEntry {
 pub struct Queue {
     items: Vec<QueueEntry>,
     position: Option<usize>,
+    /// Counter handed out (and bumped) by `push`, so each entry gets an id
+    /// distinct from every other entry ever pushed, including ones a later
+    /// `clear` removed. Needed because `clear` (unlike every prior queue
+    /// mutation) can make a vector index vacant and then have a later `push`
+    /// reuse it -- an in-flight `spawn_metadata_lookup` for the cleared
+    /// entry must not mistake the new entry at that index for the old one it
+    /// was resolving (see `set_metadata`).
+    #[serde(default)]
+    next_id: u64,
 }
 
 impl Queue {
-    /// Append `item` to the queue and return its index. Its title/length
-    /// start absent -- `player.rs`'s `spawn_metadata_lookup` fills them in
-    /// later via `set_metadata`, if at all.
-    pub fn push(&mut self, item: PlayMessage) -> usize {
+    /// Append `item` to the queue and return its index and id. Its
+    /// title/length start absent -- `player.rs`'s `spawn_metadata_lookup`
+    /// fills them in later via `set_metadata`, if at all.
+    pub fn push(&mut self, item: PlayMessage) -> (usize, u64) {
+        let id = self.next_id;
+        self.next_id += 1;
         self.items.push(QueueEntry {
             message: item,
             title: None,
             duration_secs: None,
+            id,
         });
-        self.items.len() - 1
+        (self.items.len() - 1, id)
     }
 
-    /// Record the title/length resolved for the item at `index` (see
+    /// Record the title/length resolved for the item at `index`, as long as
+    /// it's still the same entry the lookup was launched for (see
     /// `player.rs`'s `spawn_metadata_lookup`). A no-op if `index` is out of
     /// range -- e.g. `clear` emptied the queue, or it was otherwise rebuilt
-    /// shorter, while the lookup was still in flight; it must not panic.
+    /// shorter, while the lookup was still in flight -- or if `index` now
+    /// holds a different entry than `id` identifies, e.g. a `clear` followed
+    /// by a `push` that reused the same now-vacant index; it must not panic
+    /// or overwrite an unrelated entry either way.
     pub fn set_metadata(
         &mut self,
         index: usize,
+        id: u64,
         title: Option<String>,
         duration_secs: Option<f64>,
     ) {
         if let Some(entry) = self.items.get_mut(index) {
-            entry.title = title;
-            entry.duration_secs = duration_secs;
+            if entry.id == id {
+                entry.title = title;
+                entry.duration_secs = duration_secs;
+            }
         }
     }
 

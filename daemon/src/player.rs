@@ -757,9 +757,10 @@ impl Player {
         let should_play_now = self.is_idle();
         let mut rollback = None;
         let index;
+        let id;
         {
             let mut queue = self.queue.lock().unwrap();
-            index = queue.push(msg.clone());
+            (index, id) = queue.push(msg.clone());
             if should_play_now {
                 rollback = Some(QueueRollback {
                     index,
@@ -773,6 +774,7 @@ impl Player {
         spawn_metadata_lookup(
             msg,
             index,
+            id,
             &self.ytdlp_program,
             &self.queue,
             self.state_path.as_deref(),
@@ -1255,12 +1257,16 @@ fn revert_queue_position(
 /// actually played (e.g. its own load later fails and
 /// `revert_queue_position` moves `position` back): nothing but `Queue::clear`
 /// ever removes an item, so short of that the entry the lookup was resolving
-/// for is always still there to update -- and a lookup that resolves after a
-/// `clear` just finds `index` out of range, which `set_metadata` already
-/// treats as a no-op.
+/// for is always still there to update. A lookup that resolves after a
+/// `clear` finds `index` out of range, which `set_metadata` treats as a
+/// no-op; `id` (the entry's identity from `Queue::push`, distinct from the
+/// reusable `index`) additionally catches a `clear` followed by a `push`
+/// that reused the same index for an unrelated entry, so that case is a
+/// no-op too instead of overwriting the wrong item's metadata.
 fn run_metadata_lookup(
     url: &str,
     index: usize,
+    id: u64,
     ytdlp_program: &str,
     queue: &Arc<Mutex<Queue>>,
     state_path: Option<&Path>,
@@ -1270,7 +1276,7 @@ fn run_metadata_lookup(
         return;
     };
     let mut queue = queue.lock().unwrap();
-    queue.set_metadata(index, metadata.title, metadata.duration_secs);
+    queue.set_metadata(index, id, metadata.title, metadata.duration_secs);
     queue.save(state_path);
     let _ = queue_tx.send_replace(queue.to_state_message());
 }
@@ -1293,6 +1299,7 @@ fn run_metadata_lookup(
 fn spawn_metadata_lookup(
     msg: &PlayMessage,
     index: usize,
+    id: u64,
     ytdlp_program: &str,
     queue: &Arc<Mutex<Queue>>,
     state_path: Option<&Path>,
@@ -1304,7 +1311,7 @@ fn spawn_metadata_lookup(
         return;
     }
     if inline {
-        run_metadata_lookup(&url, index, ytdlp_program, queue, state_path, queue_tx);
+        run_metadata_lookup(&url, index, id, ytdlp_program, queue, state_path, queue_tx);
         return;
     }
     let program = ytdlp_program.to_string();
@@ -1312,7 +1319,15 @@ fn spawn_metadata_lookup(
     let state_path = state_path.map(Path::to_path_buf);
     let queue_tx = queue_tx.clone();
     std::thread::spawn(move || {
-        run_metadata_lookup(&url, index, &program, &queue, state_path.as_deref(), &queue_tx);
+        run_metadata_lookup(
+            &url,
+            index,
+            id,
+            &program,
+            &queue,
+            state_path.as_deref(),
+            &queue_tx,
+        );
     });
 }
 
