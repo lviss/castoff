@@ -637,6 +637,42 @@ impl Player {
         self.play_jumped_item(item, previous)
     }
 
+    /// Jump straight to an arbitrary queue index (see `queue::Queue::jump_to`)
+    /// and, if that index is in range, play it -- what the Android task's
+    /// tappable queue list calls (`Opcode::QueueJumpToIndex` in `main.rs`).
+    /// Same shape and rollback-on-failed-load contract as `queue_jump_forward`/
+    /// `queue_jump_backward`, including a no-op (not an error) for an
+    /// out-of-range index.
+    pub fn queue_jump_to_index(&self, index: usize) -> Result<()> {
+        let _operation = self.operation.lock().unwrap();
+        let mut queue = self.queue.lock().unwrap();
+        let previous = queue.position();
+        let item = queue.jump_to(index).cloned();
+        drop(queue);
+        self.play_jumped_item(item, previous)
+    }
+
+    /// Empty the play queue (see `queue::Queue::clear`) -- what the Android
+    /// task's "clear queue" button calls (`Opcode::ClearQueue` in `main.rs`).
+    /// Always stops playback first -- same visible effect as `Opcode::Stop`
+    /// -- since clearing leaves nothing in the queue left to be "current".
+    /// `is_idle()` is deliberately permissive about a still-loading item (it
+    /// exists so `play()` can let a fresh `Play` interrupt an in-flight
+    /// load), which would wrongly treat a load already claimed as the
+    /// queue's current position as nothing-to-stop; `stop_locked()` already
+    /// has its own `already_idle` check to avoid blinking the idle clock
+    /// when genuinely idle, so it's safe to call unconditionally here. Then
+    /// persist and publish the (now empty) queue, the same push-on-change
+    /// model every other queue mutation uses.
+    pub fn queue_clear(&self) -> Result<()> {
+        let _operation = self.operation.lock().unwrap();
+        self.stop_locked()?;
+        self.queue.lock().unwrap().clear();
+        self.persist_queue();
+        self.publish_queue_state();
+        Ok(())
+    }
+
     /// Shared tail of `queue_jump_forward`/`queue_jump_backward`: publish the
     /// queue's new position and, if a jump actually moved somewhere, play it.
     /// Called with `self.operation` already held. `previous` is the position
@@ -721,9 +757,10 @@ impl Player {
         let should_play_now = self.is_idle();
         let mut rollback = None;
         let index;
+        let id;
         {
             let mut queue = self.queue.lock().unwrap();
-            index = queue.push(msg.clone());
+            (index, id) = queue.push(msg.clone());
             if should_play_now {
                 rollback = Some(QueueRollback {
                     index,
@@ -737,6 +774,7 @@ impl Player {
         spawn_metadata_lookup(
             msg,
             index,
+            id,
             &self.ytdlp_program,
             &self.queue,
             self.state_path.as_deref(),
@@ -804,6 +842,13 @@ impl Player {
     /// no-op branch here is what keeps that path structurally out of reach.
     pub fn stop(&self) -> Result<()> {
         let _operation = self.operation.lock().unwrap();
+        self.stop_locked()
+    }
+
+    /// `stop`'s body, for callers (`queue_clear`) that already hold
+    /// `self.operation` and would deadlock re-acquiring it through `stop`
+    /// itself.
+    fn stop_locked(&self) -> Result<()> {
         // A `Play` still being decided is over too: without this, an error
         // arriving for it right after a `Stop` would open the browser on a
         // cast the sender already stopped. The entries are cancelled, not
@@ -1210,12 +1255,18 @@ fn revert_queue_position(
 /// `yt-dlp` erroring) just leaves the fields absent rather than touching the
 /// queue entry at all. `index` stays valid even if the item is never
 /// actually played (e.g. its own load later fails and
-/// `revert_queue_position` moves `position` back): items are never removed
-/// from the queue, only reordered by position, so the entry the lookup was
-/// resolving for is always still there to update.
+/// `revert_queue_position` moves `position` back): nothing but `Queue::clear`
+/// ever removes an item, so short of that the entry the lookup was resolving
+/// for is always still there to update. A lookup that resolves after a
+/// `clear` finds `index` out of range, which `set_metadata` treats as a
+/// no-op; `id` (the entry's identity from `Queue::push`, distinct from the
+/// reusable `index`) additionally catches a `clear` followed by a `push`
+/// that reused the same index for an unrelated entry, so that case is a
+/// no-op too instead of overwriting the wrong item's metadata.
 fn run_metadata_lookup(
     url: &str,
     index: usize,
+    id: u64,
     ytdlp_program: &str,
     queue: &Arc<Mutex<Queue>>,
     state_path: Option<&Path>,
@@ -1225,7 +1276,7 @@ fn run_metadata_lookup(
         return;
     };
     let mut queue = queue.lock().unwrap();
-    queue.set_metadata(index, metadata.title, metadata.duration_secs);
+    queue.set_metadata(index, id, metadata.title, metadata.duration_secs);
     queue.save(state_path);
     let _ = queue_tx.send_replace(queue.to_state_message());
 }
@@ -1245,9 +1296,15 @@ fn run_metadata_lookup(
 /// instance, via this newly-introduced concurrency source rather than the
 /// first two). Running the lookup inline for tests removes that thread
 /// entirely rather than racing to join it.
+// Arg count predates this change (pre-existing YouTube-metadata feature) and
+// grew past clippy's default threshold when `id` was added for entry-identity
+// tracking; bundling these into a struct is a real signature refactor left
+// for a future pass, not a mechanical lint fix.
+#[allow(clippy::too_many_arguments)]
 fn spawn_metadata_lookup(
     msg: &PlayMessage,
     index: usize,
+    id: u64,
     ytdlp_program: &str,
     queue: &Arc<Mutex<Queue>>,
     state_path: Option<&Path>,
@@ -1259,7 +1316,7 @@ fn spawn_metadata_lookup(
         return;
     }
     if inline {
-        run_metadata_lookup(&url, index, ytdlp_program, queue, state_path, queue_tx);
+        run_metadata_lookup(&url, index, id, ytdlp_program, queue, state_path, queue_tx);
         return;
     }
     let program = ytdlp_program.to_string();
@@ -1267,7 +1324,15 @@ fn spawn_metadata_lookup(
     let state_path = state_path.map(Path::to_path_buf);
     let queue_tx = queue_tx.clone();
     std::thread::spawn(move || {
-        run_metadata_lookup(&url, index, &program, &queue, state_path.as_deref(), &queue_tx);
+        run_metadata_lookup(
+            &url,
+            index,
+            id,
+            &program,
+            &queue,
+            state_path.as_deref(),
+            &queue_tx,
+        );
     });
 }
 
@@ -3798,6 +3863,154 @@ mod tests {
             .queue_jump_backward()
             .expect("jump backward at the start is a no-op");
         assert_eq!(player.queue_state().current_index, Some(0));
+    }
+
+    /// `QueueJumpToIndex` (`Player::queue_jump_to_index`) moves straight to
+    /// any in-range index in one call, not just one step at a time like
+    /// `QueueJumpForward`/`QueueJumpBackward`.
+    #[test]
+    fn queue_jump_to_index_moves_directly_to_a_valid_index() {
+        let player = headless_player();
+        let clip = || PlayMessage {
+            url: Some("av://lavfi:testsrc=size=64x64:rate=10:duration=30".to_string()),
+            ..Default::default()
+        };
+        player.play(&clip()).expect("first play");
+        wait_until(
+            &player.mpv,
+            |mpv| mpv.get_property::<f64>("time-pos").unwrap_or(0.0) > 0.05,
+            "the first clip to start playing",
+        );
+        player.play(&clip()).expect("second play enqueues");
+        player.play(&clip()).expect("third play enqueues");
+        assert_eq!(player.queue_state().current_index, Some(0));
+
+        player
+            .queue_jump_to_index(2)
+            .expect("jump straight to the third item");
+        assert_eq!(player.queue_state().current_index, Some(2));
+    }
+
+    /// Jumping to the index that is already current is in range, so per
+    /// `Queue::jump_to`'s contract (mirroring `jump_forward`/`jump_backward`:
+    /// only an out-of-range index is a no-op) it sets the position again and
+    /// replays that item, rather than being treated as a no-op -- confirmed
+    /// here by observing playback actually restart.
+    #[test]
+    fn queue_jump_to_the_current_index_safely_replays_it() {
+        let player = headless_player();
+        let clip = || PlayMessage {
+            url: Some("av://lavfi:testsrc=size=64x64:rate=10:duration=30".to_string()),
+            ..Default::default()
+        };
+        player.play(&clip()).expect("first play");
+        wait_until(
+            &player.mpv,
+            |mpv| mpv.get_property::<f64>("time-pos").unwrap_or(0.0) > 1.0,
+            "the clip to play past its first second",
+        );
+        assert_eq!(player.queue_state().current_index, Some(0));
+
+        player
+            .queue_jump_to_index(0)
+            .expect("jump to the already-current index");
+        assert_eq!(
+            player.queue_state().current_index,
+            Some(0),
+            "the position does not change when re-jumping to itself"
+        );
+        wait_until(
+            &player.mpv,
+            |mpv| mpv.get_property::<f64>("time-pos").unwrap_or(f64::MAX) < 1.0,
+            "playback to restart from the beginning",
+        );
+    }
+
+    /// An out-of-range `QueueJumpToIndex` is a no-op, not an error -- same
+    /// contract as `jump_forward`/`jump_backward` past either edge.
+    #[test]
+    fn queue_jump_to_out_of_range_index_is_a_no_op() {
+        let player = headless_player();
+        let clip = PlayMessage {
+            url: Some("av://lavfi:testsrc=size=64x64:rate=10:duration=30".to_string()),
+            ..Default::default()
+        };
+        player.play(&clip).expect("first play");
+        wait_until(
+            &player.mpv,
+            |mpv| mpv.get_property::<f64>("time-pos").unwrap_or(0.0) > 0.05,
+            "the clip to start playing",
+        );
+
+        player
+            .queue_jump_to_index(5)
+            .expect("an out-of-range jump is a no-op, not an error");
+        assert_eq!(
+            player.queue_state().current_index,
+            Some(0),
+            "position must not move for an out-of-range index"
+        );
+    }
+
+    /// `ClearQueue` (`Player::queue_clear`) with nothing playing just empties
+    /// the queue -- there is no active playback to stop.
+    #[test]
+    fn clearing_the_queue_with_nothing_playing_just_empties_it() {
+        let player = headless_player();
+        let clip = PlayMessage {
+            url: Some("av://lavfi:testsrc=size=64x64:rate=10:duration=30".to_string()),
+            ..Default::default()
+        };
+        player.play(&clip).expect("play");
+        wait_until(
+            &player.mpv,
+            |mpv| mpv.get_property::<f64>("time-pos").unwrap_or(0.0) > 0.05,
+            "the clip to start playing",
+        );
+        player.stop().expect("stop");
+        wait_until_idle_screen(&player, Some(IdleScreen::Clock), "idle clock after stop");
+
+        player.queue_clear().expect("clear an idle queue");
+
+        let state = player.queue_state();
+        assert!(state.items.is_empty(), "queue must be empty after clear");
+        assert_eq!(state.current_index, None);
+        assert_eq!(
+            player.idle_screen(),
+            Some(IdleScreen::Clock),
+            "clearing an already-idle queue must not disturb the idle clock"
+        );
+    }
+
+    /// Clearing the queue while its current item is actively playing must
+    /// stop playback first -- mpv returning to idle is the visible effect,
+    /// since after the clear there is nothing left in the queue to be
+    /// "current".
+    #[test]
+    fn clearing_the_queue_mid_playback_stops_playback() {
+        let player = headless_player();
+        let clip = PlayMessage {
+            url: Some("av://lavfi:testsrc=size=64x64:rate=10:duration=30".to_string()),
+            ..Default::default()
+        };
+        player.play(&clip).expect("play");
+        wait_until(
+            &player.mpv,
+            |mpv| mpv.get_property::<f64>("time-pos").unwrap_or(0.0) > 0.05,
+            "the clip to start playing",
+        );
+        assert_eq!(player.idle_screen(), None, "clip must be actively playing");
+
+        player.queue_clear().expect("clear a playing queue");
+
+        wait_until_idle_screen(
+            &player,
+            Some(IdleScreen::Clock),
+            "idle clock after clearing mid-playback",
+        );
+        let state = player.queue_state();
+        assert!(state.items.is_empty(), "queue must be empty after clear");
+        assert_eq!(state.current_index, None);
     }
 
     /// A queued YouTube URL must eventually report a non-empty title and

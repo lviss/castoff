@@ -19,7 +19,8 @@ use tracing::{debug, error, info, warn};
 
 use fcast::{
     Opcode, PlayMessage, PlaybackErrorMessage, PlaybackState, PlaybackUpdateMessage,
-    QueueStateMessage, SeekMessage, SetSpeedMessage, SetVolumeMessage, VersionMessage,
+    QueueJumpToIndexMessage, QueueStateMessage, SeekMessage, SetSpeedMessage, SetVolumeMessage,
+    VersionMessage,
 };
 use player::Player;
 
@@ -312,6 +313,19 @@ async fn dispatch(writer: &SharedWriter, player: &Arc<Player>, frame: fcast::Fra
             info!("received QueueJumpBackward");
             let p = Arc::clone(player);
             tokio::task::spawn_blocking(move || p.queue_jump_backward()).await??;
+            send_queue_state(writer, player).await
+        }
+        Opcode::QueueJumpToIndex => {
+            let msg: QueueJumpToIndexMessage = serde_json::from_slice(&frame.body)?;
+            info!(index = msg.index, "received QueueJumpToIndex");
+            let p = Arc::clone(player);
+            tokio::task::spawn_blocking(move || p.queue_jump_to_index(msg.index)).await??;
+            send_queue_state(writer, player).await
+        }
+        Opcode::ClearQueue => {
+            info!("received ClearQueue");
+            let p = Arc::clone(player);
+            tokio::task::spawn_blocking(move || p.queue_clear()).await??;
             send_queue_state(writer, player).await
         }
         Opcode::Version => {
@@ -778,6 +792,23 @@ mod tests {
             .await
             .expect("send QueueJumpBackward");
         read_queue_state_until(&mut client, Some(0)).await;
+
+        let jump = QueueJumpToIndexMessage { index: 1 };
+        let body = serde_json::to_vec(&jump).expect("encode QueueJumpToIndex");
+        fcast::write_frame(&mut client, Opcode::QueueJumpToIndex, &body)
+            .await
+            .expect("send QueueJumpToIndex");
+        read_queue_state_until(&mut client, Some(1)).await;
+
+        fcast::write_empty(&mut client, Opcode::ClearQueue)
+            .await
+            .expect("send ClearQueue");
+        // Same two-frames-per-mutation hazard as a jump (see
+        // `read_queue_state_until`'s doc comment): wait for the frame that
+        // actually reports the cleared position rather than trusting a 1:1
+        // command/frame correspondence.
+        let state = read_queue_state_until(&mut client, None).await;
+        assert!(state.items.is_empty(), "queue must be empty after ClearQueue");
 
         client.shutdown().await.ok();
     }

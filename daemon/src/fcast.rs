@@ -51,6 +51,13 @@ pub enum Opcode {
     /// sender -> receiver: move to the previous queue item, if any; replies
     /// `QueueState`. A no-op (still replies) when already on the first item.
     QueueJumpBackward = 17,
+    /// sender -> receiver: empty the play queue, stopping playback first if
+    /// its current item is actively playing; replies `QueueState`.
+    ClearQueue = 18,
+    /// sender -> receiver: move straight to an arbitrary queue index
+    /// (`QueueJumpToIndexMessage`), if in range; replies `QueueState`. A
+    /// no-op (still replies) for an out-of-range index.
+    QueueJumpToIndex = 19,
 }
 
 impl Opcode {
@@ -74,6 +81,8 @@ impl Opcode {
             15 => Opcode::QueueState,
             16 => Opcode::QueueJumpForward,
             17 => Opcode::QueueJumpBackward,
+            18 => Opcode::ClearQueue,
+            19 => Opcode::QueueJumpToIndex,
             _ => return None,
         })
     }
@@ -313,6 +322,15 @@ pub struct QueueStateMessage {
     /// has ever played from it yet.
     #[serde(default)]
     pub current_index: Option<usize>,
+}
+
+/// castoff private extension (see `Opcode::QueueJumpToIndex`): the queue
+/// index a sender wants to jump straight to, e.g. a tap on an item in the
+/// Android app's queue list.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QueueJumpToIndexMessage {
+    pub index: usize,
 }
 
 #[cfg(test)]

@@ -32,6 +32,10 @@ struct QueueEntry {
     title: Option<String>,
     #[serde(default)]
     duration_secs: Option<f64>,
+    /// Stable identity for this entry, distinct from its (reusable) vector
+    /// index -- see `Queue::push` and `set_metadata`.
+    #[serde(default)]
+    id: u64,
 }
 
 /// The play queue: every item ever queued, in queue order, plus the index of
@@ -40,34 +44,53 @@ struct QueueEntry {
 pub struct Queue {
     items: Vec<QueueEntry>,
     position: Option<usize>,
+    /// Counter handed out (and bumped) by `push`, so each entry gets an id
+    /// distinct from every other entry ever pushed, including ones a later
+    /// `clear` removed. Needed because `clear` (unlike every prior queue
+    /// mutation) can make a vector index vacant and then have a later `push`
+    /// reuse it -- an in-flight `spawn_metadata_lookup` for the cleared
+    /// entry must not mistake the new entry at that index for the old one it
+    /// was resolving (see `set_metadata`).
+    #[serde(default)]
+    next_id: u64,
 }
 
 impl Queue {
-    /// Append `item` to the queue and return its index. Its title/length
-    /// start absent -- `player.rs`'s `spawn_metadata_lookup` fills them in
-    /// later via `set_metadata`, if at all.
-    pub fn push(&mut self, item: PlayMessage) -> usize {
+    /// Append `item` to the queue and return its index and id. Its
+    /// title/length start absent -- `player.rs`'s `spawn_metadata_lookup`
+    /// fills them in later via `set_metadata`, if at all.
+    pub fn push(&mut self, item: PlayMessage) -> (usize, u64) {
+        let id = self.next_id;
+        self.next_id += 1;
         self.items.push(QueueEntry {
             message: item,
             title: None,
             duration_secs: None,
+            id,
         });
-        self.items.len() - 1
+        (self.items.len() - 1, id)
     }
 
-    /// Record the title/length resolved for the item at `index` (see
+    /// Record the title/length resolved for the item at `index`, as long as
+    /// it's still the same entry the lookup was launched for (see
     /// `player.rs`'s `spawn_metadata_lookup`). A no-op if `index` is out of
-    /// range -- items are never removed today, but a lookup that resolves
-    /// after this queue was somehow rebuilt shorter must not panic.
+    /// range -- e.g. `clear` emptied the queue, or it was otherwise rebuilt
+    /// shorter, while the lookup was still in flight -- or if `index` now
+    /// holds a different entry than `id` identifies, e.g. a `clear` followed
+    /// by a `push` that reused the same now-vacant index; it must not panic
+    /// or overwrite an unrelated entry either way.
     pub fn set_metadata(
         &mut self,
         index: usize,
+        id: u64,
         title: Option<String>,
         duration_secs: Option<f64>,
     ) {
         if let Some(entry) = self.items.get_mut(index) {
-            entry.title = title;
-            entry.duration_secs = duration_secs;
+            if entry.id == id {
+                entry.title = title;
+                entry.duration_secs = duration_secs;
+            }
         }
     }
 
@@ -103,6 +126,26 @@ impl Queue {
         let prev = self.position?.checked_sub(1)?;
         self.position = Some(prev);
         self.items.get(prev).map(|entry| &entry.message)
+    }
+
+    /// Move directly to the item at `index` and return it. Same "no-op past
+    /// the edge" contract as `jump_forward`/`jump_backward`: an out-of-range
+    /// index (e.g. a sender tapping a stale queue list) leaves `position`
+    /// unchanged and returns `None` rather than panicking or erroring.
+    pub fn jump_to(&mut self, index: usize) -> Option<&PlayMessage> {
+        if index >= self.items.len() {
+            return None;
+        }
+        self.position = Some(index);
+        self.items.get(index).map(|entry| &entry.message)
+    }
+
+    /// Empty the queue and forget the current position -- see
+    /// `Player::queue_clear`. The first operation that actually removes
+    /// items from the queue (see the module doc comment).
+    pub fn clear(&mut self) {
+        self.items.clear();
+        self.position = None;
     }
 
     /// This queue's state as the wire shape sent to FCast senders (see
@@ -269,6 +312,82 @@ mod tests {
             Some(0),
             "position must not move before the start"
         );
+    }
+
+    #[test]
+    fn jump_to_moves_directly_to_a_valid_index() {
+        let mut queue = Queue::default();
+        queue.push(item("a"));
+        queue.push(item("b"));
+        queue.push(item("c"));
+        queue.set_position(Some(0));
+
+        assert_eq!(
+            queue.jump_to(2).and_then(|i| i.url.clone()),
+            Some("c".to_string())
+        );
+        assert_eq!(queue.position(), Some(2));
+    }
+
+    #[test]
+    fn jump_to_an_out_of_range_index_is_a_no_op() {
+        let mut queue = Queue::default();
+        queue.push(item("a"));
+        queue.set_position(Some(0));
+
+        assert!(queue.jump_to(5).is_none());
+        assert_eq!(
+            queue.position(),
+            Some(0),
+            "position must not move for an out-of-range index"
+        );
+    }
+
+    #[test]
+    fn clear_empties_items_and_resets_position() {
+        let mut queue = Queue::default();
+        queue.push(item("a"));
+        queue.push(item("b"));
+        queue.set_position(Some(1));
+
+        queue.clear();
+
+        assert_eq!(queue.position(), None);
+        assert!(queue.to_state_message().items.is_empty());
+    }
+
+    /// Regression test for the id-based staleness check in `set_metadata`:
+    /// a `clear` followed by a `push` can reuse the same vector index for an
+    /// unrelated entry (`clear` never used to be possible before this
+    /// queue-clear feature, so index reuse could not happen previously). A
+    /// metadata lookup launched for the first entry, at the index it held
+    /// before the clear, must not overwrite the second, unrelated entry that
+    /// now sits at that same index -- keyed off `id`, not `index`, exactly
+    /// this scenario.
+    #[test]
+    fn set_metadata_after_clear_and_repush_does_not_overwrite_the_new_entry_at_the_reused_index()
+    {
+        let mut queue = Queue::default();
+        let (old_index, old_id) = queue.push(item("a"));
+
+        queue.clear();
+        let (new_index, _new_id) = queue.push(item("b"));
+        assert_eq!(
+            new_index, old_index,
+            "the cleared index must be reused by the next push for this regression to apply"
+        );
+
+        // The stale lookup for "a" resolves after "b" has taken its slot.
+        queue.set_metadata(old_index, old_id, Some("wrong title".to_string()), Some(1.0));
+
+        let state = queue.to_state_message();
+        assert_eq!(state.items.len(), 1);
+        assert_eq!(state.items[0].url, "b");
+        assert_eq!(
+            state.items[0].title, None,
+            "a stale lookup for the cleared entry must not overwrite the new entry's metadata"
+        );
+        assert_eq!(state.items[0].duration_secs, None);
     }
 
     #[test]

@@ -82,6 +82,8 @@ Implemented opcodes (all of FCast v2's playback-control surface):
 | `QueueState` (15, private extension) | receiver -> sender | the full queue and the current position in it; sent both as `RequestQueue`'s reply and, unprompted, to every connected sender whenever the queue changes |
 | `QueueJumpForward` (16, private extension) | sender -> receiver | moves to the next queue item, if any, and plays it; replies with `QueueState`. A no-op (still replies) at the last item |
 | `QueueJumpBackward` (17, private extension) | sender -> receiver | moves to the previous queue item, if any, and plays it; replies with `QueueState`. A no-op (still replies) at the first item |
+| `ClearQueue` (18, private extension) | sender -> receiver | empties the play queue, stopping playback first if its current item is actively playing; replies with `QueueState` |
+| `QueueJumpToIndex` (19, private extension) | sender -> receiver | moves straight to an arbitrary queue index (`QueueJumpToIndexMessage`) and plays it; replies with `QueueState`. A no-op (still replies) for an out-of-range index |
 
 Every connected sender keeps its FCast TCP connection open (`daemon/src/main.rs`'s
 `handle_connection` reads one persistent socket per sender, not a reconnect-per-command model),
@@ -102,11 +104,12 @@ as the synchronous reply, just possibly more than once and without an incoming c
 
 FCast v2 itself has no queue concept, and this daemon only ever implements a subset of the
 protocol for a single-user personal project (not aiming for interop with third-party FCast
-senders) -- so queueing is a straightforward private extension: four new opcodes beyond FCast's
+senders) -- so queueing is a straightforward private extension: six new opcodes beyond FCast's
 reserved `0`-`13` range (`RequestQueue` 14, `QueueState` 15, `QueueJumpForward` 16,
-`QueueJumpBackward` 17), using the same length-prefixed-opcode-plus-JSON-body framing as every
-other message. See [`daemon/src/fcast.rs`](daemon/src/fcast.rs) for the exact `QueueItemMessage`/
-`QueueStateMessage` struct shapes (each field is documented there) and
+`QueueJumpBackward` 17, `ClearQueue` 18, `QueueJumpToIndex` 19), using the same
+length-prefixed-opcode-plus-JSON-body framing as every other message. See
+[`daemon/src/fcast.rs`](daemon/src/fcast.rs) for the exact `QueueItemMessage`/`QueueStateMessage`/
+`QueueJumpToIndexMessage` struct shapes (each field is documented there) and
 [`daemon/src/queue.rs`](daemon/src/queue.rs) for the queue itself.
 
 - **Queueing instead of interrupting.** A `Play` (opcode 1) no longer always interrupts whatever
@@ -127,7 +130,14 @@ other message. See [`daemon/src/fcast.rs`](daemon/src/fcast.rs) for the exact `Q
 - **Jumping.** `QueueJumpForward`/`QueueJumpBackward` move to the next/previous item in the queue
   and play it, on demand -- not only on auto-advance. "Backward" means the previous *queue* item,
   not rewinding the current item's playback position (that's `Seek`, unrelated). Both are a no-op
-  (but still reply with `QueueState`) at either edge of the queue.
+  (but still reply with `QueueState`) at either edge of the queue. `QueueJumpToIndex` moves
+  straight to an arbitrary index in one call instead of stepping one item at a time -- e.g. a tap
+  on an item in the Android app's queue list -- and is a no-op (still replies) for an out-of-range
+  index. Jumping to the already-current index is in range, so it replays that item rather than
+  being treated as a no-op, the same as jumping anywhere else.
+- **Clearing.** `ClearQueue` empties the queue and forgets its position. If the queue's current
+  item is actively playing, it is stopped first (mpv returns to idle, the same visible effect as
+  `Stop`) since clearing leaves nothing in the queue left to be "current."
 - **The daemon remembers the queue.** The queue (its items and current position) is persisted to a
   small JSON file and reloaded at startup, so it survives a restart -- see
   `queue::default_state_path`'s doc comment in `daemon/src/queue.rs` for exactly where that file
