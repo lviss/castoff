@@ -47,8 +47,9 @@
     pulse.enable = true;
   };
 
-  # FCast control API.
-  networking.firewall.allowedTCPPorts = [ 46899 ];
+  # FCast control API (46899) and the image upload server (46900, see
+  # `daemon/src/upload.rs`'s `DEFAULT_UPLOAD_PORT`).
+  networking.firewall.allowedTCPPorts = [ 46899 46900 ];
 
   # LAN discovery, matching the nixiosk/nixos-kiosk precedent of advertising
   # the box over avahi/mDNS so a sender app can find it without static IPs.
@@ -134,17 +135,24 @@
         "virtio"
       ];
 
-      # FCast's default port, forwarded from the host so a sender running on
-      # the host -- the Android app, a test script, `socat` -- reaches the
-      # daemon in the VM with no manual qemu wiring. SLiRP's host side binds
-      # 0.0.0.0 (SLiRP only does IPv4), i.e. every host interface, exactly
-      # like the appliance's own listener; see README for the address to send
-      # to and how to restrict it to loopback.
+      # FCast's default port and the image upload server's default port
+      # (46900, see `daemon/src/upload.rs`'s `DEFAULT_UPLOAD_PORT`), both
+      # forwarded from the host so a sender running on the host -- the
+      # Android app, a test script, `socat` -- reaches the daemon in the VM
+      # with no manual qemu wiring. SLiRP's host side binds 0.0.0.0 (SLiRP
+      # only does IPv4), i.e. every host interface, exactly like the
+      # appliance's own listener; see README for the address to send to and
+      # how to restrict it to loopback.
       forwardPorts = [
         {
           from = "host";
           host.port = 46899;
           guest.port = 46899;
+        }
+        {
+          from = "host";
+          host.port = 46900;
+          guest.port = 46900;
         }
       ];
     };
