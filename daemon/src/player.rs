@@ -654,16 +654,19 @@ impl Player {
 
     /// Empty the play queue (see `queue::Queue::clear`) -- what the Android
     /// task's "clear queue" button calls (`Opcode::ClearQueue` in `main.rs`).
-    /// Stops playback first if the queue's current item is actively playing,
-    /// since clearing leaves nothing in the queue left to be "current" --
-    /// same visible effect as `Opcode::Stop` -- then persists and publishes
-    /// the (now empty) queue, the same push-on-change model every other
-    /// queue mutation uses.
+    /// Always stops playback first -- same visible effect as `Opcode::Stop`
+    /// -- since clearing leaves nothing in the queue left to be "current".
+    /// `is_idle()` is deliberately permissive about a still-loading item (it
+    /// exists so `play()` can let a fresh `Play` interrupt an in-flight
+    /// load), which would wrongly treat a load already claimed as the
+    /// queue's current position as nothing-to-stop; `stop_locked()` already
+    /// has its own `already_idle` check to avoid blinking the idle clock
+    /// when genuinely idle, so it's safe to call unconditionally here. Then
+    /// persist and publish the (now empty) queue, the same push-on-change
+    /// model every other queue mutation uses.
     pub fn queue_clear(&self) -> Result<()> {
         let _operation = self.operation.lock().unwrap();
-        if !self.is_idle() {
-            self.stop_locked()?;
-        }
+        self.stop_locked()?;
         self.queue.lock().unwrap().clear();
         self.persist_queue();
         self.publish_queue_state();
