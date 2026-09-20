@@ -241,9 +241,10 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   asserting over the wire, see `main.rs`'s `periodic_push_only_fires_while_playing`) must not
   assume the very first `PlaybackUpdate` after `Play` already reports `Playing`; wait for one that
   does, or rely on the push path's later `PlaybackRestart`-triggered update instead.
-- The play queue (`daemon/src/queue.rs`) is castoff's own private FCast extension: opcodes 14-17
-  (`RequestQueue`/`QueueState`/`QueueJumpForward`/`QueueJumpBackward`, beyond FCast's reserved
-  0-13), documented in README's "Queueing (private extension)". `Player::play` (`is_idle`, see
+- The play queue (`daemon/src/queue.rs`) is castoff's own private FCast extension: opcodes 14-19
+  (`RequestQueue`/`QueueState`/`QueueJumpForward`/`QueueJumpBackward`/`ClearQueue`/
+  `QueueJumpToIndex`, beyond FCast's reserved 0-13), documented in README's "Queueing (private
+  extension)". `Player::play` (`is_idle`, see
   above) enqueues instead of interrupting whenever something is already playing -- including a
   displayed web page, so a `Play` that arrives while one is on screen also only enqueues, superseded
   media or not; superseding what's already showing now needs an explicit `QueueJumpForward` (see

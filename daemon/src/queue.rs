@@ -356,6 +356,40 @@ mod tests {
         assert!(queue.to_state_message().items.is_empty());
     }
 
+    /// Regression test for the id-based staleness check in `set_metadata`:
+    /// a `clear` followed by a `push` can reuse the same vector index for an
+    /// unrelated entry (`clear` never used to be possible before this
+    /// queue-clear feature, so index reuse could not happen previously). A
+    /// metadata lookup launched for the first entry, at the index it held
+    /// before the clear, must not overwrite the second, unrelated entry that
+    /// now sits at that same index -- keyed off `id`, not `index`, exactly
+    /// this scenario.
+    #[test]
+    fn set_metadata_after_clear_and_repush_does_not_overwrite_the_new_entry_at_the_reused_index()
+    {
+        let mut queue = Queue::default();
+        let (old_index, old_id) = queue.push(item("a"));
+
+        queue.clear();
+        let (new_index, _new_id) = queue.push(item("b"));
+        assert_eq!(
+            new_index, old_index,
+            "the cleared index must be reused by the next push for this regression to apply"
+        );
+
+        // The stale lookup for "a" resolves after "b" has taken its slot.
+        queue.set_metadata(old_index, old_id, Some("wrong title".to_string()), Some(1.0));
+
+        let state = queue.to_state_message();
+        assert_eq!(state.items.len(), 1);
+        assert_eq!(state.items[0].url, "b");
+        assert_eq!(
+            state.items[0].title, None,
+            "a stale lookup for the cleared entry must not overwrite the new entry's metadata"
+        );
+        assert_eq!(state.items[0].duration_secs, None);
+    }
+
     #[test]
     fn jump_on_empty_or_unstarted_queue_is_a_no_op() {
         let mut queue = Queue::default();
