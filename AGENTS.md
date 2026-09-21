@@ -440,6 +440,25 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   reporting what was and wasn't actually verified here; a real Raspberry Pi 4 build/boot/playback
   test needs real hardware or a genuine `aarch64-linux` builder.
 
+- `tv-box-rpi4`'s unattended Wi-Fi join (`nix/tv-box-rpi4.nix`) sources SSID/PSK from a plain
+  `KEY=value` file, `/etc/castoff/wifi-credentials.env`, via NetworkManager's own
+  `ensureProfiles.environmentFiles` (`$VARIABLE` placeholders in the declared profile, substituted
+  by `envsubst` from that file at service start -- see the option's own doc comment in
+  `nixos/modules/services/networking/networkmanager.nix` for this exact pattern). That file is
+  deliberately NOT declared via `environment.etc`: NixOS regenerates `/etc` from the Nix store on
+  *every* boot, not just on a `nixos-rebuild switch` (confirmed by reading
+  `nixos/modules/system/etc/setup-etc.pl` -- a mode-based/copied `environment.etc` entry is
+  unconditionally re-copied from the store each boot, clobbering any edit made to that path before
+  that boot), which would silently overwrite whatever the setup person wrote to the card before the
+  Pi's first boot -- exactly backwards from what unattended first-boot provisioning needs. The
+  template is instead injected straight into the built image's root filesystem via
+  `sdImage.populateRootCommands` (a second definition, appended with `lib.mkAfter`; safe to append
+  even though neither this project's nor nixos-raspberrypi's own assignment of that option gives it
+  an explicit `type`, confirmed empirically with a minimal `lib.evalModules` case -- multiple
+  un-typed `mkOption` definitions concatenate rather than conflict), which lands the file in the
+  image before it is ever booted and is completely outside `/etc`'s store-tracked, every-boot-reset
+  tree, so it is never touched again once the image is built.
+
 ## Maintaining this file
 
 Keep this file for knowledge useful to almost every future agent session in this project.

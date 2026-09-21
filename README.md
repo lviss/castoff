@@ -765,8 +765,42 @@ zstd -d --stdout ./result | sudo dd of=/dev/sdX bs=4M status=progress conv=fsync
 # or, with raspberrypi-imager: choose "Use custom" and point it at ./result directly.
 ```
 
-Put the card in a Raspberry Pi 4B, connect it to power, Ethernet (or configure Wi-Fi -- see
-`nix/tv-box.nix`'s `networking.networkmanager`) and an HDMI display, and boot it. What to look for:
+#### Wi-Fi setup (no keyboard, mouse or monitor needed)
+
+The appliance has none of those attached once deployed, so Wi-Fi credentials have to be in place
+*before* the Pi ever boots -- there's no way to type them in afterwards. `nixosConfigurations.tv-box-rpi4`
+(`nix/tv-box-rpi4.nix`) declares a NetworkManager connection profile whose SSID/password are read
+at boot from a plain-text file, `/etc/castoff/wifi-credentials.env`, rather than baked into the
+Nix store; the flashed image already ships a placeholder copy of that file at that exact path, so
+there's nothing to create, only edit:
+
+1. Flash the SD card as above, then re-insert it into your computer (or leave it mounted) and open
+   its **root** filesystem -- the larger, second partition (ext4; needs a Linux machine, WSL, or an
+   ext4-capable tool on macOS/Windows), *not* the small FAT `FIRMWARE` partition.
+2. Edit `/etc/castoff/wifi-credentials.env` on that partition. It's plain `KEY=value` lines, no
+   quotes:
+   ```
+   WIFI_SSID=YourNetworkName
+   WIFI_PSK=YourNetworkPassword
+   ```
+3. Unmount the card and proceed to boot the Pi as below.
+
+Skipping this step (or leaving the placeholder values in place) isn't fatal -- NetworkManager just
+fails to associate and the appliance boots and runs normally otherwise (Ethernet, if plugged in,
+still works either way). This file is deliberately *not* managed the way most of NixOS's `/etc` is:
+that gets regenerated from the Nix store on every boot (which would silently overwrite whatever was
+written here before the very first boot), so this one file is instead baked straight into the
+image's filesystem at build time and left alone from then on -- see `nix/tv-box-rpi4.nix` for the
+mechanism.
+
+An established broadcast-own-AP-plus-phone captive-portal provisioning flow (the kind consumer IoT
+devices use) was considered as an alternative to this file, but no ready-made, well-documented NixOS
+module for one was found while building this -- this file-based approach is what shipped. If a
+captive-portal flow would be preferred instead, that's a follow-up someone can pick up separately.
+
+Put the card in a Raspberry Pi 4B, connect it to power and Ethernet or Wi-Fi (per the step above),
+and boot it -- an HDMI display is optional, useful only for the visual check below, never required
+for network join. What to look for:
 
 - **The appliance's idle screen**: a large white clock centred on a black screen, the same as the
   VM (see above) -- that's Cage running the daemon as its one fullscreen client.
@@ -796,7 +830,10 @@ attempt fails with a genuine `error: Cannot build ... Reason: platform mismatch,
 a configuration error. Hardware playback performance (YouTube decode, Cage/wlroots rendering) on
 real Pi 4 silicon was explicitly out of scope for this change -- see
 [Not yet implemented](#not-yet-implemented-follow-up-work) -- and was not and could not be tested
-here; the steps above are exactly what to check on real hardware.
+here; the steps above are exactly what to check on real hardware. The same applies to the Wi-Fi
+setup above: `nix eval` confirms the NetworkManager profile and the credentials-file mechanism
+build correctly into the image's derivation graph, but actually joining a real network on real
+hardware is something only a real Pi 4B boot can confirm, and is not tested here.
 
 ### Dev shell
 
