@@ -632,9 +632,13 @@ The page replaces the clock (Chromium maps over mpv), a media URL plays instead,
 (opcode `4`, no body) brings the clock back. `printf '\x01\x00\x00\x00\x0c' | nc 127.0.0.1 46899`
 is a `Ping`, if you just want to check the port is live.
 
+**SSH also works against the VM**, the same as [the Pi 4 image](#ssh-access): the VM forwards its
+guest's sshd to host port **2222**, so `ssh -p 2222 kiosk@127.0.0.1` reaches it once the VM is up
+(same `kiosk` user, initial password, and passwordless sudo as every other target).
+
 **"I see a black screen but no clock."** Press **Ctrl+Alt+3** in the QEMU window (or use its
-**View** menu to select the serial console): the VM autologins **root** there, so a blank screen
-always comes with a shell rather than a dead rectangle. Then:
+**View** menu to select the serial console), or SSH in as above: the VM autologins **root** on the
+serial console, so a blank screen always comes with a shell rather than a dead rectangle. Then:
 
 ```sh
 systemctl status cage-tty1          # the kiosk session

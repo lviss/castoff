@@ -153,6 +153,11 @@
       # only does IPv4), i.e. every host interface, exactly like the
       # appliance's own listener; see README for the address to send to and
       # how to restrict it to loopback.
+      # 2222 -> the guest's sshd (port 22), since SLiRP's NAT never forwards a
+      # guest port to the host without an explicit hostfwd rule like this one
+      # (nixpkgs' qemu-vm module defaults `forwardPorts` to `[]`) --
+      # `services.openssh.enable` above runs sshd in every target including
+      # this VM, but without this entry the host has no route to it at all.
       forwardPorts = [
         {
           from = "host";
@@ -163,6 +168,11 @@
           from = "host";
           host.port = 46900;
           guest.port = 46900;
+        }
+        {
+          from = "host";
+          host.port = 2222;
+          guest.port = 22;
         }
       ];
     };
