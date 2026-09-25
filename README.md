@@ -744,11 +744,19 @@ distro, the equivalent is installing `qemu-user-static` and registering it with 
 (package name and exact steps vary by distro); a genuine `aarch64-linux` remote builder is an
 alternative to either.
 
-**If you see `warning: ignoring untrusted substituter ... you are not a trusted user`**: passing
-`--accept-flake-config` only *offers* trust in nixos-raspberrypi's binary cache -- Nix itself still
-refuses to use a substituter or its trusted public keys unless your user is in `trusted-users`.
-Without that, the build still succeeds, just slower (it compiles the Raspberry Pi kernel from
-source instead of fetching a prebuilt one). On NixOS, add yourself and rebuild:
+**If you see `warning: ignoring untrusted substituter ... you are not a trusted user`, or
+`warning: ignoring the client-specified setting '"system"', because it is a restricted setting and
+you are not a trusted user`**: both come from the same cause -- a Nix daemon only honors
+client-specified overrides to *restricted* settings (substituters, trusted public keys, and
+`system` among them) from a `trusted-users` member; everything else silently falls back to the
+daemon's own configuration. `--accept-flake-config` only *offers* trust in nixos-raspberrypi's
+binary cache, it doesn't grant it, so the first warning's effect is just a slower build (it
+compiles the Raspberry Pi kernel from source instead of fetching a prebuilt one). The second
+warning is not merely slower and easy to miss: it means the daemon silently dropped
+`--system aarch64-linux` entirely and built for its own actual system instead -- on the common case
+of an `x86_64-linux` build machine, that's a **wrong, non-Pi output**, not the intended
+`aarch64-linux` image, even though the command otherwise appears to succeed. On NixOS, add yourself
+and rebuild:
 
 ```nix
 nix.settings.trusted-users = [ "root" "your-username" ];
