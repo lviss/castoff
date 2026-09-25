@@ -827,6 +827,19 @@ login password is set in `nix/tv-box.nix` (`users.users.kiosk.initialPassword`) 
 configured there as the device's actual credential, not a placeholder; change it after first login
 with `passwd` if desired.
 
+#### Boot-time diagnostic dump
+
+Every boot, `castoff-debug-dump.service` (`nix/tv-box-rpi4.nix`, Pi 4 only) overwrites
+`/var/log/castoff-debug.log` with a snapshot for exactly this kind of real-hardware debugging:
+`nmcli` general/device/connection status, `systemctl status`/`journalctl` for
+`NetworkManager-ensure-profiles.service` and `cage-tty1.service`, `ip addr`, `rfkill list` (if
+available), and `dmesg` lines matching `wifi`/`brcm`/`firmware`. It also dumps
+`/etc/castoff/wifi-credentials.env` itself with the PSK value redacted to its length, so the SSID
+and file format can be checked without exposing the password. Read it over SSH:
+```sh
+ssh kiosk@castoff-rpi4.local cat /var/log/castoff-debug.log
+```
+
 Put the card in a Raspberry Pi 4B, connect it to power and Ethernet or Wi-Fi (per the step above),
 and boot it -- an HDMI display is optional, useful only for the visual check below, never required
 for network join. What to look for:

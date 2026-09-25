@@ -1,4 +1,4 @@
-{ config, lib, nixos-raspberrypi, ... }:
+{ config, lib, pkgs, nixos-raspberrypi, ... }:
 
 # The Raspberry Pi 4 half of the appliance config: real hardware modules
 # from `nixos-raspberrypi` (github:nvmd/nixos-raspberrypi) layered under
@@ -82,4 +82,81 @@
     install -D -m600 ${./wifi-credentials.env.example} \
       ./files/etc/castoff/wifi-credentials.env
   '';
+
+  # Boot-time diagnostic dump for the real-hardware Wi-Fi/display issues this
+  # target has actually hit -- overwritten every boot at
+  # `/var/log/castoff-debug.log` (real ext4, on the box's own storage, not the
+  # FAT firmware partition -- SSH plus a normal `cat`/`less` is how this gets
+  # read, no special tooling needed). `RemainAfterExit = true` plus a plain
+  # oneshot lets `systemctl status` show it as a simple pass/fail rather than
+  # a service that's expected to keep running. Ordered after the units it's
+  # actually diagnosing (not `network-online.target`: that target -- and the
+  # `NetworkManager-wait-online` service backing it -- may never activate at
+  # all when Wi-Fi is exactly what's failing, which would delay or hide the
+  # dump precisely when it's most needed); a short fixed sleep stands in for
+  # "networking has had a chance to settle" instead.
+  systemd.services.castoff-debug-dump = {
+    description = "Dump castoff/networking/display diagnostics for real-hardware debugging";
+    wantedBy = [ "multi-user.target" ];
+    after = [ "NetworkManager-ensure-profiles.service" "cage-tty1.service" ];
+    serviceConfig = {
+      Type = "oneshot";
+      RemainAfterExit = true;
+    };
+    # `rfkill` is not its own nixpkgs package here and isn't guaranteed to be
+    # one of `util-linux`'s built binaries either -- the script below guards
+    # its call with `command -v` instead of depending on it directly.
+    path = [ pkgs.networkmanager pkgs.iproute2 pkgs.util-linux pkgs.gnugrep pkgs.gawk ];
+    script = ''
+      out=/var/log/castoff-debug.log
+      sleep 20
+
+      {
+        echo "=== castoff-debug-dump: $(date -Is) ==="
+
+        echo; echo "--- /etc/castoff/wifi-credentials.env (PSK redacted) ---"
+        if [ -r /etc/castoff/wifi-credentials.env ]; then
+          awk -F= '
+            /^WIFI_PSK=/ { print "WIFI_PSK=<redacted, " length($0)-length("WIFI_PSK=") " chars>"; next }
+            { print }
+          ' /etc/castoff/wifi-credentials.env
+        else
+          echo "(not present or not readable)"
+        fi
+
+        echo; echo "--- nmcli general status ---"
+        nmcli general status || true
+        echo; echo "--- nmcli device status ---"
+        nmcli device status || true
+        echo; echo "--- nmcli connection show ---"
+        nmcli connection show || true
+
+        echo; echo "--- systemctl status NetworkManager-ensure-profiles.service ---"
+        systemctl status --no-pager NetworkManager-ensure-profiles.service || true
+        echo; echo "--- journalctl -u NetworkManager-ensure-profiles.service ---"
+        journalctl --no-pager -u NetworkManager-ensure-profiles.service || true
+
+        echo; echo "--- systemctl status cage-tty1.service ---"
+        systemctl status --no-pager cage-tty1.service || true
+        echo; echo "--- journalctl -b -u cage-tty1.service ---"
+        journalctl --no-pager -b -u cage-tty1.service || true
+
+        echo; echo "--- journalctl -b -u castoff-daemon (castoff-daemon runs as cage-tty1's own client process, not its own unit -- this is expected to be empty; its own log lines are in the cage-tty1 journal above) ---"
+        journalctl --no-pager -b -u castoff-daemon || true
+
+        echo; echo "--- ip addr ---"
+        ip addr || true
+
+        echo; echo "--- rfkill list ---"
+        if command -v rfkill >/dev/null 2>&1; then
+          rfkill list || true
+        else
+          echo "(rfkill not available on this system)"
+        fi
+
+        echo; echo "--- dmesg | grep -iE 'wifi|brcm|firmware' ---"
+        dmesg | grep -iE 'wifi|brcm|firmware' || true
+      } > "$out" 2>&1
+    '';
+  };
 }
