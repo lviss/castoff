@@ -105,6 +105,17 @@
               cargo test --test webpage_display -- --ignored --nocapture
           '';
 
+          # aarch64-linux is built under QEMU user-mode emulation on the common
+          # x86_64-linux-with-binfmt path (there's no cross-compiled Rust
+          # toolchain wired up here), and emulating the test binary -- above
+          # all the headless Cage+Chromium e2e test in postCheck -- is
+          # unreliable for verification: it can segfault the emulator itself
+          # on some tests, unrelated to actual code correctness. Verification
+          # for the Raspberry Pi 4 target happens on real Pi 4 hardware
+          # instead of under emulation; x86_64-linux keeps its full checkPhase
+          # unchanged. See AGENTS.md.
+          doCheck = system != "aarch64-linux";
+
           meta = {
             description = "castoff TV-box daemon: drives mpv and exposes an FCast-based local control API";
             license = pkgs.lib.licenses.mit;

@@ -744,6 +744,13 @@ distro, the equivalent is installing `qemu-user-static` and registering it with 
 (package name and exact steps vary by distro); a genuine `aarch64-linux` remote builder is an
 alternative to either.
 
+The daemon's own test suite (`cargo test`, including the Cage/Chromium end-to-end test) is skipped
+for the `aarch64-linux` build specifically -- `x86_64-linux` still runs its full test suite
+unchanged. Running that test binary under QEMU user-mode emulation is unreliable for verification
+(it can segfault the emulator itself on some tests, unrelated to actual code correctness), so
+verification for the Raspberry Pi 4 target happens on real Pi 4 hardware instead, not under
+emulation.
+
 **If you see `warning: ignoring untrusted substituter ... you are not a trusted user`, or
 `warning: ignoring the client-specified setting '"system"', because it is a restricted setting and
 you are not a trusted user`**: both come from the same cause -- a Nix daemon only honors

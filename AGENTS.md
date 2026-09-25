@@ -439,6 +439,15 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   resulting store path: not valid, i.e. never built). That distinction matters for honestly
   reporting what was and wasn't actually verified here; a real Raspberry Pi 4 build/boot/playback
   test needs real hardware or a genuine `aarch64-linux` builder.
+- `flake.nix`'s `castoffDaemonFor` sets `doCheck = false` for `aarch64-linux` only (`x86_64-linux`
+  keeps its full `checkPhase`, including the heavy Cage/Chromium `postCheck` e2e test, unchanged).
+  On the common path of building `tv-box-rpi4-image` from an x86_64-linux machine via
+  `boot.binfmt.emulatedSystems`, Nix treats aarch64-linux as a same-`system` (not cross-compiled)
+  build and QEMU user-mode-emulates every build/check step, and emulating the test binary --
+  above all the Cage+Chromium e2e test -- is unreliable for this purpose: it can segfault the
+  emulator itself on some tests, unrelated to actual code correctness. Verification for the Pi 4
+  target happens on real Pi 4 hardware instead; do not try to make QEMU emulation reliable enough
+  to test under instead.
 
 - `tv-box-rpi4`'s unattended Wi-Fi join (`nix/tv-box-rpi4.nix`) sources SSID/PSK from a plain
   `KEY=value` file, `/etc/castoff/wifi-credentials.env`, via NetworkManager's own
