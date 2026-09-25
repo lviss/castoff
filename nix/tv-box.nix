@@ -45,8 +45,21 @@
   users.users.kiosk = {
     isNormalUser = true;
     description = "castoff kiosk session user";
-    extraGroups = [ "video" "audio" "input" ];
+    extraGroups = [ "video" "audio" "input" "wheel" ];
+    # Captain's own explicit choice for this personal single-user device (no
+    # keyboard/monitor once deployed, so this and SSH below are the only way
+    # in to diagnose it) -- not a placeholder to be hardened later.
+    initialPassword = "castoff";
   };
+
+  # Remote access: this box has no keyboard/monitor once deployed (see the
+  # Wi-Fi setup section), so SSH is the only way in to diagnose or fix it on
+  # real hardware. `kiosk`'s `wheel` membership above plus
+  # `wheelNeedsPassword = false` here gives it passwordless sudo, since a
+  # second password prompt has nowhere to go once the operator is already in
+  # over SSH with no other keyboard attached to the box itself.
+  services.openssh.enable = true;
+  security.sudo.wheelNeedsPassword = false;
 
   # Audio for mpv playback.
   security.rtkit.enable = true;

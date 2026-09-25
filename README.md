@@ -813,6 +813,16 @@ devices use) was considered as an alternative to this file, but no ready-made, w
 module for one was found while building this -- this file-based approach is what shipped. If a
 captive-portal flow would be preferred instead, that's a follow-up someone can pick up separately.
 
+#### SSH access
+
+SSH is enabled by default on every target, including this Pi 4 image (`services.openssh.enable` in
+`nix/tv-box.nix`) -- with no keyboard/monitor once deployed, it's the only way to reach the box to
+diagnose or fix anything after first boot. The login user is `kiosk`, with `sudo` requiring no
+second password prompt (there's nowhere for one to go once you're already in over SSH). The initial
+login password is set in `nix/tv-box.nix` (`users.users.kiosk.initialPassword`) -- treat whatever is
+configured there as the device's actual credential, not a placeholder; change it after first login
+with `passwd` if desired.
+
 Put the card in a Raspberry Pi 4B, connect it to power and Ethernet or Wi-Fi (per the step above),
 and boot it -- an HDMI display is optional, useful only for the visual check below, never required
 for network join. What to look for:
@@ -825,8 +835,8 @@ for network join. What to look for:
   ping castoff-rpi4.local
   nc -zv castoff-rpi4.local 46899
   ```
-- **`castoff-daemon` is actually running the kiosk session.** Over SSH (if enabled) or a directly
-  attached keyboard:
+- **`castoff-daemon` is actually running the kiosk session.** Over SSH (`ssh
+  kiosk@castoff-rpi4.local`, see [SSH access](#ssh-access) above) or a directly attached keyboard:
   ```sh
   systemctl status cage-tty1
   journalctl -b -u cage-tty1
