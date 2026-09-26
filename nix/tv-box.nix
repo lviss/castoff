@@ -14,6 +14,15 @@
 # services stripped out) but using nixpkgs' own `services.cage` module
 # instead of hand-rolled `systemd.services."cage@"` units, since that
 # module has since landed upstream.
+#
+# This module is the *target-independent* half of the appliance config --
+# everything that doesn't care what's underneath it (Cage/kiosk setup, the
+# castoff-daemon service, audio, firewall, avahi, power trimming). Each
+# concrete target layers its own hardware/filesystem/bootloader glue on top
+# of this: `nix/tv-box-x86_64.nix` for the generic x86_64-linux placeholders
+# (VM + installable-to-any-"nixos"-labeled-disk), `nix/tv-box-rpi4.nix` for
+# the Raspberry Pi 4 hardware modules from `nixos-raspberrypi`. See
+# `flake.nix` for how each target's module list is assembled.
 {
   imports = [ ];
 
@@ -36,8 +45,21 @@
   users.users.kiosk = {
     isNormalUser = true;
     description = "castoff kiosk session user";
-    extraGroups = [ "video" "audio" "input" ];
+    extraGroups = [ "video" "audio" "input" "wheel" ];
+    # Captain's own explicit choice for this personal single-user device (no
+    # keyboard/monitor once deployed, so this and SSH below are the only way
+    # in to diagnose it) -- not a placeholder to be hardened later.
+    initialPassword = "castoff";
   };
+
+  # Remote access: this box has no keyboard/monitor once deployed (see the
+  # Wi-Fi setup section), so SSH is the only way in to diagnose or fix it on
+  # real hardware. `kiosk`'s `wheel` membership above plus
+  # `wheelNeedsPassword = false` here gives it passwordless sudo, since a
+  # second password prompt has nowhere to go once the operator is already in
+  # over SSH with no other keyboard attached to the box itself.
+  services.openssh.enable = true;
+  security.sudo.wheelNeedsPassword = false;
 
   # Audio for mpv playback.
   security.rtkit.enable = true;
@@ -79,18 +101,6 @@
 
   time.timeZone = lib.mkDefault "UTC";
   system.stateVersion = lib.mkDefault "24.11";
-
-  # Generic x86_64-linux placeholders so this configuration is bootable and
-  # `nix build`-able on its own (`nix flake check`, `nixos-rebuild build-vm`,
-  # or installing to any disk labeled "nixos"). Flashing a real appliance
-  # image to specific hardware -- disko partitioning, nixos-generators, etc.
-  # -- is follow-up work; see README roadmap.
-  fileSystems."/" = lib.mkDefault {
-    device = "/dev/disk/by-label/nixos";
-    fsType = "ext4";
-  };
-  boot.loader.systemd-boot.enable = lib.mkDefault true;
-  boot.loader.efi.canTouchEfiVariables = lib.mkDefault true;
 
   # Everything below is the *VM-only* half of this module. NixOS's own
   # `virtualisation.vmVariant` (nixos/modules/virtualisation/build-vm.nix) is
@@ -143,6 +153,11 @@
       # only does IPv4), i.e. every host interface, exactly like the
       # appliance's own listener; see README for the address to send to and
       # how to restrict it to loopback.
+      # 2222 -> the guest's sshd (port 22), since SLiRP's NAT never forwards a
+      # guest port to the host without an explicit hostfwd rule like this one
+      # (nixpkgs' qemu-vm module defaults `forwardPorts` to `[]`) --
+      # `services.openssh.enable` above runs sshd in every target including
+      # this VM, but without this entry the host has no route to it at all.
       forwardPorts = [
         {
           from = "host";
@@ -153,6 +168,11 @@
           from = "host";
           host.port = 46900;
           guest.port = 46900;
+        }
+        {
+          from = "host";
+          host.port = 2222;
+          guest.port = 22;
         }
       ];
     };

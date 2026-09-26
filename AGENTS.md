@@ -338,9 +338,10 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   - The VM's serial console autologins root (a `serial-getty@ttyS0` override in the vmVariant).
     It must be `overrideStrategy = "asDropin"`: systemd ignores a unit *file* named after a
     template *instance*, so the plain `serviceConfig` form silently leaves the `login:` prompt.
-    That console is the VM's promised fallback for a blank screen; see README's VM section for what
-    the captain should see (QEMU `Ctrl+Alt+3`) and the host-side FCast port forward
-    (`virtualisation.forwardPorts`, 46899, bound on all host interfaces by SLiRP).
+    That console is one fallback for a blank screen; SSH (forwarded from host port 2222, same
+    `virtualisation.forwardPorts` mechanism as the FCast/upload ports) is the other. See README's VM
+    section for what the captain should see (QEMU `Ctrl+Alt+3`) and the forwarded ports themselves
+    (`virtualisation.forwardPorts`, bound on all host interfaces by SLiRP).
   - **`virtualisation.cores` defaults to 1** in nixpkgs' qemu-vm module (`virtualisation.memorySize`
     already defaulted sanely). One core is not enough for this VM's all-software stack (Cage, mpv
     and Chromium all draw through llvmpipe, which itself wants several cores) -- measured on a
@@ -406,6 +407,79 @@ This file is the project's committed home for project-intrinsic agent knowledge:
     acquiring it, not just before -- the same "operation lock serializes whole play/stop
     operations" discipline `player.rs` already documents, extended to this timer so a real
     `Play`/`Stop` racing the rotation can never be clobbered by a stale wallpaper swap.
+- `nixosConfigurations.tv-box-rpi4` / `packages.aarch64-linux.tv-box-rpi4-image` build a flashable
+  Raspberry Pi 4 SD image via [`nixos-raspberrypi`](https://github.com/nvmd/nixos-raspberrypi)
+  (github:nvmd/nixos-raspberrypi), a separate flake input from this project's main `nixpkgs` pin --
+  its hardware modules are validated against its own pinned nixpkgs, so it is deliberately not
+  `nixpkgs.follows`-ed. `flake.nix` builds it with `lib.nixosSystemFull` (the same "full"
+  RPi-optimised package set `lib.nixosInstaller` uses) plus that flake's `sd-image` module, imported
+  directly by `nix/tv-box-rpi4.nix` rather than through `lib.nixosInstaller` itself.
+  `nixosInstaller` also pulls in `raspberrypi-installer.nix`, and through it nixpkgs'
+  `profiles/installation-device.nix` -- the profile for installation *media*, confirmed by reading
+  it directly to force-enable `documentation.*` (overriding `nix/tv-box.nix`'s deliberate
+  closure-trimming), create a passwordless "nixos" account *and* a passwordless root account,
+  autologin "nixos" at the console, and set `services.openssh.settings.PermitRootLogin = mkDefault
+  "yes"` -- none of which belongs on a deployed, SSH-reachable appliance. `sd-image` alone (without
+  `raspberrypi-installer.nix`) is what actually makes the result both flashable installer media
+  *and* a ready-to-boot system in one image -- its partition table auto-expands to fill the SD card
+  on first boot, so no separate `nixos-anywhere`/`disko` install step is needed for this use case
+  (nixos-raspberrypi also supports that combination separately, for installing onto other target
+  disks -- not what this project uses). `raspberrypi-installer.nix` did carry one real,
+  unrelated-to-"installer media" fix worth keeping regardless -- `boot.swraid.enable = false`, since
+  RPi's initrd fails partway through writing itself with swraid's auto-assembly probing active --
+  `nix/tv-box-rpi4.nix` re-applies that fix directly now that the module bringing it isn't imported.
+  `nixosSystemFull` (like its siblings, including `nixosInstaller`) automatically injects
+  `nixos-raspberrypi` itself into every module's `specialArgs`, so `nix/tv-box-rpi4.nix` can just
+  reference it without `flake.nix` wiring that by hand. `config.system.build.sdImage`'s output
+  (`nix build`'s `./result` symlink) is a *directory*, not the compressed image file itself -- the
+  actual file lives inside it at `sd-image/<name>.img.zst`; decompress that path with `zstd -d`
+  before `dd`, not `./result` directly.
+  `nix/tv-box.nix` (the shared kiosk config: Cage/`kiosk` user, the daemon service, audio,
+  firewall, avahi, power trimming) is target-independent; `nix/tv-box-x86_64.nix` and
+  `nix/tv-box-rpi4.nix` are the two per-target hardware/filesystem/bootloader layers on top of it
+  (generic x86_64 placeholders for `tv-box`/`tv-box-vm`, real Pi 4 hardware modules for
+  `tv-box-rpi4`), assembled per-target in `flake.nix`.
+  This sandbox has no `aarch64-linux` builder and no `aarch64-linux` QEMU user-mode emulation
+  configured (no `boot.binfmt.emulatedSystems`, nothing under `/proc/sys/fs/binfmt_misc`) -- a
+  direct, non-dry-run `nix build` of any `aarch64-linux` output fails with a genuine `error:
+  Cannot build ... Reason: platform mismatch, Required system: 'aarch64-linux', Current system:
+  'x86_64-linux'`. `nix flake check --all-systems` and `nix build --dry-run` still fully evaluate
+  every `aarch64-linux` output (including `nixosConfigurations.tv-box-rpi4`, which `nix flake
+  check` evaluates even without `--all-systems`, since NixOS-configuration evaluation isn't
+  system-gated the way `packages`/`checks` realization is) and resolve the whole build closure with
+  no errors -- `nix flake check --all-systems` reports "all checks passed!" for `aarch64-linux`
+  outputs on this basis alone, without ever realizing them (confirmed via `nix path-info` on the
+  resulting store path: not valid, i.e. never built). That distinction matters for honestly
+  reporting what was and wasn't actually verified here; a real Raspberry Pi 4 build/boot/playback
+  test needs real hardware or a genuine `aarch64-linux` builder.
+- `flake.nix`'s `castoffDaemonFor` sets `doCheck = false` for `aarch64-linux` only (`x86_64-linux`
+  keeps its full `checkPhase`, including the heavy Cage/Chromium `postCheck` e2e test, unchanged).
+  On the common path of building `tv-box-rpi4-image` from an x86_64-linux machine via
+  `boot.binfmt.emulatedSystems`, Nix treats aarch64-linux as a same-`system` (not cross-compiled)
+  build and QEMU user-mode-emulates every build/check step, and emulating the test binary --
+  above all the Cage+Chromium e2e test -- is unreliable for this purpose: it can segfault the
+  emulator itself on some tests, unrelated to actual code correctness. Verification for the Pi 4
+  target happens on real Pi 4 hardware instead; do not try to make QEMU emulation reliable enough
+  to test under instead.
+
+- `tv-box-rpi4`'s unattended Wi-Fi join (`nix/tv-box-rpi4.nix`) sources SSID/PSK from a plain
+  `KEY=value` file, `/etc/castoff/wifi-credentials.env`, via NetworkManager's own
+  `ensureProfiles.environmentFiles` (`$VARIABLE` placeholders in the declared profile, substituted
+  by `envsubst` from that file at service start -- see the option's own doc comment in
+  `nixos/modules/services/networking/networkmanager.nix` for this exact pattern). That file is
+  deliberately NOT declared via `environment.etc`: NixOS regenerates `/etc` from the Nix store on
+  *every* boot, not just on a `nixos-rebuild switch` (confirmed by reading
+  `nixos/modules/system/etc/setup-etc.pl` -- a mode-based/copied `environment.etc` entry is
+  unconditionally re-copied from the store each boot, clobbering any edit made to that path before
+  that boot), which would silently overwrite whatever the setup person wrote to the card before the
+  Pi's first boot -- exactly backwards from what unattended first-boot provisioning needs. The
+  template is instead injected straight into the built image's root filesystem via
+  `sdImage.populateRootCommands` (a second definition, appended with `lib.mkAfter`; safe to append
+  even though neither this project's nor nixos-raspberrypi's own assignment of that option gives it
+  an explicit `type`, confirmed empirically with a minimal `lib.evalModules` case -- multiple
+  un-typed `mkOption` definitions concatenate rather than conflict), which lands the file in the
+  image before it is ever booted and is completely outside `/etc`'s store-tracked, every-boot-reset
+  tree, so it is never touched again once the image is built.
 
 ## Maintaining this file
 

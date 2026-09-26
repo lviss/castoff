@@ -43,6 +43,11 @@ That's it: no Jellyfin, no Immich/local-folder slideshows. See
   desktop environment or display manager -- running the castoff daemon as that one client. Cage
   stacks a second, newer client on top when there is one, which is how a cast web page takes the
   screen; see [How webpage (dashboard) display works](#how-webpage-dashboard-display-works).
+  `nix/tv-box.nix` holds this target-independent kiosk config; `nix/tv-box-x86_64.nix` layers
+  generic x86_64-linux placeholders on top of it for `nixosConfigurations.tv-box`, and
+  `nix/tv-box-rpi4.nix` layers real Raspberry Pi 4 hardware modules on top of it for
+  `nixosConfigurations.tv-box-rpi4` -- see
+  [Raspberry Pi 4 image](#raspberry-pi-4-image).
 - **`daemon/`** -- a Rust daemon (`castoff-daemon`) that embeds mpv via
   [libmpv2](https://crates.io/crates/libmpv2), spawns Chromium (packaged alongside it, see
   [Building and running](#building-and-running)) for web pages, and exposes a local control API
@@ -529,6 +534,11 @@ nix flake check   # builds and tests the daemon package (via `checks`), and eval
                    # package) and the dev shell
 ```
 
+This builds and evaluates the `x86_64-linux` outputs. `nix flake check --all-systems` also
+evaluates the `aarch64-linux` outputs (`tv-box-rpi4`, `tv-box-rpi4-image`) but does not build them
+on a machine that can't execute `aarch64-linux` derivations -- see
+[Raspberry Pi 4 image](#raspberry-pi-4-image).
+
 The package's tests include the end-to-end webpage/routing test (see
 [How webpage (dashboard) display works](#how-webpage-dashboard-display-works)): it starts a real
 headless Cage session with the real Chromium engine and asserts on compositor pixels. The Nix
@@ -622,9 +632,13 @@ The page replaces the clock (Chromium maps over mpv), a media URL plays instead,
 (opcode `4`, no body) brings the clock back. `printf '\x01\x00\x00\x00\x0c' | nc 127.0.0.1 46899`
 is a `Ping`, if you just want to check the port is live.
 
+**SSH also works against the VM**, the same as [the Pi 4 image](#ssh-access): the VM forwards its
+guest's sshd to host port **2222**, so `ssh -p 2222 kiosk@127.0.0.1` reaches it once the VM is up
+(same `kiosk` user, initial password, and passwordless sudo as every other target).
+
 **"I see a black screen but no clock."** Press **Ctrl+Alt+3** in the QEMU window (or use its
-**View** menu to select the serial console): the VM autologins **root** there, so a blank screen
-always comes with a shell rather than a dead rectangle. Then:
+**View** menu to select the serial console), or SSH in as above: the VM autologins **root** on the
+serial console, so a blank screen always comes with a shell rather than a dead rectangle. Then:
 
 ```sh
 systemctl status cage-tty1          # the kiosk session
@@ -694,6 +708,180 @@ after Cage starts works normally. This is entirely VM-only tooling (`wlr-randr` 
 are not part of the appliance's runtime closure); the real box has no virtio-gpu resize event to
 react to in the first place.
 
+### Raspberry Pi 4 image
+
+`nixosConfigurations.tv-box-rpi4` (`nix/tv-box.nix` plus `nix/tv-box-rpi4.nix`) is the same
+appliance config as `tv-box`, but layered onto real Raspberry Pi 4 hardware modules from
+[nixos-raspberrypi](https://github.com/nvmd/nixos-raspberrypi) (kernel, firmware, `vc4-kms-v3d`
+display, Bluetooth) instead of `tv-box`'s generic x86_64 placeholders.
+`packages.aarch64-linux.tv-box-rpi4-image` builds it with `nixos-raspberrypi.lib.nixosSystemFull`
+plus that flake's `sd-image` module (imported directly by `nix/tv-box-rpi4.nix`, rather than
+through nixos-raspberrypi's own `nixosInstaller` helper, which also pulls in an installation-*media*
+profile with side effects -- forced documentation, a passwordless "nixos"/root account, console
+autologin -- that don't belong on a deployed, SSH-reachable appliance; see `flake.nix`'s comment on
+`tv-box-rpi4-system`). `sd-image` alone is what makes the result a single image that's both
+flashable installation media *and* a ready-to-use booted system -- the partition table auto-expands
+to fill the SD card on first boot, so there's no separate `nixos-anywhere`/`disko` install step.
+
+Build it (on an `aarch64-linux` machine, or an `x86_64-linux` machine with `aarch64-linux` cross
+build support enabled -- see below; this repo's own sandbox has neither, see further down):
+
+```sh
+# --accept-flake-config trusts nixos-raspberrypi's binary cache (see its own README), which
+# avoids rebuilding the Raspberry Pi kernel from source. --system aarch64-linux is required:
+# the bare flake shorthand `.#tv-box-rpi4-image` resolves against the CALLING machine's own
+# system first (i.e. `packages.<caller's system>.tv-box-rpi4-image`), so on any non-aarch64
+# machine it fails with "does not provide attribute packages.x86_64-linux.tv-box-rpi4-image"
+# without this flag -- confirmed against a real x86_64-linux laptop.
+nix build --accept-flake-config --system aarch64-linux .#packages.aarch64-linux.tv-box-rpi4-image
+```
+
+**Building on an `x86_64-linux` machine** (the common case) additionally needs `aarch64-linux`
+cross build support enabled on that machine, or the build fails at the same platform-mismatch
+error this project's own sandbox hits (see further down) -- `--system aarch64-linux` alone only
+selects *which* output to build, it doesn't grant the ability to build it. On NixOS, add this to
+your system configuration and `sudo nixos-rebuild switch`:
+
+```nix
+boot.binfmt.emulatedSystems = [ "aarch64-linux" ];
+```
+
+This registers QEMU user-mode emulation so the build actually runs (slowly -- it's emulating
+another CPU architecture) instead of hard-failing at the platform-mismatch check. On a non-NixOS
+distro, the equivalent is installing `qemu-user-static` and registering it with `binfmt_misc`
+(package name and exact steps vary by distro); a genuine `aarch64-linux` remote builder is an
+alternative to either.
+
+The daemon's own test suite (`cargo test`, including the Cage/Chromium end-to-end test) is skipped
+for the `aarch64-linux` build specifically -- `x86_64-linux` still runs its full test suite
+unchanged. Running that test binary under QEMU user-mode emulation is unreliable for verification
+(it can segfault the emulator itself on some tests, unrelated to actual code correctness), so
+verification for the Raspberry Pi 4 target happens on real Pi 4 hardware instead, not under
+emulation.
+
+**If you see `warning: ignoring untrusted substituter ... you are not a trusted user`, or
+`warning: ignoring the client-specified setting '"system"', because it is a restricted setting and
+you are not a trusted user`**: both come from the same cause -- a Nix daemon only honors
+client-specified overrides to *restricted* settings (substituters, trusted public keys, and
+`system` among them) from a `trusted-users` member; everything else silently falls back to the
+daemon's own configuration. `--accept-flake-config` only *offers* trust in nixos-raspberrypi's
+binary cache, it doesn't grant it, so the first warning's effect is just a slower build (it
+compiles the Raspberry Pi kernel from source instead of fetching a prebuilt one). The second
+warning is not merely slower and easy to miss: it means the daemon silently dropped
+`--system aarch64-linux` entirely and built for its own actual system instead -- on the common case
+of an `x86_64-linux` build machine, that's a **wrong, non-Pi output**, not the intended
+`aarch64-linux` image, even though the command otherwise appears to succeed. On NixOS, add yourself
+and rebuild:
+
+```nix
+nix.settings.trusted-users = [ "root" "your-username" ];
+```
+
+(non-NixOS: add the same to `trusted-users` in `/etc/nix/nix.conf` and restart the `nix-daemon`
+service).
+
+That produces `./result`, a *directory* (not the image file itself) containing the compressed image
+at `./result/sd-image/nixos-image-rpi4-uboot.img.zst`. Flash that file to an SD card (**this
+overwrites the entire card** -- double-check `of=`):
+
+```sh
+zstd -d --stdout ./result/sd-image/nixos-image-rpi4-uboot.img.zst | sudo dd of=/dev/sdX bs=4M status=progress conv=fsync
+# or, with raspberrypi-imager: choose "Use custom" and point it at that same .img.zst file.
+```
+
+#### Wi-Fi setup (no keyboard, mouse or monitor needed)
+
+The appliance has none of those attached once deployed, so Wi-Fi credentials have to be in place
+*before* the Pi ever boots -- there's no way to type them in afterwards. `nixosConfigurations.tv-box-rpi4`
+(`nix/tv-box-rpi4.nix`) declares a NetworkManager connection profile whose SSID/password are read
+at boot from a plain-text file, `/etc/castoff/wifi-credentials.env`, rather than baked into the
+Nix store; the flashed image already ships a placeholder copy of that file at that exact path, so
+there's nothing to create, only edit:
+
+1. Flash the SD card as above, then re-insert it into your computer (or leave it mounted) and open
+   its **root** filesystem -- the larger, second partition (ext4; needs a Linux machine, WSL, or an
+   ext4-capable tool on macOS/Windows), *not* the small FAT `FIRMWARE` partition.
+2. Edit `/etc/castoff/wifi-credentials.env` on that partition. It's plain `KEY=value` lines, no
+   quotes:
+   ```
+   WIFI_SSID=YourNetworkName
+   WIFI_PSK=YourNetworkPassword
+   ```
+3. Unmount the card and proceed to boot the Pi as below.
+
+Skipping this step (or leaving the placeholder values in place) isn't fatal -- NetworkManager just
+fails to associate and the appliance boots and runs normally otherwise (Ethernet, if plugged in,
+still works either way). This file is deliberately *not* managed the way most of NixOS's `/etc` is:
+that gets regenerated from the Nix store on every boot (which would silently overwrite whatever was
+written here before the very first boot), so this one file is instead baked straight into the
+image's filesystem at build time and left alone from then on -- see `nix/tv-box-rpi4.nix` for the
+mechanism.
+
+An established broadcast-own-AP-plus-phone captive-portal provisioning flow (the kind consumer IoT
+devices use) was considered as an alternative to this file, but no ready-made, well-documented NixOS
+module for one was found while building this -- this file-based approach is what shipped. If a
+captive-portal flow would be preferred instead, that's a follow-up someone can pick up separately.
+
+#### SSH access
+
+SSH is enabled by default on every target, including this Pi 4 image (`services.openssh.enable` in
+`nix/tv-box.nix`) -- with no keyboard/monitor once deployed, it's the only way to reach the box to
+diagnose or fix anything after first boot. The login user is `kiosk`, with `sudo` requiring no
+second password prompt (there's nowhere for one to go once you're already in over SSH). The initial
+login password is set in `nix/tv-box.nix` (`users.users.kiosk.initialPassword`) -- treat whatever is
+configured there as the device's actual credential, not a placeholder; change it after first login
+with `passwd` if desired.
+
+#### Boot-time diagnostic dump
+
+Every boot, `castoff-debug-dump.service` (`nix/tv-box-rpi4.nix`, Pi 4 only) overwrites
+`/var/log/castoff-debug.log` with a snapshot for exactly this kind of real-hardware debugging:
+`nmcli` general/device/connection status, `systemctl status`/`journalctl` for
+`NetworkManager-ensure-profiles.service` and `cage-tty1.service`, `ip addr`, `rfkill list` (if
+available), and `dmesg` lines matching `wifi`/`brcm`/`firmware`. It also dumps
+`/etc/castoff/wifi-credentials.env` itself with the PSK value redacted to its length, so the SSID
+and file format can be checked without exposing the password. Read it over SSH:
+```sh
+ssh kiosk@castoff-rpi4.local cat /var/log/castoff-debug.log
+```
+
+Put the card in a Raspberry Pi 4B, connect it to power and Ethernet or Wi-Fi (per the step above),
+and boot it -- an HDMI display is optional, useful only for the visual check below, never required
+for network join. What to look for:
+
+- **The appliance's idle screen**: a large white clock centred on a black screen, the same as the
+  VM (see above) -- that's Cage running the daemon as its one fullscreen client.
+- **The box is reachable on the LAN.** It advertises itself over mDNS/avahi (`castoff-rpi4.local`)
+  and listens for FCast on port 46899; from another machine on the same network:
+  ```sh
+  ping castoff-rpi4.local
+  nc -zv castoff-rpi4.local 46899
+  ```
+- **`castoff-daemon` is actually running the kiosk session.** Over SSH (`ssh
+  kiosk@castoff-rpi4.local`, see [SSH access](#ssh-access) above) or a directly attached keyboard:
+  ```sh
+  systemctl status cage-tty1
+  journalctl -b -u cage-tty1
+  ```
+- **A shared YouTube link plays.** Cast a `youtube.com`/`youtu.be` URL to the box (an FCast `Play`,
+  same as the [manual protocol test](#manual-protocol-test) above, or a real FCast sender) and
+  confirm it starts playing video, not just that the daemon accepted the command.
+
+**What was and wasn't verified here.** This sandbox has neither an `aarch64-linux` builder nor
+`aarch64-linux` QEMU user-mode emulation configured (no `boot.binfmt.emulatedSystems`, no
+`binfmt_misc` entries) -- `nix flake check --all-systems` and `nix eval` on every new output
+resolve cleanly, and `nix build --dry-run .#packages.aarch64-linux.tv-box-rpi4-image` resolves the
+entire ~430-derivation closure with no errors, but an actual build was never executed: a direct,
+non-dry-run `nix build` attempt fails with a genuine `error: Cannot build ... Reason: platform
+mismatch, Required system: 'aarch64-linux', Current system: 'x86_64-linux'`, confirming this is an
+environment limitation, not a configuration error. Hardware playback performance (YouTube decode,
+Cage/wlroots rendering) on real Pi 4 silicon was explicitly out of scope for this change -- see
+[Not yet implemented](#not-yet-implemented-follow-up-work) -- and was not and could not be tested
+here; the steps above are exactly what to check on real hardware. The same applies to the Wi-Fi
+setup above: `nix eval` confirms the NetworkManager profile and the credentials-file mechanism
+build correctly into the image's derivation graph, but actually joining a real network on real
+hardware is something only a real Pi 4B boot can confirm, and is not tested here.
+
 ### Dev shell
 
 ```sh
@@ -760,9 +948,13 @@ Out of scope for this scaffold, deliberately:
 - The native Android control app, including handling Android `Share` intents and the upload
   client for [Image uploads (private extension)](#image-uploads-private-extension)'s HTTP
   endpoint -- the daemon-side upload contract exists, but nothing in this repo sends to it yet.
-- Appliance disk-image generation (e.g. via `nixos-generators`/`disko`) for a flashable image;
-  today's `tv-box` configuration needs a real `fileSystems."/"` and bootloader target to install
-  to actual hardware (the flake ships placeholder values for `nix flake check`/VM use).
+- x86_64 appliance disk-image generation for real hardware (e.g. via `nixos-generators`/`disko`);
+  `tv-box`'s `fileSystems."/"` and bootloader target are still generic placeholders for
+  `nix flake check`/VM use (see `nix/tv-box-x86_64.nix`). A flashable image *is* implemented for
+  the Raspberry Pi 4 target -- see [Raspberry Pi 4 image](#raspberry-pi-4-image).
+- Playback-quality/resolution options for the Raspberry Pi 4 target (e.g. capping YouTube
+  quality) -- deliberately not built preemptively; a follow-up only if real Pi 4 hardware testing
+  finds a need for it.
 - Any authentication/credential flow, which is also what a dashboard behind a login (e.g. a
   private Grafana) needs; today's webpage display is for pages reachable without credentials.
 - Interaction with a displayed page (clicking, typing, scrolling, remote control) and
