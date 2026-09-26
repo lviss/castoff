@@ -4,22 +4,35 @@
 # from `nixos-raspberrypi` (github:nvmd/nixos-raspberrypi) layered under
 # `nix/tv-box.nix`'s target-independent kiosk config, the same way
 # `nix/tv-box-x86_64.nix` layers generic placeholders under it for the VM
-# target. `flake.nix` builds this with `nixos-raspberrypi.lib.nixosInstaller`,
-# which adds that flake's own `sd-image`/`raspberrypi-installer` modules on
-# top of this one -- that combination is what makes
-# `packages.aarch64-linux.tv-box-rpi4-image` a single image that's both
-# flashable installation media and a ready-to-boot system (the partition
-# table auto-expands to fill the SD card on first boot; no separate
-# nixos-anywhere/disko install step). `nixos-raspberrypi.lib.nixosInstaller`
-# (and its siblings `nixosSystem`/`nixosSystemFull`) pass `nixos-raspberrypi`
-# into every module's `specialArgs` automatically, per its README, so this
-# module doesn't need `flake.nix` to do that by hand.
+# target. `flake.nix` builds this with `nixos-raspberrypi.lib.nixosSystemFull`
+# (which auto-injects `nixos-raspberrypi` into every module's `specialArgs`,
+# per its README, so this module doesn't need `flake.nix` to do that by
+# hand) -- this module imports nixos-raspberrypi's `sd-image` module itself,
+# rather than going through that flake's own `nixosInstaller` helper, which
+# also pulls in `raspberrypi-installer.nix` and, through it, nixpkgs'
+# `profiles/installation-device.nix`: the profile for installation *media*,
+# not a deployed appliance (it force-enables `documentation.*`, creates a
+# passwordless "nixos" account and a passwordless root account, autologins
+# "nixos" at the console, and sets `PermitRootLogin = mkDefault "yes"` --
+# confirmed by reading that profile directly; see `flake.nix`'s comment on
+# `tv-box-rpi4-system` for the full list). Importing `sd-image` directly here
+# keeps the actual flashability -- `config.system.build.sdImage`, the
+# partition table auto-expanding to fill the SD card on first boot, no
+# separate nixos-anywhere/disko install step -- without any of that.
 {
   imports = with nixos-raspberrypi.nixosModules; [
     raspberry-pi-4.base
     raspberry-pi-4.display-vc4
     raspberry-pi-4.bluetooth
+    sd-image
   ];
+
+  # `raspberrypi-installer.nix` (not imported here -- see above) also carried
+  # this real, unrelated-to-"installer media" boot fix: RPi's initrd fails
+  # partway through writing itself when `boot.swraid`'s auto-assembly probing
+  # is active ("/initrd.image: incomplete write (-28 != ...)", subsequently
+  # failing to boot at all), so it's disabled the same way here.
+  boot.swraid.enable = lib.mkForce false;
 
   # `nix/tv-box.nix` sets this with `mkDefault "24.11"` for the x86_64
   # placeholder target; this config actually installs against

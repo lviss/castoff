@@ -140,14 +140,25 @@
 
       # The Raspberry Pi 4 appliance configuration: nix/tv-box.nix's
       # target-independent kiosk config layered onto nixos-raspberrypi's Pi 4
-      # hardware modules via nix/tv-box-rpi4.nix. `nixosInstaller` (rather
-      # than `nixosSystem`) is what makes the resulting image directly
-      # flashable *and* bootable in one step -- it adds nixos-raspberrypi's
-      # own `sd-image`/`raspberrypi-installer` modules, whose partition table
-      # auto-expands to fill the SD card on first boot, so no separate
-      # nixos-anywhere/disko install step is needed. See nix/tv-box-rpi4.nix
+      # hardware modules via nix/tv-box-rpi4.nix. `nixosSystemFull` (rather
+      # than the plainer `nixosSystem`) is the same "full" RPi-optimised
+      # package set nixos-raspberrypi's own `nixosInstaller` uses -- this
+      # flake used `nixosInstaller` originally, but that also pulls in
+      # nixos-raspberrypi's `raspberrypi-installer.nix`, which imports
+      # nixpkgs' `profiles/installation-device.nix`: the profile for
+      # installation *media*, not a deployed appliance. Confirmed by reading
+      # it directly, that profile force-enables `documentation.*` (overriding
+      # `nix/tv-box.nix`'s deliberate closure-trimming), creates a
+      # passwordless "nixos" user *and* a passwordless root account, sets
+      # `services.getty.autologinUser = "nixos"`, and sets
+      # `services.openssh.settings.PermitRootLogin = mkDefault "yes"` -- none
+      # of that belongs on a deployed, SSH-reachable box. `nix/tv-box-rpi4.nix`
+      # instead imports nixos-raspberrypi's `sd-image` module directly (the
+      # actual flashability/auto-expanding-partition-table piece) without
+      # `raspberrypi-installer.nix`, so the appliance gets a flashable image
+      # with none of the installer-media side effects. See nix/tv-box-rpi4.nix
       # and README's Raspberry Pi 4 section.
-      tv-box-rpi4-system = nixos-raspberrypi.lib.nixosInstaller {
+      tv-box-rpi4-system = nixos-raspberrypi.lib.nixosSystemFull {
         specialArgs = { castoffDaemon = castoffDaemon.aarch64-linux; };
         modules = [ ./nix/tv-box.nix ./nix/tv-box-rpi4.nix ];
       };

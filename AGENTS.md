@@ -411,18 +411,29 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   Raspberry Pi 4 SD image via [`nixos-raspberrypi`](https://github.com/nvmd/nixos-raspberrypi)
   (github:nvmd/nixos-raspberrypi), a separate flake input from this project's main `nixpkgs` pin --
   its hardware modules are validated against its own pinned nixpkgs, so it is deliberately not
-  `nixpkgs.follows`-ed. Its `lib.nixosInstaller` (not the plainer `nixosSystem`/`nixosSystemFull`)
-  is what makes the result both flashable installer media *and* a ready-to-boot system in one
-  image -- it layers that flake's own `sd-image`/`raspberrypi-installer` modules on top, whose
-  partition table auto-expands to fill the SD card on first boot, so no separate
-  `nixos-anywhere`/`disko` install step is needed for this use case (nixos-raspberrypi also
-  supports that combination separately, for installing onto other target disks -- not what this
-  project uses). `nixosInstaller` (like its siblings) automatically injects `nixos-raspberrypi`
-  itself into every module's `specialArgs`, so `nix/tv-box-rpi4.nix` can just reference it without
-  `flake.nix` wiring that by hand. `config.system.build.sdImage`'s output (`nix build`'s `./result`
-  symlink) is a *directory*, not the compressed image file itself -- the actual file lives inside
-  it at `sd-image/<name>.img.zst`; decompress that path with `zstd -d` before `dd`, not `./result`
-  directly.
+  `nixpkgs.follows`-ed. `flake.nix` builds it with `lib.nixosSystemFull` (the same "full"
+  RPi-optimised package set `lib.nixosInstaller` uses) plus that flake's `sd-image` module, imported
+  directly by `nix/tv-box-rpi4.nix` rather than through `lib.nixosInstaller` itself.
+  `nixosInstaller` also pulls in `raspberrypi-installer.nix`, and through it nixpkgs'
+  `profiles/installation-device.nix` -- the profile for installation *media*, confirmed by reading
+  it directly to force-enable `documentation.*` (overriding `nix/tv-box.nix`'s deliberate
+  closure-trimming), create a passwordless "nixos" account *and* a passwordless root account,
+  autologin "nixos" at the console, and set `services.openssh.settings.PermitRootLogin = mkDefault
+  "yes"` -- none of which belongs on a deployed, SSH-reachable appliance. `sd-image` alone (without
+  `raspberrypi-installer.nix`) is what actually makes the result both flashable installer media
+  *and* a ready-to-boot system in one image -- its partition table auto-expands to fill the SD card
+  on first boot, so no separate `nixos-anywhere`/`disko` install step is needed for this use case
+  (nixos-raspberrypi also supports that combination separately, for installing onto other target
+  disks -- not what this project uses). `raspberrypi-installer.nix` did carry one real,
+  unrelated-to-"installer media" fix worth keeping regardless -- `boot.swraid.enable = false`, since
+  RPi's initrd fails partway through writing itself with swraid's auto-assembly probing active --
+  `nix/tv-box-rpi4.nix` re-applies that fix directly now that the module bringing it isn't imported.
+  `nixosSystemFull` (like its siblings, including `nixosInstaller`) automatically injects
+  `nixos-raspberrypi` itself into every module's `specialArgs`, so `nix/tv-box-rpi4.nix` can just
+  reference it without `flake.nix` wiring that by hand. `config.system.build.sdImage`'s output
+  (`nix build`'s `./result` symlink) is a *directory*, not the compressed image file itself -- the
+  actual file lives inside it at `sd-image/<name>.img.zst`; decompress that path with `zstd -d`
+  before `dd`, not `./result` directly.
   `nix/tv-box.nix` (the shared kiosk config: Cage/`kiosk` user, the daemon service, audio,
   firewall, avahi, power trimming) is target-independent; `nix/tv-box-x86_64.nix` and
   `nix/tv-box-rpi4.nix` are the two per-target hardware/filesystem/bootloader layers on top of it

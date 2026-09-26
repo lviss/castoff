@@ -714,10 +714,14 @@ react to in the first place.
 appliance config as `tv-box`, but layered onto real Raspberry Pi 4 hardware modules from
 [nixos-raspberrypi](https://github.com/nvmd/nixos-raspberrypi) (kernel, firmware, `vc4-kms-v3d`
 display, Bluetooth) instead of `tv-box`'s generic x86_64 placeholders.
-`packages.aarch64-linux.tv-box-rpi4-image` builds it with `nixos-raspberrypi.lib.nixosInstaller`,
-which is what makes the result a single image that's both flashable installation media *and* a
-ready-to-use booted system -- the partition table auto-expands to fill the SD card on first boot,
-so there's no separate `nixos-anywhere`/`disko` install step.
+`packages.aarch64-linux.tv-box-rpi4-image` builds it with `nixos-raspberrypi.lib.nixosSystemFull`
+plus that flake's `sd-image` module (imported directly by `nix/tv-box-rpi4.nix`, rather than
+through nixos-raspberrypi's own `nixosInstaller` helper, which also pulls in an installation-*media*
+profile with side effects -- forced documentation, a passwordless "nixos"/root account, console
+autologin -- that don't belong on a deployed, SSH-reachable appliance; see `flake.nix`'s comment on
+`tv-box-rpi4-system`). `sd-image` alone is what makes the result a single image that's both
+flashable installation media *and* a ready-to-use booted system -- the partition table auto-expands
+to fill the SD card on first boot, so there's no separate `nixos-anywhere`/`disko` install step.
 
 Build it (on an `aarch64-linux` machine, or an `x86_64-linux` machine with `aarch64-linux` cross
 build support enabled -- see below; this repo's own sandbox has neither, see further down):
