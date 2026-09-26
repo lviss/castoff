@@ -23,10 +23,14 @@
 
   # `nix/tv-box.nix` sets this with `mkDefault "24.11"` for the x86_64
   # placeholder target; this config actually installs against
-  # nixos-raspberrypi's own pinned nixpkgs (see `flake.nix`), so pin it to
-  # whatever release that pin resolves to rather than inheriting an
-  # unrelated default.
-  system.stateVersion = config.system.nixos.release;
+  # nixos-raspberrypi's own pinned nixpkgs (see `flake.nix`), so it needs its
+  # own value rather than inheriting an unrelated default. Frozen to a
+  # literal (the release `config.system.nixos.release` resolved to at the
+  # time this was written) rather than tracking that expression live: the
+  # `nixos-raspberrypi` input is unpinned, so a routine `nix flake update
+  # nixos-raspberrypi` would otherwise silently advance stateVersion on an
+  # already-deployed box.
+  system.stateVersion = "26.05";
 
   networking.hostName = "castoff-rpi4";
 

@@ -776,12 +776,13 @@ nix.settings.trusted-users = [ "root" "your-username" ];
 (non-NixOS: add the same to `trusted-users` in `/etc/nix/nix.conf` and restart the `nix-daemon`
 service).
 
-That produces `./result`, a compressed image (`nixos-image-rpi4-uboot.img.zst`). Flash it to an SD
-card (**this overwrites the entire card** -- double-check `of=`):
+That produces `./result`, a *directory* (not the image file itself) containing the compressed image
+at `./result/sd-image/nixos-image-rpi4-uboot.img.zst`. Flash that file to an SD card (**this
+overwrites the entire card** -- double-check `of=`):
 
 ```sh
-zstd -d --stdout ./result | sudo dd of=/dev/sdX bs=4M status=progress conv=fsync
-# or, with raspberrypi-imager: choose "Use custom" and point it at ./result directly.
+zstd -d --stdout ./result/sd-image/nixos-image-rpi4-uboot.img.zst | sudo dd of=/dev/sdX bs=4M status=progress conv=fsync
+# or, with raspberrypi-imager: choose "Use custom" and point it at that same .img.zst file.
 ```
 
 #### Wi-Fi setup (no keyboard, mouse or monitor needed)
@@ -865,8 +866,9 @@ for network join. What to look for:
 **What was and wasn't verified here.** This sandbox has neither an `aarch64-linux` builder nor
 `aarch64-linux` QEMU user-mode emulation configured (no `boot.binfmt.emulatedSystems`, no
 `binfmt_misc` entries) -- `nix flake check --all-systems` and `nix eval` on every new output
-resolve cleanly, and `nix build --dry-run .#tv-box-rpi4-image` resolves the entire ~430-derivation
-closure with no errors, but an actual build was never executed: a direct, non-dry-run `nix build`
+resolve cleanly, and `nix build --dry-run .#packages.aarch64-linux.tv-box-rpi4-image` resolves the
+entire ~430-derivation closure with no errors, but an actual build was never executed: a direct,
+non-dry-run `nix build`
 attempt fails with a genuine `error: Cannot build ... Reason: platform mismatch, Required system:
 'aarch64-linux', Current system: 'x86_64-linux'`, confirming this is an environment limitation, not
 a configuration error. Hardware playback performance (YouTube decode, Cage/wlroots rendering) on

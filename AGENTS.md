@@ -418,9 +418,10 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   supports that combination separately, for installing onto other target disks -- not what this
   project uses). `nixosInstaller` (like its siblings) automatically injects `nixos-raspberrypi`
   itself into every module's `specialArgs`, so `nix/tv-box-rpi4.nix` can just reference it without
-  `flake.nix` wiring that by hand. `config.system.build.sdImage`'s output is the compressed image
-  file itself (`<name>.img.zst`), not a directory -- `nix build`'s `./result` symlink points
-  straight at it, decompress with `zstd -d` before `dd`.
+  `flake.nix` wiring that by hand. `config.system.build.sdImage`'s output (`nix build`'s `./result`
+  symlink) is a *directory*, not the compressed image file itself -- the actual file lives inside
+  it at `sd-image/<name>.img.zst`; decompress that path with `zstd -d` before `dd`, not `./result`
+  directly.
   `nix/tv-box.nix` (the shared kiosk config: Cage/`kiosk` user, the daemon service, audio,
   firewall, avahi, power trimming) is target-independent; `nix/tv-box-x86_64.nix` and
   `nix/tv-box-rpi4.nix` are the two per-target hardware/filesystem/bootloader layers on top of it
