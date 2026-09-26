@@ -338,9 +338,10 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   - The VM's serial console autologins root (a `serial-getty@ttyS0` override in the vmVariant).
     It must be `overrideStrategy = "asDropin"`: systemd ignores a unit *file* named after a
     template *instance*, so the plain `serviceConfig` form silently leaves the `login:` prompt.
-    That console is the VM's promised fallback for a blank screen; see README's VM section for what
-    the captain should see (QEMU `Ctrl+Alt+3`) and the host-side FCast port forward
-    (`virtualisation.forwardPorts`, 46899, bound on all host interfaces by SLiRP).
+    That console is one fallback for a blank screen; SSH (forwarded from host port 2222, same
+    `virtualisation.forwardPorts` mechanism as the FCast/upload ports) is the other. See README's VM
+    section for what the captain should see (QEMU `Ctrl+Alt+3`) and the forwarded ports themselves
+    (`virtualisation.forwardPorts`, bound on all host interfaces by SLiRP).
   - **`virtualisation.cores` defaults to 1** in nixpkgs' qemu-vm module (`virtualisation.memorySize`
     already defaulted sanely). One core is not enough for this VM's all-software stack (Cage, mpv
     and Chromium all draw through llvmpipe, which itself wants several cores) -- measured on a

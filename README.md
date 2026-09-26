@@ -868,11 +868,10 @@ for network join. What to look for:
 `binfmt_misc` entries) -- `nix flake check --all-systems` and `nix eval` on every new output
 resolve cleanly, and `nix build --dry-run .#packages.aarch64-linux.tv-box-rpi4-image` resolves the
 entire ~430-derivation closure with no errors, but an actual build was never executed: a direct,
-non-dry-run `nix build`
-attempt fails with a genuine `error: Cannot build ... Reason: platform mismatch, Required system:
-'aarch64-linux', Current system: 'x86_64-linux'`, confirming this is an environment limitation, not
-a configuration error. Hardware playback performance (YouTube decode, Cage/wlroots rendering) on
-real Pi 4 silicon was explicitly out of scope for this change -- see
+non-dry-run `nix build` attempt fails with a genuine `error: Cannot build ... Reason: platform
+mismatch, Required system: 'aarch64-linux', Current system: 'x86_64-linux'`, confirming this is an
+environment limitation, not a configuration error. Hardware playback performance (YouTube decode,
+Cage/wlroots rendering) on real Pi 4 silicon was explicitly out of scope for this change -- see
 [Not yet implemented](#not-yet-implemented-follow-up-work) -- and was not and could not be tested
 here; the steps above are exactly what to check on real hardware. The same applies to the Wi-Fi
 setup above: `nix eval` confirms the NetworkManager profile and the credentials-file mechanism
