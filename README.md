@@ -466,9 +466,41 @@ pages). Web pages additionally need a Wayland session, because the engine is lau
 `--ozone-platform=wayland` -- running the daemon as Cage's client, as the appliance does, provides
 that; a bare desktop session where `WAYLAND_DISPLAY` is set does as well.
 
+### Casting from a computer
+
+`scripts/cast.sh` is a command-line FCast sender -- it reproduces castoff-android's full
+`FCastClient.kt` command surface (play/pause/resume/stop/seek/volume/ping, the queue extension,
+and the image-upload+wallpaper extension) so the daemon can be driven from a computer, for
+everyday control or for manual testing, without the Android app:
+
+```sh
+scripts/cast.sh ping
+scripts/cast.sh play 'https://www.youtube.com/watch?v=dQw4w9WgXcQ'
+scripts/cast.sh volume 0.5
+scripts/cast.sh queue-request
+scripts/cast.sh upload-image photo.jpg --display --wallpaper
+scripts/cast.sh --help   # full command list
+```
+
+It defaults to `127.0.0.1:46899`/`46900` (override with `--host`/`--port`/`--image-port`, or the
+daemon's own `CASTOFF_HOST`/`CASTOFF_PORT`/`CASTOFF_IMAGE_PORT` env vars, so pointing it at a real
+box is just `CASTOFF_HOST=<box> scripts/cast.sh ...`). It needs `perl` (byte-level framing,
+`scripts/lib/fcast-client.pl`), `jq` (JSON construction/parsing) and `curl` (image upload); all
+three are in `devShells.default`, so `nix develop` provides them. See
+`scripts/tests/` for its test coverage (framing round-trips and the queue-reply-skip behavior
+below, run with `scripts/tests/run.sh`).
+
+One correctness detail worth knowing if you're reading the implementation: a queue command's
+`QueueState` reply is not always the very next frame on the wire, because some queue commands also
+trigger a `PlaybackUpdate` published to every connection first (e.g. `ClearQueue` stops playback).
+`fcast-client.pl`'s `read_queue_reply` keeps reading and discards any `PlaybackUpdate` until
+`QueueState` (or connection close) arrives, mirroring castoff-android's `FCastClient.kt` and this
+daemon's own `read_queue_state` test helper (`daemon/src/main.rs`).
+
 ### Manual protocol test
 
-With the daemon running, send raw FCast frames, e.g. a `Ping` (opcode `12`, no body -> length 1):
+For lower-level debugging than `scripts/cast.sh` -- or if it's the thing that's broken -- send raw
+FCast frames by hand. A `Ping` (opcode `12`, no body -> length 1):
 
 ```sh
 printf '\x01\x00\x00\x00\x0c' | socat - TCP:127.0.0.1:46899 | xxd
@@ -485,46 +517,11 @@ perl -e '
 # -> VolumeUpdate reply: {"generationTime":...,"volume":0.5}
 ```
 
-or a web page (opcode `1`). No `container` is needed -- the daemon tries media first and falls
-back to the browser engine, see
-[How the daemon decides between media and a web page](#how-the-daemon-decides-between-media-and-a-web-page)
--- but a sender that already knows can say so explicitly:
-
-```sh
-perl -e '
-  my $body = q({"url":"http://127.0.0.1:8000/dashboard.html"});
-  print pack("V", length($body) + 1), chr(1), $body;
-' | socat - TCP:127.0.0.1:46899 | xxd
-# -> PlaybackUpdate reply: {"state":1,...}  (Playing while the page is displayed)
-
-# ... or, with the explicit MIME type that skips the media attempt entirely:
-perl -e '
-  my $body = q({"container":"text/html","url":"http://127.0.0.1:8000/dashboard.html"});
-  print pack("V", length($body) + 1), chr(1), $body;
-' | socat - TCP:127.0.0.1:46899 | xxd
-```
-
-or upload and display an image (see [Image uploads (private extension)](#image-uploads-private-extension)):
-
-```sh
-resp=$(curl -s -X POST --data-binary @photo.jpg -H 'Content-Type: image/jpeg' \
-  http://127.0.0.1:46900/images)
-echo "$resp"   # -> {"id":"...","url":"file://...","container":"image/jpeg"}
-
-# Feed the response's url/container straight into an ordinary Play:
-perl -e '
-  my $body = shift;
-  print pack("V", length($body) + 1), chr(1), $body;
-' "$(echo "$resp" | jq -c '{url, container}')" | socat - TCP:127.0.0.1:46899 | xxd
-
-# Tag that same id for idle-screen wallpaper rotation (opcode 20):
-id=$(echo "$resp" | jq -r .id)
-perl -e '
-  my $body = shift;
-  print pack("V", length($body) + 1), chr(20), $body;
-' "{\"id\":\"$id\",\"wallpaper\":true}" | socat - TCP:127.0.0.1:46899 | xxd
-# -> ImageWallpaperUpdate reply (opcode 21): {"generationTime":...,"id":"...","wallpaper":true}
-```
+`scripts/cast.sh`'s own framing (`scripts/lib/fcast-client.pl`) follows this exact same
+perl-packs-the-frame, socket-sends-it convention, just via Perl's `IO::Socket::INET` directly
+rather than piping through `socat` -- needed so it can read an arbitrary number of reply frames
+per command (the `QueueState`-after-`PlaybackUpdate` case above) without bash's binary-unsafe
+`read` builtin in the way.
 
 ### Whole-system checks
 
@@ -864,8 +861,9 @@ for network join. What to look for:
   journalctl -b -u cage-tty1
   ```
 - **A shared YouTube link plays.** Cast a `youtube.com`/`youtu.be` URL to the box (an FCast `Play`,
-  same as the [manual protocol test](#manual-protocol-test) above, or a real FCast sender) and
-  confirm it starts playing video, not just that the daemon accepted the command.
+  e.g. `CASTOFF_HOST=castoff-rpi4.local scripts/cast.sh play '<url>'`, see
+  [Casting from a computer](#casting-from-a-computer) above, or a real FCast sender) and confirm
+  it starts playing video, not just that the daemon accepted the command.
 
 **What was and wasn't verified here.** This sandbox has neither an `aarch64-linux` builder nor
 `aarch64-linux` QEMU user-mode emulation configured (no `boot.binfmt.emulatedSystems`, no

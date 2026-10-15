@@ -1,0 +1,118 @@
+#!/usr/bin/env bash
+# Integration tests for scripts/cast.sh: runs the real script as a
+# subprocess against throwaway fake FCast/HTTP servers (fake-fcast-server.pl,
+# fake-http-server.pl), so the actual TCP round trip, the queue-reply skip
+# logic, and the upload-image HTTP flow are all exercised for real -- not
+# just the pure-framing logic scripts/tests/test_fcast_client.pl covers.
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CAST_SH="$SCRIPT_DIR/../cast.sh"
+
+pass=0
+fail=0
+
+assert_eq() {
+    local desc="$1" expected="$2" actual="$3"
+    if [[ "$expected" == "$actual" ]]; then
+        pass=$((pass + 1))
+    else
+        fail=$((fail + 1))
+        echo "FAIL: $desc"
+        echo "  expected: $expected"
+        echo "  actual:   $actual"
+    fi
+}
+
+assert_status_nonzero() {
+    local desc="$1" status="$2"
+    if [[ "$status" -ne 0 ]]; then
+        pass=$((pass + 1))
+    else
+        fail=$((fail + 1))
+        echo "FAIL: $desc (expected a nonzero exit status, got 0)"
+    fi
+}
+
+# Waits for a fake server's --port-file to appear and have content, then
+# echoes the port it picked.
+read_port() {
+    local port_file="$1" tries=50
+    while [[ ! -s "$port_file" ]]; do
+        tries=$((tries - 1))
+        [[ $tries -gt 0 ]] || { echo "timed out waiting for $port_file" >&2; return 1; }
+        sleep 0.1
+    done
+    cat "$port_file"
+}
+
+test_ping() {
+    local port_file; port_file="$(mktemp -u)"
+    perl "$SCRIPT_DIR/fake-fcast-server.pl" --port-file "$port_file" --scenario ping &
+    local server_pid=$!
+    local port; port="$(read_port "$port_file")"
+
+    local out
+    out="$(CASTOFF_PORT="$port" "$CAST_SH" ping)"
+    wait "$server_pid" 2>/dev/null
+    rm -f "$port_file"
+
+    assert_eq "ping replies pong" "pong" "$out"
+}
+
+test_queue_clear_skips_interleaved_playback_update() {
+    local port_file; port_file="$(mktemp -u)"
+    perl "$SCRIPT_DIR/fake-fcast-server.pl" --port-file "$port_file" --scenario queue-skip &
+    local server_pid=$!
+    local port; port="$(read_port "$port_file")"
+
+    local out
+    out="$(CASTOFF_PORT="$port" "$CAST_SH" queue-clear)"
+    wait "$server_pid" 2>/dev/null
+    rm -f "$port_file"
+
+    local current_index
+    current_index="$(jq '.currentIndex' <<<"$out")"
+    assert_eq "queue-clear decodes QueueState, not the interleaved PlaybackUpdate" "null" "$current_index"
+}
+
+test_ping_fails_loudly_when_server_closes_without_a_reply() {
+    local port_file; port_file="$(mktemp -u)"
+    perl "$SCRIPT_DIR/fake-fcast-server.pl" --port-file "$port_file" --scenario closes-without-reply &
+    local server_pid=$!
+    local port; port="$(read_port "$port_file")"
+
+    CASTOFF_PORT="$port" "$CAST_SH" ping >/dev/null 2>&1
+    local status=$?
+    wait "$server_pid" 2>/dev/null
+    rm -f "$port_file"
+
+    assert_status_nonzero "ping exits nonzero when the connection closes before a reply" "$status"
+}
+
+test_upload_image() {
+    local port_file; port_file="$(mktemp -u)"
+    perl "$SCRIPT_DIR/fake-http-server.pl" --port-file "$port_file" &
+    local server_pid=$!
+    local port; port="$(read_port "$port_file")"
+
+    local tmp_img; tmp_img="$(mktemp --suffix=.jpg)"
+    printf '\xff\xd8\xff\xd9' > "$tmp_img"
+
+    local out
+    out="$(CASTOFF_IMAGE_PORT="$port" "$CAST_SH" upload-image "$tmp_img")"
+    wait "$server_pid" 2>/dev/null
+    rm -f "$port_file" "$tmp_img"
+
+    local id
+    id="$(jq -r '.id' <<<"$out")"
+    assert_eq "upload-image prints the daemon's returned id" "test-id-1" "$id"
+}
+
+test_ping
+test_queue_clear_skips_interleaved_playback_update
+test_ping_fails_loudly_when_server_closes_without_a_reply
+test_upload_image
+
+echo "passed: $pass failed: $fail"
+[[ $fail -eq 0 ]]

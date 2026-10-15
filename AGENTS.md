@@ -519,6 +519,31 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   image before it is ever booted and is completely outside `/etc`'s store-tracked, every-boot-reset
   tree, so it is never touched again once the image is built.
 
+- `scripts/cast.sh` is a command-line FCast sender reproducing castoff-android's `FCastClient.kt`
+  command surface, for controlling the daemon (or testing it) from a computer -- see README's
+  "Casting from a computer". Its byte-level framing/socket I/O (`scripts/lib/fcast-client.pl`)
+  deliberately does **not** follow the README's `perl`-packs-the-frame-then-pipes-to-`socat`
+  convention used elsewhere in this project: queue commands need to read an unbounded number of
+  reply frames (discarding an interleaved `PlaybackUpdate` until `QueueState` arrives, the same
+  gotcha `FCastClient.kt`'s `readQueueStateReply` and `daemon/src/main.rs`'s `read_queue_state`
+  test helper both work around), and the 4-byte little-endian length prefix routinely contains NUL
+  bytes that bash's `read` builtin cannot hold in a variable. `fcast-client.pl` uses Perl's own
+  `IO::Socket::INET` for the whole round trip instead, which is both binary-safe and avoids a
+  socat/coproc/fd-juggling dance in bash for what is otherwise a one-shot connection per command
+  (mirroring `FCastClient.kt`'s own one-connection-per-command model). Do not "fix" this back to
+  piping through `socat` without re-solving the same binary-safety problem.
+  `fcast-client.pl` guards its CLI entry point with `main() unless caller`, so
+  `scripts/tests/test_fcast_client.pl` can `require` it and unit-test `encode_frame`/`read_frame`/
+  `read_queue_reply` directly against in-memory scalar-ref filehandles -- no daemon, no network.
+  `scripts/tests/test_cast_sh.sh` separately drives the real `cast.sh` as a subprocess against two
+  throwaway fake servers (`fake-fcast-server.pl`, `fake-http-server.pl`), each binding an ephemeral
+  port and writing it to a `--port-file` the test script polls, rather than a fixed port, to avoid
+  a bind race between picking a "free" port and the server actually claiming it. Run the whole
+  suite with `scripts/tests/run.sh`; CI runs it as a separate `cast-script-tests` job
+  (`.github/workflows/ci.yml`), independent of the `flake-check` job. `perl`/`socat`/`jq` were
+  added to `devShells.default` in `flake.nix` for this (`socat` is kept for the README's own manual
+  protocol-test examples, which `cast.sh` complements rather than replaces for low-level debugging).
+
 ## Maintaining this file
 
 Keep this file for knowledge useful to almost every future agent session in this project.
