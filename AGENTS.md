@@ -104,6 +104,44 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   `is_active()` there instead made a `Play` arriving during that cosmetic fade-out still interrupt
   already-genuine playback rather than queue behind it (regression tests
   `play_while_playing_enqueues_instead_of_interrupting` and siblings in `player.rs`).
+- Every `osd-overlay` command's `res_x`/`res_y` declares the ASS coordinate space the drawing's
+  points are authored in, and mpv scales that declared canvas to whatever its *actual* current OSD
+  render-target size is -- independently per axis (confirmed empirically: a declared-vs-actual
+  aspect-ratio mismatch stretches non-uniformly, not a letterboxed/aspect-correct fit). A fixed,
+  hardcoded declared canvas (`overlay.rs`'s old `CANVAS_WIDTH`/`HEIGHT` 1920x1080) is therefore only
+  safe when the real output is also exactly that aspect ratio; on anything else (confirmed on the Pi
+  4 appliance and the NixOS VM) a shape whose math assumes equal-axis scaling -- `overlay.rs`'s
+  spinner, drawn as a true circle in canvas space via equal-magnitude trig -- comes out stretched
+  into an oval. The fix is `overlay.rs`'s `current_canvas`: read mpv's own `osd-width`/`osd-height`
+  properties (through the same `Mpv` handle, confirmed against the pinned 0.41.0 via
+  `--list-properties`) fresh on every draw and declare that as `res_x`/`res_y`, so the declared and
+  actual canvas can never mismatch; `spinner_ass`'s radii scale proportionally to
+  `min(canvas_w, canvas_h)` so the spinner's on-screen size is unchanged at the historical 1920x1080
+  and still looks reasonable elsewhere. `osd-width`/`osd-height` read back `0` before mpv's window is
+  actually mapped (confirmed empirically), so `current_canvas` falls back to the old fixed
+  1920x1080 only in that narrow window, never as the steady-state behavior. `idle_screen.rs` has the
+  same hardcoded-canvas pattern but was deliberately left alone: its only draws are a full-canvas
+  rect and centered clock text, neither of which has an equal-axis-trig defect like the spinner's --
+  a full rect looks identical whether stretched or not, and text stretching is a separate, much
+  smaller-stakes cosmetic concern that was out of this fix's scope.
+  This bug could not be reproduced with a plain CLI `mpv` instance driving `osd-overlay` directly
+  over its JSON IPC socket (`--input-ipc-server`): content registered that way never actually
+  composited on screen in a headless wlroots session, even though mpv accepted every command, while
+  `show-text` (a different, always-on-top OSD message path) composited fine in the same session --
+  a real discrepancy, still unexplained, between CLI-mpv-plus-manual-IPC and the daemon's own
+  `libmpv2`-embedded `osd-overlay` calls specifically. The reliable way to reproduce/verify this
+  class of bug headlessly (no GPU/X server needed, confirmed working in a sandbox with no Xvfb)
+  is driving the real `libmpv2` code path directly: start a headless wlroots Cage session
+  (`WLR_BACKENDS=headless`, short `XDG_RUNTIME_DIR` -- see the Chromium `TMPDIR` note above for why
+  short), point a throwaway `cargo test` at it (`WAYLAND_DISPLAY`/`XDG_RUNTIME_DIR` env, `vo=gpu`
+  `gpu-context=wayland`) calling the real overlay-drawing function, set a non-16:9 output size with
+  `wlr-randr --output <name> --custom-mode <W>x<H>` (not part of this project's runtime or dev-shell
+  closure, but installable standalone via `nix shell nixpkgs#wlr-randr`) against the same Cage
+  session, and capture with `grim` -- the same primitives `daemon/tests/webpage_display.rs` already
+  uses for its own real-pixel e2e assertions, recombined for an overlay-shape question instead of a
+  browser-engine one. Sleep briefly after creating the `Mpv` handle before drawing/reading
+  `osd-width`/`osd-height`: both read back as unrealized/`0` until the compositor actually maps the
+  window, which does not happen synchronously with `Mpv::with_initializer` returning.
 - YouTube playback needs no daemon-side code: mpv's built-in `ytdl_hook` Lua script (same core in
   both CLI mpv and `libmpv2`) auto-detects non-direct-media URLs and shells out to `yt-dlp` on
   `PATH`, unconditionally, with no libmpv init tweaks required — see README's "How YouTube
