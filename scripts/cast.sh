@@ -141,6 +141,9 @@ cmd_play() {
 
     local headers_json="null"
     if [[ ${#headers[@]} -gt 0 ]]; then
+        for header in "${headers[@]}"; do
+            [[ "$header" =~ ^[^=]+=.*$ ]] || die "play: --header values must be KEY=VALUE (got: $header)"
+        done
         headers_json="$(printf '%s\n' "${headers[@]}" \
             | jq -R 'capture("^(?<k>[^=]+)=(?<v>.*)$") | {(.k): .v}' \
             | jq -s 'add')" \

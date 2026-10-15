@@ -540,9 +540,10 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   port and writing it to a `--port-file` the test script polls, rather than a fixed port, to avoid
   a bind race between picking a "free" port and the server actually claiming it. Run the whole
   suite with `scripts/tests/run.sh`; CI runs it as a separate `cast-script-tests` job
-  (`.github/workflows/ci.yml`), independent of the `flake-check` job. `perl`/`socat`/`jq` were
-  added to `devShells.default` in `flake.nix` for this (`socat` is kept for the README's own manual
-  protocol-test examples, which `cast.sh` complements rather than replaces for low-level debugging).
+  (`.github/workflows/ci.yml`), independent of the `flake-check` job. `perl`/`socat`/`jq`/`curl`
+  were added to `devShells.default` in `flake.nix` for this (`socat` is kept for the README's own
+  manual protocol-test examples, which `cast.sh` complements rather than replaces for low-level
+  debugging).
   `cast.sh` checks `perl`/`jq`/`curl` are on `PATH` (its `check_dependencies`, run unconditionally
   before anything else) and fails with a named-tool, actionable message otherwise -- added after a
   real user ran it from a bare `nix shell` (which does not load this flake's `devShells.default`)
