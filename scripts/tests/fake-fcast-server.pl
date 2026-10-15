@@ -34,10 +34,16 @@ close($pf);
 
 my $client = $listener->accept or die "accept failed: $!\n";
 binmode($client);
-read_frame($client);    # the request; every scenario here ignores its content.
+my $request = read_frame($client);    # the one request a real daemon would consume.
 
 if ( $scenario eq 'ping' ) {
     write_frame( $client, 13, '' );    # Pong
+}
+elsif ( $scenario eq 'echo-request' ) {
+    # Sends the request body straight back (as a Pong body), so tests can
+    # assert on exactly what cast.sh put on the wire -- e.g. that a Play's
+    # --header flags became the body's `headers` object.
+    write_frame( $client, 13, $request->{body} );
 }
 elsif ( $scenario eq 'queue-skip' ) {
     # Mirrors ClearQueue's real daemon behavior: a PlaybackUpdate is

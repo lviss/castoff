@@ -889,7 +889,7 @@ hardware is something only a real Pi 4B boot can confirm, and is not tested here
 
 ```sh
 nix develop   # cargo, rustc, rust-analyzer, clippy, yt-dlp, chromium, cage, grim,
-              # with mpv already wired up for linking
+              # perl, socat, jq, curl, with mpv already wired up for linking
 cd daemon && cargo build && cargo clippy
 ```
 
@@ -948,9 +948,10 @@ Out of scope for this scaffold, deliberately:
   [How YouTube playback works](#how-youtube-playback-works),
   [How webpage (dashboard) display works](#how-webpage-dashboard-display-works), and
   [Image uploads (private extension)](#image-uploads-private-extension).)
-- The native Android control app, including handling Android `Share` intents and the upload
+- The native Android control app, including handling Android `Share` intents and its upload
   client for [Image uploads (private extension)](#image-uploads-private-extension)'s HTTP
-  endpoint -- the daemon-side upload contract exists, but nothing in this repo sends to it yet.
+  endpoint -- the daemon-side upload contract exists, and `scripts/cast.sh` can drive it (see
+  [Casting from a computer](#casting-from-a-computer)), but there is no Android app yet.
 - x86_64 appliance disk-image generation for real hardware (e.g. via `nixos-generators`/`disko`);
   `tv-box`'s `fileSystems."/"` and bootloader target are still generic placeholders for
   `nix flake check`/VM use (see `nix/tv-box-x86_64.nix`). A flashable image *is* implemented for

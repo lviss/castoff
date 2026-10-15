@@ -121,6 +121,48 @@ assert_contains() {
     fi
 }
 
+test_play_transmits_headers() {
+    local port_file; port_file="$(mktemp -u)"
+    perl "$SCRIPT_DIR/fake-fcast-server.pl" --port-file "$port_file" --scenario echo-request &
+    local server_pid=$!
+    local port; port="$(read_port "$port_file")"
+
+    local out
+    out="$(CASTOFF_PORT="$port" "$CAST_SH" play 'http://example.com/v.mp4' \
+        --header 'Accept=video/mp4' --header 'Referer=http://example.com/')"
+    wait "$server_pid" 2>/dev/null
+    rm -f "$port_file"
+
+    assert_eq "play sends the URL on the wire" "http://example.com/v.mp4" "$(jq -r '.url' <<<"$out")"
+    assert_eq "play folds the first --header into the body's headers" "video/mp4" "$(jq -r '.headers.Accept' <<<"$out")"
+    assert_eq "play folds the second --header into the body's headers" "http://example.com/" "$(jq -r '.headers.Referer' <<<"$out")"
+}
+
+# Regression: a --header value missing its '=' used to be silently dropped
+# by the jq `capture(...)` pipeline (which exits 0 on no match), so the
+# command succeeded while sending fewer headers than asked -- with every
+# header malformed, `headers` was omitted entirely. It must now fail loudly
+# before any connection is made.
+test_malformed_header_fails_loudly() {
+    local port_file; port_file="$(mktemp -u)"
+    perl "$SCRIPT_DIR/fake-fcast-server.pl" --port-file "$port_file" --scenario echo-request &
+    local server_pid=$!
+    local port; port="$(read_port "$port_file")"
+
+    local out status
+    out="$(CASTOFF_PORT="$port" "$CAST_SH" play 'http://example.com/v.mp4' \
+        --header 'Accept=video/mp4' --header 'totallybadheader' 2>&1)"
+    status=$?
+    # The fixed script rejects the bad header before connecting, so the fake
+    # server would otherwise sit in accept() forever.
+    kill "$server_pid" 2>/dev/null
+    wait "$server_pid" 2>/dev/null
+    rm -f "$port_file"
+
+    assert_status_nonzero "a malformed --header fails the command" "$status"
+    assert_contains "the error explains the KEY=VALUE requirement" "$out" "KEY=VALUE"
+}
+
 test_missing_dependency_fails_with_a_clear_message() {
     # Strips jq's directory out of PATH (leaving perl/curl reachable) to
     # reproduce the captain's real report: `nix shell` (not `nix develop`)
@@ -142,6 +184,8 @@ test_ping
 test_queue_clear_skips_interleaved_playback_update
 test_ping_fails_loudly_when_server_closes_without_a_reply
 test_upload_image
+test_play_transmits_headers
+test_malformed_header_fails_loudly
 test_missing_dependency_fails_with_a_clear_message
 
 echo "passed: $pass failed: $fail"
