@@ -543,6 +543,11 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   (`.github/workflows/ci.yml`), independent of the `flake-check` job. `perl`/`socat`/`jq` were
   added to `devShells.default` in `flake.nix` for this (`socat` is kept for the README's own manual
   protocol-test examples, which `cast.sh` complements rather than replaces for low-level debugging).
+  `cast.sh` checks `perl`/`jq`/`curl` are on `PATH` (its `check_dependencies`, run unconditionally
+  before anything else) and fails with a named-tool, actionable message otherwise -- added after a
+  real user ran it from a bare `nix shell` (which does not load this flake's `devShells.default`)
+  and hit a raw `jq: command not found` from deep inside a helper function. That check deliberately
+  does **not** include `socat`, matching the point above: `cast.sh` never actually calls it.
 
 ## Maintaining this file
 

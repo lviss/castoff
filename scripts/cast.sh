@@ -6,6 +6,31 @@
 # Android app. See README's "Casting from a computer" section.
 set -euo pipefail
 
+die() {
+    echo "cast.sh: $*" >&2
+    exit 1
+}
+
+# Checked before anything else runs: without this, a missing tool fails
+# deep inside some helper function with a raw, unexplained shell
+# "command not found" (e.g. "./scripts/cast.sh: line N: jq: command not
+# found") that gives no hint what's missing or how to fix it. `socat` is
+# deliberately not checked here -- it's not actually a cast.sh dependency
+# (fcast-client.pl talks TCP directly via Perl's IO::Socket::INET; socat only
+# appears in README's own raw-frame manual-protocol-test examples).
+check_dependencies() {
+    local tool missing=()
+    for tool in perl jq curl; do
+        command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
+    done
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        die "missing required tool(s): ${missing[*]}." \
+            "Run this from 'nix develop' in the repo root (its devShells.default provides" \
+            "perl/jq/curl), or install ${missing[*]} directly."
+    fi
+}
+check_dependencies
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FCAST_CLIENT="$SCRIPT_DIR/lib/fcast-client.pl"
 
@@ -28,11 +53,6 @@ OPCODE_QUEUE_JUMP_BACKWARD=17
 OPCODE_CLEAR_QUEUE=18
 OPCODE_QUEUE_JUMP_TO_INDEX=19
 OPCODE_SET_IMAGE_WALLPAPER=20
-
-die() {
-    echo "cast.sh: $*" >&2
-    exit 1
-}
 
 usage() {
     cat <<'EOF'

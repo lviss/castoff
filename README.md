@@ -471,7 +471,14 @@ that; a bare desktop session where `WAYLAND_DISPLAY` is set does as well.
 `scripts/cast.sh` is a command-line FCast sender -- it reproduces castoff-android's full
 `FCastClient.kt` command surface (play/pause/resume/stop/seek/volume/ping, the queue extension,
 and the image-upload+wallpaper extension) so the daemon can be driven from a computer, for
-everyday control or for manual testing, without the Android app:
+everyday control or for manual testing, without the Android app.
+
+**Run it from `nix develop` in the repo root.** It needs `perl` (byte-level framing,
+`scripts/lib/fcast-client.pl`), `jq` (JSON construction/parsing) and `curl` (image upload); all
+three are in `devShells.default`, so `nix develop` provides them -- a bare `nix shell` does not.
+Outside `nix develop`, install those three yourself; either way, the script itself checks for them
+upfront and fails with a clear message naming exactly what's missing, rather than an unexplained
+`command not found` from deep inside some helper function.
 
 ```sh
 scripts/cast.sh ping
@@ -484,9 +491,7 @@ scripts/cast.sh --help   # full command list
 
 It defaults to `127.0.0.1:46899`/`46900` (override with `--host`/`--port`/`--image-port`, or the
 daemon's own `CASTOFF_HOST`/`CASTOFF_PORT`/`CASTOFF_IMAGE_PORT` env vars, so pointing it at a real
-box is just `CASTOFF_HOST=<box> scripts/cast.sh ...`). It needs `perl` (byte-level framing,
-`scripts/lib/fcast-client.pl`), `jq` (JSON construction/parsing) and `curl` (image upload); all
-three are in `devShells.default`, so `nix develop` provides them. See
+box is just `CASTOFF_HOST=<box> scripts/cast.sh ...`). See
 `scripts/tests/` for its test coverage (framing round-trips and the queue-reply-skip behavior
 below, run with `scripts/tests/run.sh`).
 

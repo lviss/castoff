@@ -109,10 +109,40 @@ test_upload_image() {
     assert_eq "upload-image prints the daemon's returned id" "test-id-1" "$id"
 }
 
+assert_contains() {
+    local desc="$1" haystack="$2" needle="$3"
+    if [[ "$haystack" == *"$needle"* ]]; then
+        pass=$((pass + 1))
+    else
+        fail=$((fail + 1))
+        echo "FAIL: $desc"
+        echo "  expected to contain: $needle"
+        echo "  actual:              $haystack"
+    fi
+}
+
+test_missing_dependency_fails_with_a_clear_message() {
+    # Strips jq's directory out of PATH (leaving perl/curl reachable) to
+    # reproduce the captain's real report: `nix shell` (not `nix develop`)
+    # has perl/curl as ambient system tools but not this flake's jq.
+    local jq_dir; jq_dir="$(dirname "$(command -v jq)")"
+    local trimmed_path
+    trimmed_path="$(printf '%s' "$PATH" | tr ':' '\n' | grep -vxF "$jq_dir" | paste -sd: -)"
+
+    local out status
+    out="$(PATH="$trimmed_path" "$CAST_SH" ping 2>&1)"
+    status=$?
+
+    assert_status_nonzero "cast.sh exits nonzero when a dependency is missing" "$status"
+    assert_contains "the error names the missing tool" "$out" "missing required tool(s): jq"
+    assert_contains "the error points at the fix" "$out" "nix develop"
+}
+
 test_ping
 test_queue_clear_skips_interleaved_playback_update
 test_ping_fails_loudly_when_server_closes_without_a_reply
 test_upload_image
+test_missing_dependency_fails_with_a_clear_message
 
 echo "passed: $pass failed: $fail"
 [[ $fail -eq 0 ]]
