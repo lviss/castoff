@@ -40,12 +40,20 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use libmpv2::Mpv;
 
-/// Virtual ASS canvas both overlays are drawn on; mpv scales this to the real
-/// output resolution, so every coordinate below is resolution independent.
-/// Matches the idle clock's canvas (`idle_screen.rs`) so the two layers line
-/// up, but is declared locally to keep this module self-contained.
-const CANVAS_WIDTH: i64 = 1920;
-const CANVAS_HEIGHT: i64 = 1080;
+/// Fallback declared ASS canvas, used only on the narrow window where mpv's
+/// own `osd-width`/`osd-height` properties aren't yet available (read 0; see
+/// `current_canvas`) -- e.g. immediately after mpv starts, before its window
+/// is mapped. Every real draw instead declares the canvas as mpv's actual
+/// current OSD render-target size, so there is never a declared-vs-actual
+/// mismatch for mpv to scale away: a circle drawn in that space stays a
+/// circle on screen regardless of the real output's aspect ratio. Declaring
+/// a fixed, resolution-independent canvas and trusting mpv to scale it
+/// uniformly was the historical approach here and is exactly the bug this
+/// replaces -- mpv stretches a declared canvas to the real output
+/// independently per axis, so a non-16:9 real output (confirmed on the Pi 4
+/// appliance and the NixOS VM) turned a true circle into an oval.
+const FALLBACK_CANVAS_WIDTH: i64 = 1920;
+const FALLBACK_CANVAS_HEIGHT: i64 = 1080;
 
 /// `osd-overlay` ids. Distinct from the idle clock's 9000/9001. Note that
 /// mpv does **not** order overlays by id: whichever overlay was most recently
@@ -348,17 +356,33 @@ fn draw_overlay(mpv: &Mpv, opacity: u8, spinner_deg: Option<f64>) -> Result<()> 
     }
 }
 
+/// mpv's own current OSD render-target size (`osd-width`/`osd-height`),
+/// falling back to `FALLBACK_CANVAS_WIDTH`/`HEIGHT` only when mpv reports
+/// either as not yet available (read back as `0`, e.g. before its window is
+/// mapped). Read fresh on every draw -- not cached -- so a render target that
+/// changes while the daemon is running (e.g. the NixOS VM's own
+/// `wlr-randr`-driven follow-resize, see `AGENTS.md`) is picked up on the very
+/// next frame, with no stale declared-vs-actual mismatch window.
+fn current_canvas(mpv: &Mpv) -> (i64, i64) {
+    let width: i64 = mpv.get_property("osd-width").unwrap_or(0);
+    let height: i64 = mpv.get_property("osd-height").unwrap_or(0);
+    if width > 0 && height > 0 {
+        (width, height)
+    } else {
+        (FALLBACK_CANVAS_WIDTH, FALLBACK_CANVAS_HEIGHT)
+    }
+}
+
 /// Draw the full-canvas black rectangle at `opacity` (0 = transparent, 255 =
 /// opaque) into the fade overlay id. Drawn as an ASS vector rect, faded with
 /// `\1a` (inverted alpha).
 fn draw_fade_rect(mpv: &Mpv, opacity: u8) -> Result<()> {
+    let (w, h) = current_canvas(mpv);
     // ASS alpha is inverted from opacity: 00 is opaque, FF is transparent.
     let alpha = 255 - opacity;
     let fade = format!(
         "{{\\an7\\pos(0,0)\\1c&H000000&\\1a&H{alpha:02X}&\\bord0\\shad0\\p1}}\
          m 0 0 l {w} 0 l {w} {h} l 0 {h}{{\\p0}}",
-        w = CANVAS_WIDTH,
-        h = CANVAS_HEIGHT,
     );
     mpv.command(
         "osd-overlay",
@@ -366,8 +390,8 @@ fn draw_fade_rect(mpv: &Mpv, opacity: u8) -> Result<()> {
             &OSD_OVERLAY_FADE_ID.to_string(),
             "ass-events",
             &fade,
-            &CANVAS_WIDTH.to_string(),
-            &CANVAS_HEIGHT.to_string(),
+            &w.to_string(),
+            &h.to_string(),
         ],
     )
     .map_err(|e| anyhow::anyhow!("osd-overlay (fade) failed: {e:?}"))?;
@@ -377,15 +401,16 @@ fn draw_fade_rect(mpv: &Mpv, opacity: u8) -> Result<()> {
 /// Draw the rotating spinner into the spinner overlay id. One `osd-overlay`
 /// command per frame, on top of the already-opaque fade rect.
 fn draw_spinner(mpv: &Mpv, deg: f64) -> Result<()> {
-    let spinner = spinner_ass(deg);
+    let (w, h) = current_canvas(mpv);
+    let spinner = spinner_ass(deg, w, h);
     mpv.command(
         "osd-overlay",
         &[
             &OSD_OVERLAY_SPINNER_ID.to_string(),
             "ass-events",
             &spinner,
-            &CANVAS_WIDTH.to_string(),
-            &CANVAS_HEIGHT.to_string(),
+            &w.to_string(),
+            &h.to_string(),
         ],
     )
     .map_err(|e| anyhow::anyhow!("osd-overlay (spinner) failed: {e:?}"))?;
@@ -425,11 +450,19 @@ fn clear_overlay(mpv: &Mpv) -> Result<()> {
 /// arc and its rotation pivot are both displaced and `\frz` orbits the arc
 /// around the canvas instead of spinning it. Verified against a libass render
 /// (see the commit that fixed the orbit).
-fn spinner_ass(angle_deg: f64) -> String {
-    let cx = CANVAS_WIDTH as f64 / 2.0;
-    let cy = CANVAS_HEIGHT as f64 / 2.0;
-    let outer_radius = 110.0;
-    let inner_radius = 82.0;
+///
+/// `outer_radius`/`inner_radius` are sized relative to `min(canvas_w,
+/// canvas_h)` rather than fixed absolute units: at the historical fixed
+/// 1920x1080 canvas, 1080 was that minimum, so scaling against it keeps the
+/// spinner's on-screen size/look there exactly unchanged, while still
+/// shrinking or growing sensibly with the real canvas `draw_spinner` now
+/// reads back at every draw.
+fn spinner_ass(angle_deg: f64, canvas_w: i64, canvas_h: i64) -> String {
+    let cx = canvas_w as f64 / 2.0;
+    let cy = canvas_h as f64 / 2.0;
+    let scale = canvas_w.min(canvas_h) as f64 / FALLBACK_CANVAS_HEIGHT as f64;
+    let outer_radius = 110.0 * scale;
+    let inner_radius = 82.0 * scale;
     let sweep_degrees = 270.0;
     let arc_steps = 30;
 
