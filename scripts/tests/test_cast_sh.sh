@@ -164,12 +164,20 @@ test_malformed_header_fails_loudly() {
 }
 
 test_missing_dependency_fails_with_a_clear_message() {
-    # Strips jq's directory out of PATH (leaving perl/curl reachable) to
-    # reproduce the captain's real report: `nix shell` (not `nix develop`)
-    # has perl/curl as ambient system tools but not this flake's jq.
-    local jq_dir; jq_dir="$(dirname "$(command -v jq)")"
-    local trimmed_path
-    trimmed_path="$(printf '%s' "$PATH" | tr ':' '\n' | grep -vxF "$jq_dir" | paste -sd: -)"
+    # Strips every jq-bearing directory out of PATH (leaving perl/curl
+    # reachable) to reproduce the captain's real report: `nix shell` (not
+    # `nix develop`) has perl/curl as ambient system tools but not this
+    # flake's jq. More than one jq can be on PATH at once (the dev shell's
+    # plus an ambient system/user one, e.g. on the CI runner), so strip all
+    # of them -- stripping only the first `command -v jq` reports would
+    # leave a second jq reachable and cast.sh would never see a missing
+    # dependency at all.
+    local dir trimmed_path=""
+    local IFS=:
+    for dir in $PATH; do
+        [[ -x "$dir/jq" ]] && continue
+        trimmed_path+="${trimmed_path:+:}$dir"
+    done
 
     local out status
     out="$(PATH="$trimmed_path" "$CAST_SH" ping 2>&1)"
