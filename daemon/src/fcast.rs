@@ -71,6 +71,21 @@ pub enum Opcode {
     /// receiver -> sender: confirms the wallpaper tag `SetImageWallpaper`
     /// just set.
     ImageWallpaperUpdate = 21,
+    // --- castoff private extension: directional/select remote navigation
+    // for a Jellyfin page (`daemon/src/jellyfin.rs`). Jellyfin's own
+    // `GeneralCommand` vocabulary already includes `MoveUp`/`MoveDown`/
+    // `MoveLeft`/`MoveRight`/`Select`/`Back` as first-class server-defined
+    // values, dispatched inside a logged-in jellyfin-web tab exactly like a
+    // real remote's D-pad -- see README's Jellyfin section. FCast's existing
+    // `Pause`/`Resume`/`Seek`/`SetVolume` opcodes already cover controlling
+    // *playback*; this is for the one extra verb set a Jellyfin page needs
+    // that no existing opcode maps onto: browsing/selecting before anything
+    // is playing.
+    /// sender -> receiver: send a directional/select command
+    /// (`RemoteCommandMessage`) to whichever source currently accepts one
+    /// (today: a displayed Jellyfin page). Replies `PlaybackUpdate`, the
+    /// same acknowledgement shape `Pause`/`Resume`/etc. already use.
+    RemoteCommand = 22,
 }
 
 impl Opcode {
@@ -98,6 +113,7 @@ impl Opcode {
             19 => Opcode::QueueJumpToIndex,
             20 => Opcode::SetImageWallpaper,
             21 => Opcode::ImageWallpaperUpdate,
+            22 => Opcode::RemoteCommand,
             _ => return None,
         })
     }
@@ -366,6 +382,25 @@ pub struct ImageWallpaperUpdateMessage {
     pub generation_time: u64,
     pub id: String,
     pub wallpaper: bool,
+}
+
+/// castoff private extension (see `Opcode::RemoteCommand`): a
+/// directional/select command, matching Jellyfin's own `GeneralCommand`
+/// vocabulary (`MediaBrowser.Model/Session/GeneralCommandType.cs`) 1:1 since
+/// that is the only consumer today -- see `daemon/src/jellyfin.rs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RemoteCommand {
+    MoveUp,
+    MoveDown,
+    MoveLeft,
+    MoveRight,
+    Select,
+    Back,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteCommandMessage {
+    pub command: RemoteCommand,
 }
 
 #[cfg(test)]

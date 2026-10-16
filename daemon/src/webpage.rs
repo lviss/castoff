@@ -191,6 +191,19 @@ impl Browser {
             // (the end-to-end test asserts on them).
             "--force-color-profile=srgb".to_string(),
             format!("--user-data-dir={}", self.profile_dir.display()),
+            // A command arriving over a page's own WebSocket (e.g. Jellyfin's
+            // session-control channel driving jellyfin-web's `playbackManager`)
+            // is not a user gesture, so without this flag Chromium's default
+            // autoplay policy rejects the resulting `play()` call outright --
+            // exactly the "stuck at splash screen" failure upstream describes
+            // (jellyfin-web#4901). Confirmed necessary and sufficient against
+            // the pinned Chromium build (see `castoff-jellyfin-cast-research`
+            // report): without it, `play()` rejects with `NotAllowedError`;
+            // with it, playback starts. Safe to apply unconditionally to every
+            // page this controller shows, not just Jellyfin's -- this is a
+            // kiosk with no mouse/keyboard for a user gesture to ever come
+            // from regardless of which page is on screen.
+            "--autoplay-policy=no-user-gesture-required".to_string(),
         ]
     }
 
@@ -267,6 +280,10 @@ impl Browser {
 /// The page currently on screen, plus everything needed to take it down.
 struct ActivePage {
     pid: i32,
+    /// The URL this page was shown with. Lets a caller (e.g. `Player`'s
+    /// Jellyfin routing) recognize *which* page is on screen without a new
+    /// parallel tracking mechanism of its own.
+    url: String,
     /// Signals (once) that the browser process has been reaped.
     exited: Receiver<()>,
 }
@@ -313,6 +330,16 @@ impl WebpageController {
         self.state.lock().unwrap().current.is_some()
     }
 
+    /// The URL currently displayed, if any.
+    pub(crate) fn active_url(&self) -> Option<String> {
+        self.state
+            .lock()
+            .unwrap()
+            .current
+            .as_ref()
+            .map(|p| p.url.clone())
+    }
+
     /// Display `url`, replacing whatever page (if any) is on screen.
     ///
     /// The incumbent engine is taken down and *reaped* before the
@@ -347,6 +374,7 @@ impl WebpageController {
             state.generation += 1;
             state.current = Some(ActivePage {
                 pid,
+                url: url.to_string(),
                 exited: exited_rx,
             });
             state.generation
@@ -478,6 +506,9 @@ mod tests {
 
         assert!(args.iter().any(|a| a == "--ozone-platform=wayland"));
         assert!(args.iter().any(|a| a == "--kiosk"));
+        assert!(args
+            .iter()
+            .any(|a| a == "--autoplay-policy=no-user-gesture-required"));
         assert!(args
             .iter()
             .any(|a| a == "--app=http://127.0.0.1:8000/dashboard"));

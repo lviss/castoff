@@ -550,6 +550,44 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   and hit a raw `jq: command not found` from deep inside a helper function. That check deliberately
   does **not** include `socat`, matching the point above: `cast.sh` never actually calls it.
 
+- `daemon/src/jellyfin.rs` is castoff's Jellyfin **Session REST client** (`ureq`, the daemon's
+  first HTTP client dependency), not a second mpv process or a daemon-owned WebSocket client --
+  see README's "How Jellyfin control works". `Player::pause`/`resume`/`seek`/`set_volume`/the new
+  `remote_command` (FCast's private-extension `Opcode::RemoteCommand`, `fcast.rs`) route to it
+  instead of mpv whenever `WebpageController::active_url()`'s origin matches a logged-in
+  `JellyfinSession`'s `server_url` (`JellyfinSession::controls`); a non-Jellyfin page, or no login
+  at all, falls through to mpv exactly as before this feature existed.
+  **Quick Connect's secret is idempotent and device-bound to whoever called `Initiate`, not
+  whoever redeems it**: confirmed by reading the server's own `QuickConnectManager.cs` --
+  `AuthorizeRequest` (the human-approval step) creates exactly one `AuthenticationResult` tied to
+  the `DeviceId` that called `/QuickConnect/Initiate`, and `GetAuthorizedRequest` (what
+  `/Users/AuthenticateWithQuickConnect` calls) just returns that same cached result by secret,
+  repeatably, until it expires (10 minutes). So there is exactly one client identity per login, not
+  a separate "daemon backend" session distinct from "the browser tab's session" --
+  `JellyfinSession::login_with_quick_connect` is written on this basis (one fixed, persisted
+  `device_id` for everything this daemon does as a Jellyfin client).
+  **Still open, and why**: nothing in the daemon calls `login_with_quick_connect` yet.
+  `localStorage` (where jellyfin-web keeps its login, confirmed from the archived
+  `jellyfin-apiclient-javascript`'s `credentials.js`/`appStorage.js`: plain `localStorage.setItem`
+  under the key `jellyfin_credentials`) is strictly **origin-scoped** -- a page the daemon serves
+  from its own local port cannot write it for the Jellyfin server's origin, and Chromium's
+  on-disk `localStorage` backing store is an internal LevelDB encoding, not something to
+  hand-write from outside the browser either. That leaves either CDP (driving the already-open
+  tab's own JS, e.g. clicking its Quick Connect button or reading/setting `window.ApiClient`,
+  which jellyfin-web deliberately exposes globally) or some other mechanism neither verified nor
+  built here -- see README's own call-out of this as an open decision, and do not assume a
+  same-origin bootstrap page can solve it. Everything *downstream* of a login already works and is
+  unit-tested (`jellyfin.rs`'s and `player.rs`'s own `#[cfg(test)]` modules) against a mock server,
+  independent of how that login eventually happens.
+  **Test gotcha if you touch this**: every `Player` method that already calls `publish_status()`
+  (`pause`/`resume`/`seek`, and the new `remote_command`) now also polls Jellyfin's `GET /Sessions`
+  once more via `status()` when a Jellyfin page is active -- not just once per test scenario. A
+  mock server that serves an exact, finite response sequence undercounts and starves a later
+  request (seen first-hand: the naive version of `player.rs`'s `MockJellyfin` hung at test
+  teardown waiting on a response that would never come). `MockJellyfin` therefore cycles its
+  response list indefinitely and polls with a stop flag rather than blocking on `recv()` forever,
+  so `Drop` can always ask it to stop instead of risking that hang.
+
 ## Maintaining this file
 
 Keep this file for knowledge useful to almost every future agent session in this project.

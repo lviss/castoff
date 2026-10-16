@@ -32,8 +32,12 @@ A `Play` that is still loading shows an on-screen spinner, and starts/stops are 
 short fade (see
 [On-screen feedback](#on-screen-feedback-loading-indicator-and-startstop-fade)).
 
-That's it: no Jellyfin, no Immich/local-folder slideshows. See
-[Not yet implemented](#not-yet-implemented-follow-up-work) below for what's planned but not built.
+A logged-in Jellyfin page additionally gets real playback control, now-playing display and
+remote-nav through FCast's existing opcodes (see
+[How Jellyfin control works](#how-jellyfin-control-works)) -- though nothing in the daemon yet
+triggers that login itself (see that section's last paragraph). No Immich/local-folder slideshows
+either. See [Not yet implemented](#not-yet-implemented-follow-up-work) below for what's planned
+but not built.
 
 ## What's here
 
@@ -96,6 +100,7 @@ Implemented opcodes (all of FCast v2's playback-control surface):
 | `QueueJumpToIndex` (19, private extension) | sender -> receiver | moves straight to an arbitrary queue index (`QueueJumpToIndexMessage`) and plays it; replies with `QueueState`. A no-op (still replies) for an out-of-range index |
 | `SetImageWallpaper` (20, private extension) | sender -> receiver | tags or untags a previously-uploaded image (by the id the upload endpoint returned) for idle-screen wallpaper rotation; replies with `ImageWallpaperUpdate` (see [Image uploads (private extension)](#image-uploads-private-extension)) |
 | `ImageWallpaperUpdate` (21, private extension) | receiver -> sender | confirms the wallpaper tag `SetImageWallpaper` just set |
+| `RemoteCommand` (22, private extension) | sender -> receiver | sends a directional/select command (`MoveUp`/`MoveDown`/`MoveLeft`/`MoveRight`/`Select`/`Back`) to whichever source currently accepts one -- today, a displayed Jellyfin page (see [How Jellyfin control works](#how-jellyfin-control-works)); replies with `PlaybackUpdate`. Errors if no such source is displayed |
 
 Every connected sender keeps its FCast TCP connection open (`daemon/src/main.rs`'s
 `handle_connection` reads one persistent socket per sender, not a reconnect-per-command model),
@@ -363,7 +368,9 @@ The daemon supervises the engine (`daemon/src/webpage.rs`):
 - `PlaybackUpdate` reports `Playing` while a page is displayed: mpv itself is idle (it is only
   carrying the clock behind the page), but the content the sender asked for is live. A page has no
   mpv timeline, so `time`/`duration` are absent. `Pause`/`Resume`/`Seek`/`SetSpeed` do not apply to
-  a page -- interactive control is out of scope for v1.
+  a page -- interactive control is out of scope for v1 -- except for a Jellyfin page, which routes
+  them to Jellyfin's own Session REST API instead of mpv; see
+  [How Jellyfin control works](#how-jellyfin-control-works).
 
 The daemon never re-fetches or re-renders the page on a timer: the engine keeps it live, and any
 refresh cadence belongs to the page itself (Grafana's auto-refresh, say), which is both the
@@ -377,12 +384,52 @@ the daemon refuses a root without room for that socket with a plain-language con
 of letting Chromium die cryptically; while a page is up, mpv's decode pipeline is stopped, so
 nothing plays or decodes behind it.
 
-Not supported: pages behind a login (there is no credential flow yet -- see
-[Not yet implemented](#not-yet-implemented-follow-up-work)), DRM-protected video, and any
-interaction -- no clicking, typing, scrolling or remote control. Chromium is launched as a kiosk
-(`--kiosk --app=<url>`): no tabs, no omnibox, no window controls. As everywhere else in this
-daemon, an async engine failure is never silent -- Chromium's own diagnostics go to the daemon's
-stderr/journal, the same way mpv's do.
+Not supported: pages behind a login (there is no general credential flow -- see
+[Not yet implemented](#not-yet-implemented-follow-up-work) -- Jellyfin is the one exception, see
+below), DRM-protected video, and any interaction -- no clicking, typing, scrolling or remote
+control, again except for Jellyfin, which has its own server-mediated remote-control channel.
+Chromium is launched as a kiosk (`--kiosk --app=<url>`): no tabs, no omnibox, no window controls.
+As everywhere else in this daemon, an async engine failure is never silent -- Chromium's own
+diagnostics go to the daemon's stderr/journal, the same way mpv's do.
+
+### How Jellyfin control works
+
+A Jellyfin page is displayed the same way any other web page is -- there is no second mpv process
+and no daemon-owned WebSocket client talking Jellyfin's own session protocol. What makes it
+different is that once that page is logged in, jellyfin-web registers a normal,
+remote-controllable Jellyfin session (`SupportsMediaControl: true`) with its own open WebSocket to
+the server, and the daemon becomes an authenticated REST client *of that same session*
+(`daemon/src/jellyfin.rs`), driven by FCast's existing opcodes:
+
+- **Playback control.** `Pause`/`Resume`/`Seek`/`SetVolume` route to `POST
+  /Sessions/{id}/Playing/{command}` / `POST /Sessions/{id}/Command` instead of mpv, whenever the
+  displayed page's origin matches a server the daemon is logged into (`JellyfinSession::controls`)
+  -- a displayed page from any other origin, or no Jellyfin login at all, falls through to mpv
+  exactly as before.
+- **Now-playing/queue display.** `status`/`RequestQueue` poll `GET /Sessions` for the real
+  currently-playing item and report it as `PlaybackUpdate`'s `time`/`duration` and one evolving
+  `QueueState` entry -- not a mirrored per-item queue, since Jellyfin's own session has a separate
+  playlist the daemon does not control.
+- **Directional/select remote navigation.** A new private-extension FCast opcode,
+  `RemoteCommand` (`MoveUp`/`MoveDown`/`MoveLeft`/`MoveRight`/`Select`/`Back`), dispatches
+  Jellyfin's own `GeneralCommand` vocabulary -- the same mechanism a real remote's D-pad drives --
+  so browsing the library before anything is playing doesn't need the general "remote control an
+  arbitrary page" capability this daemon doesn't have.
+
+The `--autoplay-policy=no-user-gesture-required` Chromium flag (`webpage.rs`'s `Browser::args`) is
+what makes a server-issued command actually start playback in the tab: without it, Chromium
+rejects a `play()` call that didn't originate from a user gesture, which is the "stuck at splash
+screen" failure [jellyfin-web#4901](https://github.com/jellyfin/jellyfin-web/issues/4901)
+describes.
+
+**Not yet wired up: how a login actually happens.** `JellyfinSession::login_with_quick_connect`
+implements the one-time Quick Connect handshake itself (`POST /QuickConnect/Initiate`, poll `GET
+/QuickConnect/Connect`, then `POST /Users/AuthenticateWithQuickConnect`) and is fully unit-tested,
+but nothing in the daemon calls it yet: *when* a login is triggered and *how* its pairing code
+reaches the screen is an open product decision, since no existing on-screen affordance shows
+arbitrary status text once a web page is displayed (mpv's own OSD overlay, which the idle clock
+and loading spinner use, is hidden the moment a browser page is stacked over it). Once a login
+exists by whatever means, everything above already works against it.
 
 ### On-screen feedback: loading indicator and start/stop fade
 
@@ -942,9 +989,13 @@ this scaffold yet, but they should carry forward into every later task on this c
 
 Out of scope for this scaffold, deliberately:
 
-- Playback sources: Jellyfin (authenticated via Jellyfin's Quick Connect flow -- never a typed
-  password) and a slideshow pulled from Immich or a local folder. (YouTube, web pages, and images
-  uploaded from a phone are implemented -- see
+- Triggering a Jellyfin login: the Quick Connect handshake itself (`POST /QuickConnect/Initiate`,
+  poll `GET /QuickConnect/Connect`, `POST /Users/AuthenticateWithQuickConnect` -- never a typed
+  password) and the REST client/FCast routing built on top of it are implemented and tested (see
+  [How Jellyfin control works](#how-jellyfin-control-works)), but nothing calls that handshake
+  yet: when it runs and how its pairing code reaches the screen is still an open decision. A
+  slideshow pulled from Immich or a local folder is unrelated follow-up work, not started.
+  (YouTube, web pages, and images uploaded from a phone are implemented -- see
   [How YouTube playback works](#how-youtube-playback-works),
   [How webpage (dashboard) display works](#how-webpage-dashboard-display-works), and
   [Image uploads (private extension)](#image-uploads-private-extension).)
@@ -959,10 +1010,13 @@ Out of scope for this scaffold, deliberately:
 - Playback-quality/resolution options for the Raspberry Pi 4 target (e.g. capping YouTube
   quality) -- deliberately not built preemptively; a follow-up only if real Pi 4 hardware testing
   finds a need for it.
-- Any authentication/credential flow, which is also what a dashboard behind a login (e.g. a
-  private Grafana) needs; today's webpage display is for pages reachable without credentials.
-- Interaction with a displayed page (clicking, typing, scrolling, remote control) and
-  DRM-protected video in it.
+- A general authentication/credential flow for an arbitrary dashboard behind a login (e.g. a
+  private Grafana); today's webpage display is otherwise for pages reachable without credentials.
+  Jellyfin's Quick Connect handshake is the one exception, and is implemented but not yet
+  triggered by anything -- see [How Jellyfin control works](#how-jellyfin-control-works).
+- Interaction with a displayed page in general (clicking, typing, scrolling, remote control) and
+  DRM-protected video in it. Jellyfin again has its own exception for remote control (not general
+  input synthesis) -- see the same section.
 - Selectable stream quality (see [Design principles](#design-principles) above).
 
 The daemon and its FCast-based control API are meant to be generic enough that all of the above

@@ -12,10 +12,12 @@ use tokio::sync::watch;
 use tracing::{debug, error, warn};
 
 use crate::fcast::{
-    PlayMessage, PlayTarget, PlaybackState, PlaybackUpdateMessage, QueueStateMessage,
+    PlayMessage, PlayTarget, PlaybackState, PlaybackUpdateMessage, QueueItemMessage,
+    QueueStateMessage, RemoteCommand,
 };
 use crate::idle_screen::{IdleScreen, IdleScreenController, OnChange};
 use crate::images::ImageStore;
+use crate::jellyfin::JellyfinSession;
 use crate::overlay::PlaybackOverlay;
 use crate::queue::Queue;
 use crate::webpage::WebpageController;
@@ -59,6 +61,14 @@ pub struct Player {
     /// idle-screen wallpaper rotation timer (`idle_screen.rs`, via the
     /// `on_wallpaper_tick` callback built in `build`).
     images: Arc<ImageStore>,
+    /// Castoff's own Jellyfin login and Session REST client
+    /// (`jellyfin.rs`). `pause`/`resume`/`seek`/`set_volume` and the new
+    /// `remote_command` route to it instead of mpv whenever the displayed
+    /// web page's origin matches this session's logged-in server (see
+    /// `JellyfinSession::controls`), so Jellyfin becomes one more
+    /// controllable source through FCast's existing opcodes rather than a
+    /// parallel control path.
+    jellyfin: Arc<JellyfinSession>,
     /// Broadcasts the latest `PlaybackUpdate`-shaped snapshot whenever any
     /// method below changes playback state, or an async transition does (a
     /// `PlaybackRestart`, an idle-screen show/hide, or the browser fallback
@@ -393,6 +403,7 @@ impl Player {
             Arc::new(WebpageController::from_env()),
             state_path,
             Arc::new(ImageStore::from_env()),
+            Arc::new(JellyfinSession::from_env()),
             crate::metadata::ytdlp_program(),
             false,
         )
@@ -413,6 +424,7 @@ impl Player {
             Arc::new(WebpageController::with_program(program)),
             None,
             Arc::new(ImageStore::ephemeral_for_test()),
+            Arc::new(JellyfinSession::ephemeral_for_test()),
             crate::metadata::ytdlp_program(),
             false,
         )
@@ -427,6 +439,7 @@ impl Player {
             Arc::new(WebpageController::with_program(program)),
             Some(state_path),
             Arc::new(ImageStore::ephemeral_for_test()),
+            Arc::new(JellyfinSession::ephemeral_for_test()),
             crate::metadata::ytdlp_program(),
             false,
         )
@@ -449,8 +462,30 @@ impl Player {
             Arc::new(WebpageController::with_program(browser_program)),
             None,
             Arc::new(ImageStore::ephemeral_for_test()),
+            Arc::new(JellyfinSession::ephemeral_for_test()),
             ytdlp_program.to_string(),
             true,
+        )
+    }
+
+    /// `with_browser`, but with a caller-supplied `JellyfinSession` -- for
+    /// tests exercising FCast-to-Jellyfin routing (`pause`/`resume`/`seek`/
+    /// `set_volume`/`remote_command`/`status`/`queue_state` all consult it
+    /// when the displayed page's origin matches its login).
+    #[cfg(test)]
+    fn with_browser_and_jellyfin(
+        mpv: Arc<Mpv>,
+        program: &str,
+        jellyfin: Arc<JellyfinSession>,
+    ) -> Result<Self> {
+        Self::build(
+            mpv,
+            Arc::new(WebpageController::with_program(program)),
+            None,
+            Arc::new(ImageStore::ephemeral_for_test()),
+            jellyfin,
+            crate::metadata::ytdlp_program(),
+            false,
         )
     }
 
@@ -459,6 +494,7 @@ impl Player {
         webpage: Arc<WebpageController>,
         state_path: Option<PathBuf>,
         images: Arc<ImageStore>,
+        jellyfin: Arc<JellyfinSession>,
         ytdlp_program: String,
         metadata_lookup_inline: bool,
     ) -> Result<Self> {
@@ -576,6 +612,7 @@ impl Player {
             queue,
             state_path,
             images,
+            jellyfin,
             status_tx,
             queue_tx,
             ytdlp_program,
@@ -608,8 +645,38 @@ impl Player {
         self.queue_tx.subscribe()
     }
 
-    /// The current queue as the wire shape sent to FCast senders.
+    /// The current queue as the wire shape sent to FCast senders: castoff's
+    /// own persisted play queue normally, or -- while a Jellyfin page this
+    /// session is logged into is displayed and has something playing -- one
+    /// synthetic entry reflecting *that* session's now-playing item instead.
+    ///
+    /// Deliberately not a mirrored per-item queue: Jellyfin's session has
+    /// its own separate playlist that castoff does not control and that can
+    /// change for reasons having nothing to do with castoff (e.g. someone
+    /// picks something else from their phone's Jellyfin app), so splicing it
+    /// into castoff's own queue would make `QueueJumpToIndex` etc. promise
+    /// something that doesn't work -- see the `castoff-jellyfin-integration-ux`
+    /// report §3. The one entry's `title`/`duration_secs` are simply
+    /// refreshed on every poll, the same "resolve asynchronously, leave
+    /// absent on failure" contract `metadata.rs`'s YouTube title lookup
+    /// already uses.
     pub fn queue_state(&self) -> QueueStateMessage {
+        if self.jellyfin_controls_active_page() {
+            if let Some(url) = self.webpage.active_url() {
+                if let Ok(Some(now_playing)) = self.jellyfin.now_playing() {
+                    return QueueStateMessage {
+                        generation_time: now_millis(),
+                        items: vec![QueueItemMessage {
+                            url,
+                            container: Some("text/html".to_string()),
+                            title: now_playing.title,
+                            duration_secs: now_playing.duration_secs,
+                        }],
+                        current_index: Some(0),
+                    };
+                }
+            }
+        }
         self.queue.lock().unwrap().to_state_message()
     }
 
@@ -854,18 +921,53 @@ impl Player {
         result
     }
 
+    /// Whether the page currently displayed by the browser engine is a
+    /// Jellyfin server `self.jellyfin` is logged into -- the condition that
+    /// routes `pause`/`resume`/`seek`/`set_volume`/`remote_command` to it
+    /// instead of mpv (see `jellyfin.rs`'s `JellyfinSession::controls`).
+    fn jellyfin_controls_active_page(&self) -> bool {
+        self.webpage
+            .active_url()
+            .is_some_and(|url| self.jellyfin.controls(&url))
+    }
+
     pub fn pause(&self) -> Result<()> {
-        self.mpv
-            .set_property("pause", true)
-            .map_err(|e| anyhow::anyhow!("pause failed: {e:?}"))?;
+        if self.jellyfin_controls_active_page() {
+            self.jellyfin.pause()?;
+        } else {
+            self.mpv
+                .set_property("pause", true)
+                .map_err(|e| anyhow::anyhow!("pause failed: {e:?}"))?;
+        }
         self.publish_status();
         Ok(())
     }
 
     pub fn resume(&self) -> Result<()> {
-        self.mpv
-            .set_property("pause", false)
-            .map_err(|e| anyhow::anyhow!("resume failed: {e:?}"))?;
+        if self.jellyfin_controls_active_page() {
+            self.jellyfin.resume()?;
+        } else {
+            self.mpv
+                .set_property("pause", false)
+                .map_err(|e| anyhow::anyhow!("resume failed: {e:?}"))?;
+        }
+        self.publish_status();
+        Ok(())
+    }
+
+    /// Send a directional/select remote-navigation command (castoff's own
+    /// FCast `Opcode::RemoteCommand`) to the displayed Jellyfin page, if any
+    /// -- see README's Jellyfin section. Errors (rather than silently
+    /// no-opping) when no Jellyfin page is on screen: unlike
+    /// `pause`/`resume`/`seek`, there is no mpv equivalent to harmlessly
+    /// fall back to.
+    pub fn remote_command(&self, command: RemoteCommand) -> Result<()> {
+        if !self.jellyfin_controls_active_page() {
+            anyhow::bail!(
+                "no displayed Jellyfin page to send a remote-navigation command to"
+            );
+        }
+        self.jellyfin.remote_command(command)?;
         self.publish_status();
         Ok(())
     }
@@ -932,14 +1034,21 @@ impl Player {
     }
 
     pub fn seek(&self, time: f64) -> Result<()> {
-        self.mpv
-            .command("seek", &[&time.to_string(), "absolute"])
-            .map_err(|e| anyhow::anyhow!("seek failed: {e:?}"))?;
+        if self.jellyfin_controls_active_page() {
+            self.jellyfin.seek(time)?;
+        } else {
+            self.mpv
+                .command("seek", &[&time.to_string(), "absolute"])
+                .map_err(|e| anyhow::anyhow!("seek failed: {e:?}"))?;
+        }
         self.publish_status();
         Ok(())
     }
 
     pub fn set_volume(&self, volume: f64) -> Result<()> {
+        if self.jellyfin_controls_active_page() {
+            return self.jellyfin.set_volume(volume);
+        }
         self.mpv
             .set_property("volume", to_mpv_volume(volume))
             .map_err(|e| anyhow::anyhow!("set_volume failed: {e:?}"))
@@ -953,9 +1062,37 @@ impl Player {
         Ok(())
     }
 
-    /// Snapshot current mpv state as an FCast PlaybackUpdate.
+    /// Snapshot current playback state as an FCast PlaybackUpdate: mpv's own
+    /// state normally, or -- while a Jellyfin page this session is logged
+    /// into is displayed -- that session's real now-playing position and
+    /// duration instead (mpv itself is only carrying the idle clock *behind*
+    /// the browser engine's window, same as for any other web page; see
+    /// `snapshot_status`). A Jellyfin poll failure (e.g. the tab hasn't
+    /// registered a session yet) falls back to the plain webpage snapshot
+    /// rather than erroring a status request.
     pub fn status(&self) -> PlaybackUpdateMessage {
-        snapshot_status(&self.mpv, &self.webpage, self.idle.is_wallpaper_active())
+        let base = snapshot_status(&self.mpv, &self.webpage, self.idle.is_wallpaper_active());
+        if !self.jellyfin_controls_active_page() {
+            return base;
+        }
+        match self.jellyfin.now_playing() {
+            Ok(Some(now_playing)) => PlaybackUpdateMessage {
+                generation_time: base.generation_time,
+                state: if now_playing.is_paused {
+                    PlaybackState::Paused
+                } else {
+                    PlaybackState::Playing
+                },
+                time: now_playing.position_secs,
+                duration: now_playing.duration_secs,
+                speed: base.speed,
+            },
+            Ok(None) => base,
+            Err(e) => {
+                debug!(error = %e, "Jellyfin now-playing poll failed; reporting plain webpage status");
+                base
+            }
+        }
     }
 
     /// Current volume on FCast's 0.0-1.0 scale.
@@ -2828,6 +2965,298 @@ mod tests {
         wait_until_process_gone(pid, "the browser engine");
         assert_eq!(player.idle_screen(), Some(IdleScreen::Clock));
         assert_eq!(player.status().state, PlaybackState::Idle);
+    }
+
+    /// A minimal mock Jellyfin server for routing tests: serves exactly
+    /// `responses.len()` requests in order, reporting each request's URL
+    /// (and, for `Command` posts, its JSON body) back over `received` so a
+    /// test can assert which REST call `Player` actually made, without
+    /// re-testing `jellyfin.rs`'s own request-shape coverage here.
+    /// A mock Jellyfin server for routing tests: cycles through `responses`
+    /// indefinitely (so an incidental extra poll -- e.g. the `publish_status`
+    /// every `Player` method already issues, which now also polls Jellyfin's
+    /// now-playing state -- never starves a later, deliberately-asserted
+    /// request of a reply) and reports each request's URL plus body over
+    /// `received` so a test can see what `Player` actually sent, without
+    /// re-testing `jellyfin.rs`'s own request-shape coverage here.
+    ///
+    /// Polls with a short timeout rather than blocking on `recv()` so
+    /// `Drop` can always ask the server thread to stop and have it actually
+    /// notice, instead of risking a join that hangs forever on a `recv()`
+    /// with no further request coming.
+    struct MockJellyfin {
+        addr: String,
+        received: std::sync::mpsc::Receiver<String>,
+        stop: Arc<std::sync::atomic::AtomicBool>,
+        handle: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl MockJellyfin {
+        fn serving(responses: Vec<serde_json::Value>) -> Self {
+            assert!(!responses.is_empty(), "serving() needs at least one response");
+            let server = tiny_http::Server::http("127.0.0.1:0").expect("bind mock Jellyfin");
+            let addr = server.server_addr().to_string();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let thread_stop = Arc::clone(&stop);
+            let handle = std::thread::spawn(move || {
+                use std::sync::atomic::Ordering;
+                let mut bodies = responses.into_iter().cycle();
+                while !thread_stop.load(Ordering::Relaxed) {
+                    let Ok(Some(mut request)) = server.recv_timeout(Duration::from_millis(100))
+                    else {
+                        continue;
+                    };
+                    let mut observed = request.url().to_string();
+                    let mut read_body = String::new();
+                    if request.as_reader().read_to_string(&mut read_body).is_ok()
+                        && !read_body.is_empty()
+                    {
+                        observed.push('\n');
+                        observed.push_str(&read_body);
+                    }
+                    let _ = tx.send(observed);
+                    let body = bodies.next().expect("cycle never ends");
+                    let _ = request.respond(tiny_http::Response::from_string(body.to_string()));
+                }
+            });
+            Self {
+                addr,
+                received: rx,
+                stop,
+                handle: Some(handle),
+            }
+        }
+
+        fn base_url(&self) -> String {
+            format!("http://{}", self.addr)
+        }
+
+        /// Drain received requests until one contains `substr`, so a test
+        /// isn't coupled to exactly how many incidental requests (e.g.
+        /// status polls) precede the one it actually cares about.
+        fn next_matching(&self, substr: &str) -> String {
+            for _ in 0..20 {
+                let req = self
+                    .received
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("the mock Jellyfin server must have received a request");
+                if req.contains(substr) {
+                    return req;
+                }
+            }
+            panic!("no request matching {substr:?} seen within 20 requests");
+        }
+    }
+
+    impl Drop for MockJellyfin {
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            if let Some(h) = self.handle.take() {
+                let _ = h.join();
+            }
+        }
+    }
+
+    /// [`headless_player_with_browser`], but with a `JellyfinSession`
+    /// supplied instead of a fresh, logged-out one -- so routing tests can
+    /// pre-authenticate it against a mock server.
+    fn headless_player_with_browser_and_jellyfin(
+        program: &Path,
+        jellyfin: Arc<crate::jellyfin::JellyfinSession>,
+    ) -> Player {
+        let player = Player::with_browser_and_jellyfin(
+            headless_mpv(),
+            program.to_str().expect("stub browser path must be UTF-8"),
+            jellyfin,
+        )
+        .expect("create player");
+        player
+            .show_idle_screen(IdleScreen::Clock)
+            .expect("show initial idle screen");
+        player
+    }
+
+    /// `pause`/`resume`/`seek`/`set_volume` must route to the Jellyfin
+    /// Session REST API, not mpv, once a page from the logged-in Jellyfin
+    /// server's own origin is displayed -- the mechanism
+    /// `castoff-jellyfin-integration-ux` calls "one more controllable
+    /// source" through FCast's existing opcodes.
+    #[test]
+    fn playback_opcodes_route_to_jellyfin_when_its_page_is_displayed() {
+        // One response, cycled: every request here is either `GET /Sessions`
+        // (session resolution, and the `now_playing` poll every `Player`
+        // method's own `publish_status` also triggers) or a `POST` whose
+        // response body is never parsed, so this single array response
+        // answers all of them.
+        let mock = MockJellyfin::serving(vec![serde_json::json!([{ "Id": "s1" }])]);
+        let jellyfin = Arc::new(crate::jellyfin::JellyfinSession::ephemeral_for_test());
+        jellyfin.set_credentials(crate::jellyfin::JellyfinCredentials {
+            server_url: mock.base_url(),
+            access_token: "tok".to_string(),
+            user_id: "user".to_string(),
+        });
+
+        let dir = scratch_dir("jellyfin-playback-routing");
+        let browser = stub_browser(&dir, "browser-waiting", "sleep 300");
+        let player = headless_player_with_browser_and_jellyfin(&browser, jellyfin);
+        player
+            .play(&webpage_play(&format!("{}/web/index.html", mock.base_url())))
+            .expect("the Jellyfin page must be accepted as a webpage Play");
+
+        player.pause().expect("pause must route to Jellyfin");
+        assert!(mock.next_matching("/Playing/Pause").contains("/Playing/Pause"));
+
+        player.resume().expect("resume must route to Jellyfin");
+        assert!(mock.next_matching("/Playing/Unpause").contains("/Playing/Unpause"));
+
+        player.seek(12.5).expect("seek must route to Jellyfin");
+        assert!(mock.next_matching("seekPositionTicks=125000000").contains("seekPositionTicks=125000000"));
+
+        player
+            .set_volume(0.5)
+            .expect("set_volume must route to Jellyfin");
+        let volume_request = mock.next_matching("\"Volume\":\"50\"");
+        assert!(volume_request.contains("/Command"));
+        assert!(volume_request.contains("\"Volume\":\"50\""));
+
+        // None of the above must ever have touched mpv's own `pause`
+        // property: it must still read back as unset/false.
+        let mpv_paused: bool = player.mpv.get_property("pause").unwrap_or(false);
+        assert!(
+            !mpv_paused,
+            "mpv itself must be untouched while Jellyfin handles playback"
+        );
+    }
+
+    /// Regression guard for the pre-Jellyfin behavior: with no Jellyfin
+    /// login at all (the common case today), a displayed web page's
+    /// `pause`/`resume`/`seek`/`set_volume` must still fall through to mpv
+    /// exactly as before -- `jellyfin_controls_active_page` must be false
+    /// whenever there is no matching login, not just when the page itself
+    /// isn't Jellyfin's.
+    #[test]
+    fn playback_opcodes_still_use_mpv_when_there_is_no_jellyfin_login() {
+        let dir = scratch_dir("jellyfin-playback-routing-no-login");
+        let browser = stub_browser(&dir, "browser-waiting", "sleep 300");
+        let player = headless_player_with_browser(&browser);
+        player
+            .play(&webpage_play("http://127.0.0.1:9/dashboard"))
+            .expect("a webpage play must be accepted");
+
+        player.pause().expect("pause must fall through to mpv");
+        let mpv_paused: bool = player.mpv.get_property("pause").unwrap_or(false);
+        assert!(mpv_paused, "with no Jellyfin login, pause must reach mpv");
+    }
+
+    /// `RemoteCommand` (castoff's own FCast directional-nav opcode) must
+    /// dispatch a Jellyfin `GeneralCommand` when its page is on screen.
+    #[test]
+    fn remote_command_dispatches_to_jellyfin_when_its_page_is_displayed() {
+        let mock = MockJellyfin::serving(vec![serde_json::json!([{ "Id": "s1" }])]);
+        let jellyfin = Arc::new(crate::jellyfin::JellyfinSession::ephemeral_for_test());
+        jellyfin.set_credentials(crate::jellyfin::JellyfinCredentials {
+            server_url: mock.base_url(),
+            access_token: "tok".to_string(),
+            user_id: "user".to_string(),
+        });
+
+        let dir = scratch_dir("jellyfin-remote-command-routing");
+        let browser = stub_browser(&dir, "browser-waiting", "sleep 300");
+        let player = headless_player_with_browser_and_jellyfin(&browser, jellyfin);
+        player
+            .play(&webpage_play(&format!("{}/web/index.html", mock.base_url())))
+            .expect("the Jellyfin page must be accepted as a webpage Play");
+
+        player
+            .remote_command(crate::fcast::RemoteCommand::Select)
+            .expect("remote_command must reach the displayed Jellyfin page");
+        let request = mock.next_matching("\"Name\":\"Select\"");
+        assert!(request.contains("/Command"));
+        assert!(request.contains("\"Name\":\"Select\""));
+    }
+
+    /// With no Jellyfin page displayed, `remote_command` has nothing to
+    /// send to (there is no mpv fallback, unlike the playback opcodes).
+    #[test]
+    fn remote_command_errors_without_a_displayed_jellyfin_page() {
+        let dir = scratch_dir("jellyfin-remote-command-no-page");
+        let browser = stub_browser(&dir, "browser-waiting", "sleep 300");
+        let player = headless_player_with_browser(&browser);
+
+        let err = player
+            .remote_command(crate::fcast::RemoteCommand::MoveUp)
+            .expect_err("no Jellyfin page is displayed");
+        assert!(
+            err.to_string().contains("no displayed Jellyfin page"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// `status()` must report the real Jellyfin now-playing position and
+    /// duration -- not mpv's own (idle) state -- while a page from the
+    /// logged-in server is displayed, so a sender's progress bar reflects
+    /// what is actually playing in the tab.
+    #[test]
+    fn status_reports_jellyfin_now_playing_when_its_page_is_displayed() {
+        let mock = MockJellyfin::serving(vec![serde_json::json!([{
+            "Id": "s1",
+            "PlayState": { "PositionTicks": 50_000_000, "IsPaused": false },
+            "NowPlayingItem": { "Name": "Big Buck Bunny", "RunTimeTicks": 6_000_000_000i64 },
+        }])]);
+        let jellyfin = Arc::new(crate::jellyfin::JellyfinSession::ephemeral_for_test());
+        jellyfin.set_credentials(crate::jellyfin::JellyfinCredentials {
+            server_url: mock.base_url(),
+            access_token: "tok".to_string(),
+            user_id: "user".to_string(),
+        });
+
+        let dir = scratch_dir("jellyfin-status-routing");
+        let browser = stub_browser(&dir, "browser-waiting", "sleep 300");
+        let player = headless_player_with_browser_and_jellyfin(&browser, jellyfin);
+        player
+            .play(&webpage_play(&format!("{}/web/index.html", mock.base_url())))
+            .expect("the Jellyfin page must be accepted as a webpage Play");
+
+        let status = player.status();
+        assert_eq!(status.state, PlaybackState::Playing);
+        assert_eq!(status.time, Some(5.0));
+        assert_eq!(status.duration, Some(600.0));
+    }
+
+    /// `queue_state()` must report one synthetic entry for the Jellyfin
+    /// session's now-playing item while its page is displayed, not castoff's
+    /// own (here: empty) persisted queue -- see the
+    /// `castoff-jellyfin-integration-ux` report's "one evolving placeholder
+    /// entry" recommendation.
+    #[test]
+    fn queue_state_reports_one_synthetic_jellyfin_item_when_its_page_is_displayed() {
+        let mock = MockJellyfin::serving(vec![serde_json::json!([{
+            "Id": "s1",
+            "PlayState": { "PositionTicks": 0, "IsPaused": false },
+            "NowPlayingItem": { "Name": "Big Buck Bunny", "RunTimeTicks": 6_000_000_000i64 },
+        }])]);
+        let jellyfin = Arc::new(crate::jellyfin::JellyfinSession::ephemeral_for_test());
+        jellyfin.set_credentials(crate::jellyfin::JellyfinCredentials {
+            server_url: mock.base_url(),
+            access_token: "tok".to_string(),
+            user_id: "user".to_string(),
+        });
+
+        let dir = scratch_dir("jellyfin-queue-state-routing");
+        let browser = stub_browser(&dir, "browser-waiting", "sleep 300");
+        let player = headless_player_with_browser_and_jellyfin(&browser, jellyfin);
+        let url = format!("{}/web/index.html", mock.base_url());
+        player
+            .play(&webpage_play(&url))
+            .expect("the Jellyfin page must be accepted as a webpage Play");
+
+        let queue = player.queue_state();
+        assert_eq!(queue.current_index, Some(0));
+        assert_eq!(queue.items.len(), 1);
+        assert_eq!(queue.items[0].url, url);
+        assert_eq!(queue.items[0].title, Some("Big Buck Bunny".to_string()));
+        assert_eq!(queue.items[0].duration_secs, Some(600.0));
     }
 
     /// Casting media while a page is displayed must take the screen back:
