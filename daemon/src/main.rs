@@ -1,3 +1,4 @@
+mod cdp;
 mod fcast;
 mod idle_screen;
 mod images;

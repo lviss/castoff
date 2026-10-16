@@ -124,6 +124,10 @@ struct Handles<'a> {
     overlay: &'a PlaybackOverlay,
     idle: &'a IdleScreenController,
     routing: &'a Mutex<Routing>,
+    /// Kept as `&Arc<...>` (not `&JellyfinSession`): `play_webpage` needs an
+    /// owned `Arc` to hand to `jellyfin::maybe_start_login`, which moves it
+    /// into a detached background thread.
+    jellyfin: &'a Arc<JellyfinSession>,
 }
 
 /// The play queue state `spawn_async_event_watcher`'s background thread needs
@@ -549,6 +553,7 @@ impl Player {
             let routing = Arc::clone(&routing);
             let operation = Arc::clone(&operation);
             let queue = Arc::clone(&queue);
+            let jellyfin = Arc::clone(&jellyfin);
             let status_tx = status_tx.clone();
             let queue_tx = queue_tx.clone();
             let state_path = state_path.clone();
@@ -559,6 +564,7 @@ impl Player {
                     overlay: &overlay,
                     idle,
                     routing: &routing,
+                    jellyfin: &jellyfin,
                 };
                 auto_advance_queue(
                     &handles,
@@ -582,6 +588,7 @@ impl Player {
             &mpv,
             Arc::clone(&idle),
             Arc::clone(&webpage),
+            Arc::clone(&jellyfin),
             Arc::clone(&routing),
             Arc::clone(&operation),
             status_tx.clone(),
@@ -702,6 +709,7 @@ impl Player {
             overlay: &self.overlay,
             idle: &self.idle,
             routing: &self.routing,
+            jellyfin: &self.jellyfin,
         }
     }
 
@@ -1315,6 +1323,11 @@ fn play_webpage(h: &Handles, url: &str) -> Result<()> {
     // browser installed) is reported to the sender and leaves mpv's
     // playback (if any) untouched.
     h.webpage.show(url)?;
+    // If this page's origin turns out to be a Jellyfin server the daemon
+    // isn't already logged into, this starts that login dance in the
+    // background (see `jellyfin.rs`'s module doc comment) -- never here on
+    // this call stack, since it can block for minutes waiting on a human.
+    crate::jellyfin::maybe_start_login(h.jellyfin, h.webpage.profile_dir(), url);
     h.mpv
         .command("stop", &[])
         .map_err(|e| anyhow::anyhow!("stop before displaying a web page failed: {e:?}"))?;
@@ -1627,10 +1640,15 @@ fn snapshot_status(
 /// The raw `mpv_wait_event` (rather than libmpv2's safe `wait_event`) is what
 /// makes the id available at all: the safe enum keeps only the end reason and
 /// error code, and drops `playlist_entry_id`.
+// `jellyfin` pushed this past clippy's default threshold; bundling these
+// into a struct is a real signature refactor left for a future pass, not a
+// mechanical lint fix -- same call as `spawn_metadata_lookup`'s.
+#[allow(clippy::too_many_arguments)]
 fn spawn_async_event_watcher(
     mpv: &Mpv,
     idle: Arc<IdleScreenController>,
     webpage: Arc<WebpageController>,
+    jellyfin: Arc<JellyfinSession>,
     routing: Arc<Mutex<Routing>>,
     operation: Arc<Mutex<()>>,
     status_tx: watch::Sender<PlaybackUpdateMessage>,
@@ -1696,6 +1714,7 @@ fn spawn_async_event_watcher(
                             &events,
                             &idle,
                             &webpage,
+                            &jellyfin,
                             &status_tx,
                             QueueContext {
                                 queue: &queue.queue,
@@ -1758,12 +1777,17 @@ fn spawn_async_event_watcher(
 /// Called from `spawn_async_event_watcher` with the `operation` lock already
 /// held (see `Player::operation`), so the browser swap cannot interleave with
 /// a newer `play`/`stop`.
+// Same note as `spawn_async_event_watcher`'s: `jellyfin` pushed this past
+// clippy's default threshold, and bundling these into a struct is a real
+// signature refactor left for a future pass.
+#[allow(clippy::too_many_arguments)]
 fn fall_back_to_browser(
     url: &str,
     mpv_error: &libmpv2::Error,
     mpv: &Mpv,
     idle: &IdleScreenController,
     webpage: &WebpageController,
+    jellyfin: &Arc<JellyfinSession>,
     status_tx: &watch::Sender<PlaybackUpdateMessage>,
     queue: QueueContext,
 ) {
@@ -1791,6 +1815,8 @@ fn fall_back_to_browser(
             queue.queue_tx,
             queue.rollback,
         );
+    } else {
+        crate::jellyfin::maybe_start_login(jellyfin, webpage.profile_dir(), url);
     }
     // This path never goes through a `Player` method: a successful `show`
     // flips `webpage.is_active()` from false to true, which is the
@@ -3095,6 +3121,7 @@ mod tests {
             server_url: mock.base_url(),
             access_token: "tok".to_string(),
             user_id: "user".to_string(),
+            device_id: "device".to_string(),
         });
 
         let dir = scratch_dir("jellyfin-playback-routing");
@@ -3159,6 +3186,7 @@ mod tests {
             server_url: mock.base_url(),
             access_token: "tok".to_string(),
             user_id: "user".to_string(),
+            device_id: "device".to_string(),
         });
 
         let dir = scratch_dir("jellyfin-remote-command-routing");
@@ -3209,6 +3237,7 @@ mod tests {
             server_url: mock.base_url(),
             access_token: "tok".to_string(),
             user_id: "user".to_string(),
+            device_id: "device".to_string(),
         });
 
         let dir = scratch_dir("jellyfin-status-routing");
@@ -3241,6 +3270,7 @@ mod tests {
             server_url: mock.base_url(),
             access_token: "tok".to_string(),
             user_id: "user".to_string(),
+            device_id: "device".to_string(),
         });
 
         let dir = scratch_dir("jellyfin-queue-state-routing");

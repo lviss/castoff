@@ -32,10 +32,11 @@ A `Play` that is still loading shows an on-screen spinner, and starts/stops are 
 short fade (see
 [On-screen feedback](#on-screen-feedback-loading-indicator-and-startstop-fade)).
 
-A logged-in Jellyfin page additionally gets real playback control, now-playing display and
-remote-nav through FCast's existing opcodes (see
-[How Jellyfin control works](#how-jellyfin-control-works)) -- though nothing in the daemon yet
-triggers that login itself (see that section's last paragraph). No Immich/local-folder slideshows
+A page served by a Jellyfin server is recognized automatically -- no special `container` needed --
+and logs itself in via Jellyfin's own Quick Connect flow (a code shown in the page's own dialog,
+approved from an already-logged-in device, never a typed password), after which it additionally
+gets real playback control, now-playing display and remote-nav through FCast's existing opcodes
+(see [How Jellyfin control works](#how-jellyfin-control-works)). No Immich/local-folder slideshows
 either. See [Not yet implemented](#not-yet-implemented-follow-up-work) below for what's planned
 but not built.
 
@@ -422,14 +423,22 @@ rejects a `play()` call that didn't originate from a user gesture, which is the 
 screen" failure [jellyfin-web#4901](https://github.com/jellyfin/jellyfin-web/issues/4901)
 describes.
 
-**Not yet wired up: how a login actually happens.** `JellyfinSession::login_with_quick_connect`
-implements the one-time Quick Connect handshake itself (`POST /QuickConnect/Initiate`, poll `GET
-/QuickConnect/Connect`, then `POST /Users/AuthenticateWithQuickConnect`) and is fully unit-tested,
-but nothing in the daemon calls it yet: *when* a login is triggered and *how* its pairing code
-reaches the screen is an open product decision, since no existing on-screen affordance shows
-arbitrary status text once a web page is displayed (mpv's own OSD overlay, which the idle clock
-and loading spinner use, is hidden the moment a browser page is stacked over it). Once a login
-exists by whatever means, everything above already works against it.
+**How the login itself happens.** The daemon never calls Jellyfin's Quick Connect REST endpoints
+itself. jellyfin-web's login stores its session in `localStorage`, which is strictly
+origin-scoped: no page served from the daemon's own origin could write it for the Jellyfin
+server's, so the only way to get the *displayed tab's own* session logged in is to let
+jellyfin-web run its *own* Quick Connect flow inside itself. Whenever a displayed web page's
+origin answers `GET /System/Info/Public` the way a Jellyfin server does
+(`jellyfin::probe_server`) and the daemon isn't already logged into it, `jellyfin::maybe_start_login`
+drives that page via a minimal Chrome DevTools Protocol client (`daemon/src/cdp.rs`, over a
+`--remote-debugging-port=0` Chromium already launches with): it clicks the login page's own Quick
+Connect button -- which runs jellyfin-web's *own* Initiate/poll/Authenticate dance and shows the
+code in its own dialog, so the daemon never needs to display one itself -- waits (up to ten
+minutes, matching the server's own secret lifetime) for a human to approve it elsewhere, then
+reads back the token/user/device id that flow already obtained via `window.ApiClient`, which
+jellyfin-web deliberately exposes globally. This all runs on its own background thread, off any
+`Player` operation's lock, since waiting on a human can take minutes; a page that is not a
+Jellyfin server, or one the daemon is already logged into, never spawns that thread at all.
 
 ### On-screen feedback: loading indicator and start/stop fade
 
@@ -989,16 +998,12 @@ this scaffold yet, but they should carry forward into every later task on this c
 
 Out of scope for this scaffold, deliberately:
 
-- Triggering a Jellyfin login: the Quick Connect handshake itself (`POST /QuickConnect/Initiate`,
-  poll `GET /QuickConnect/Connect`, `POST /Users/AuthenticateWithQuickConnect` -- never a typed
-  password) and the REST client/FCast routing built on top of it are implemented and tested (see
-  [How Jellyfin control works](#how-jellyfin-control-works)), but nothing calls that handshake
-  yet: when it runs and how its pairing code reaches the screen is still an open decision. A
-  slideshow pulled from Immich or a local folder is unrelated follow-up work, not started.
-  (YouTube, web pages, and images uploaded from a phone are implemented -- see
+- A slideshow pulled from Immich or a local folder. (YouTube, web pages, images uploaded from a
+  phone, and Jellyfin are implemented -- see
   [How YouTube playback works](#how-youtube-playback-works),
-  [How webpage (dashboard) display works](#how-webpage-dashboard-display-works), and
-  [Image uploads (private extension)](#image-uploads-private-extension).)
+  [How webpage (dashboard) display works](#how-webpage-dashboard-display-works),
+  [Image uploads (private extension)](#image-uploads-private-extension), and
+  [How Jellyfin control works](#how-jellyfin-control-works).)
 - The native Android control app, including handling Android `Share` intents and its upload
   client for [Image uploads (private extension)](#image-uploads-private-extension)'s HTTP
   endpoint -- the daemon-side upload contract exists, and `scripts/cast.sh` can drive it (see
@@ -1012,8 +1017,8 @@ Out of scope for this scaffold, deliberately:
   finds a need for it.
 - A general authentication/credential flow for an arbitrary dashboard behind a login (e.g. a
   private Grafana); today's webpage display is otherwise for pages reachable without credentials.
-  Jellyfin's Quick Connect handshake is the one exception, and is implemented but not yet
-  triggered by anything -- see [How Jellyfin control works](#how-jellyfin-control-works).
+  Jellyfin's Quick Connect login is the one exception, and is fully implemented -- see
+  [How Jellyfin control works](#how-jellyfin-control-works).
 - Interaction with a displayed page in general (clicking, typing, scrolling, remote control) and
   DRM-protected video in it. Jellyfin again has its own exception for remote control (not general
   input synthesis) -- see the same section.

@@ -1,4 +1,4 @@
-//! Jellyfin Session REST client.
+//! Jellyfin login and Session REST client.
 //!
 //! Castoff shows Jellyfin's own web client (jellyfin-web) as a browser tab
 //! through the existing `webpage.rs` mechanism -- no second mpv process, no
@@ -13,49 +13,48 @@
 //! `README.md`'s Jellyfin section and the `castoff-jellyfin-cast-research`/
 //! `castoff-jellyfin-integration-ux` research reports this follows.
 //!
-//! # Why one client identity for everything
+//! # How the login itself happens
 //!
-//! A Quick Connect secret, once a human approves its code on another
-//! device, resolves to exactly *one* server-side `AuthenticationResult` --
-//! tied to the `Device`/`DeviceId` that called `/QuickConnect/Initiate`, not
-//! to whoever later redeems it (confirmed by reading the server's own
-//! `QuickConnectManager.cs`: `GetAuthorizedRequest` just returns the cached
-//! result by secret, idempotently, until it expires). So whichever device
-//! performs the Initiate/poll/Authenticate dance becomes *the* identity for
-//! that whole login; there is no separate "backend session" distinct from
-//! "the browser tab's session" to juggle. `JellyfinSession` here is written
-//! to be that one identity (`DEVICE_ID` persisted alongside the resulting
-//! credentials), ready for whatever wires the human-facing pairing step to
-//! it -- see the worklog/status notes for the open question of how the
-//! resulting token reaches the browser tab's own (origin-scoped)
-//! `localStorage`, which this module deliberately does not attempt to
-//! solve by itself.
+//! The daemon never calls `/QuickConnect/Initiate` itself. `localStorage`
+//! (where jellyfin-web keeps its login) is strictly origin-scoped, so no
+//! page the daemon serves from its own origin could write it for the
+//! Jellyfin server's -- the only way to get the *browser tab's own* session
+//! logged in is to let jellyfin-web run its *own* Quick Connect flow inside
+//! itself. `maybe_start_login`/`login_via_browser_tab` drive that flow via a
+//! minimal Chrome DevTools Protocol client (`cdp.rs`): click the login
+//! page's own Quick Connect button (so its own JS runs the Initiate/poll/
+//! Authenticate dance and shows the code in its own dialog -- nothing here
+//! needs to display one), wait for a human to approve it elsewhere, then
+//! read back the token/user/device id that flow already obtained via
+//! `window.ApiClient`, which jellyfin-web deliberately exposes globally
+//! (confirmed in the `castoff-jellyfin-integration-ux` report). Everything
+//! below this point in the module -- resolving the tab's own session,
+//! sending it playback/volume/navigation commands, polling its now-playing
+//! state -- just needs the resulting `JellyfinCredentials` and does not care
+//! how they were obtained.
 //!
-//! # Scope
-//!
-//! Everything here assumes a `JellyfinCredentials` already exists (however
-//! it got there) and uses it to: resolve the tab's own session id, send
-//! playback/volume/navigation commands to it, and poll its now-playing
-//! state. The Quick Connect functions at the bottom produce that
-//! `JellyfinCredentials` in the first place, independent of how/when a
-//! caller decides to invoke them or show the resulting code -- that
-//! decision is out of scope for this module.
+//! The browser tab's own device id (read back the same way) is what makes
+//! this work: the credentials the daemon uses for its REST calls are for
+//! *the same device* jellyfin-web registered its session under, so
+//! `GET /Sessions?DeviceId=<that id>` resolves to the tab's own session --
+//! there is no separate "daemon device" identity to keep in sync with it.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
-use std::sync::Mutex;
-use std::time::Duration;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tracing::{debug, warn};
+use tracing::{info, warn};
 
+use crate::cdp;
 use crate::fcast::RemoteCommand;
 
-/// Castoff's fixed client/device identity presented to Jellyfin for every
-/// request -- the Quick Connect login and every Session REST call
-/// afterwards, so they are all unambiguously the same client to the server.
+/// Castoff's fixed client identity presented to Jellyfin for every Session
+/// REST call (the `DeviceId` comes from the logged-in credentials instead --
+/// see this module's doc comment).
 const CLIENT_NAME: &str = "castoff";
 
 /// How long a single Jellyfin REST call may take before this daemon gives up
@@ -64,40 +63,28 @@ const CLIENT_NAME: &str = "castoff";
 /// thread there is still a real resource leak over time).
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// How often to poll `/QuickConnect/Connect` while waiting for a human to
-/// approve the on-screen code, matching jellyfin-web's own polling cadence
-/// (`authenticateQuickConnect`'s `setInterval(..., 5000)`).
-///
-/// Not read anywhere in the daemon itself yet: *when* a login is triggered
-/// and *how* its code reaches the screen is an open product decision (no
-/// existing castoff affordance shows arbitrary status text once a web page
-/// -- which would include Jellyfin's own -- is stacked over mpv's window;
-/// see this module's doc comment). `login_with_quick_connect` below and
-/// everything it calls are complete and tested in isolation, ready for
-/// whatever that decision wires them to.
-#[cfg_attr(not(test), allow(dead_code))]
-const QUICK_CONNECT_POLL_INTERVAL: Duration = Duration::from_secs(5);
+/// How long to wait for Chromium's DevTools HTTP server to come up after the
+/// engine is spawned (see `cdp::wait_for_devtools_port`).
+const DEVTOOLS_PORT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The server's own Quick Connect request timeout
-/// (`QuickConnectManager.cs`'s `Timeout = 10` minutes) -- waiting any longer
-/// than this for an approval is pointless, the secret has already expired
-/// server-side. Same pending-wiring note as `QUICK_CONNECT_POLL_INTERVAL`.
-#[cfg_attr(not(test), allow(dead_code))]
-const QUICK_CONNECT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+/// How long to wait for the login page's own Quick Connect button to become
+/// clickable. It starts hidden (`class="... btnQuick hide"`); jellyfin-web's
+/// own `viewshow` handler removes `hide` once its own
+/// `GET /QuickConnect/Enabled` call resolves true (confirmed from
+/// `jellyfin-web`'s `login/index.js`), so this is page-load plus one of the
+/// page's own network round trips, not instant.
+const QUICK_CONNECT_BUTTON_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long to wait for a human to approve the Quick Connect code
+/// jellyfin-web's own dialog is showing, matching the server's own secret
+/// lifetime (`QuickConnectManager.cs`'s `Timeout = 10` minutes) -- waiting
+/// any longer is pointless, the secret has already expired server-side.
+const LOGIN_WAIT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
+/// How often `wait_until` re-evaluates its condition.
+const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 const STATE_FILE_NAME: &str = "jellyfin.json";
-
-/// Persisted Jellyfin login: castoff's own device id (chosen once, before
-/// any login exists, so it has to be stored independently of
-/// `credentials`) plus the credentials a completed Quick Connect login
-/// produced, if any.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-struct JellyfinState {
-    #[serde(default)]
-    device_id: Option<String>,
-    #[serde(default)]
-    credentials: Option<JellyfinCredentials>,
-}
 
 /// A completed Jellyfin login: enough to act as that session's client for
 /// every Session REST call below.
@@ -109,6 +96,13 @@ pub(crate) struct JellyfinCredentials {
     pub(crate) server_url: String,
     pub(crate) access_token: String,
     pub(crate) user_id: String,
+    /// The browser tab's own device id (`window.ApiClient.deviceId()`),
+    /// read back from the same login that produced `access_token`. Every
+    /// REST call below presents this exact id in its own `Authorization`
+    /// header and uses it to find the tab's session
+    /// (`GET /Sessions?DeviceId=...`) -- see this module's doc comment for
+    /// why there is no separate daemon-chosen device id.
+    pub(crate) device_id: String,
 }
 
 /// Jellyfin's now-playing state for the controlled session, in the shape
@@ -185,8 +179,8 @@ impl RemoteCommand {
     }
 }
 
+#[derive(Default)]
 struct SessionState {
-    device_id: String,
     credentials: Option<JellyfinCredentials>,
     /// Cached `Sessions` id for `credentials`' device, resolved lazily
     /// (`resolve_session`) and invalidated whenever `credentials` changes.
@@ -209,31 +203,17 @@ impl JellyfinSession {
     }
 
     fn with_state_path(state_path: Option<PathBuf>) -> Self {
-        let loaded = state_path.as_deref().and_then(load_state);
-        let (device_id, credentials) = match loaded {
-            Some(state) => (
-                state.device_id.unwrap_or_else(generate_device_id),
-                state.credentials,
-            ),
-            None => (generate_device_id(), None),
-        };
-        let session = Self {
+        let credentials = state_path.as_deref().and_then(load_credentials);
+        Self {
             agent: ureq::AgentBuilder::new()
                 .timeout(REQUEST_TIMEOUT)
                 .build(),
             state: Mutex::new(SessionState {
-                device_id,
                 credentials,
                 session_id: None,
             }),
             state_path,
-        };
-        // Persist a freshly generated device id immediately, so a login
-        // started against it (which embeds it in the Quick Connect
-        // `Initiate` call) is reproducible across a restart even before any
-        // credentials exist.
-        session.persist();
-        session
+        }
     }
 
     /// An in-memory-only session (no persisted state file), for tests --
@@ -245,20 +225,10 @@ impl JellyfinSession {
 
     fn persist(&self) {
         let Some(path) = &self.state_path else { return };
-        let state = {
-            let s = self.state.lock().unwrap();
-            JellyfinState {
-                device_id: Some(s.device_id.clone()),
-                credentials: s.credentials.clone(),
-            }
-        };
-        if let Err(e) = try_save(&state, path) {
+        let credentials = self.state.lock().unwrap().credentials.clone();
+        if let Err(e) = try_save(&credentials, path) {
             warn!(error = %e, ?path, "failed to persist Jellyfin login state");
         }
-    }
-
-    pub(crate) fn device_id(&self) -> String {
-        self.state.lock().unwrap().device_id.clone()
     }
 
     pub(crate) fn credentials(&self) -> Option<JellyfinCredentials> {
@@ -266,10 +236,7 @@ impl JellyfinSession {
     }
 
     /// Adopt a completed login, persist it, and drop any cached session id
-    /// (it belonged to the previous credentials, if any). Only called by
-    /// `login_with_quick_connect` and tests today -- see that method's
-    /// pending-wiring note.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// (it belonged to the previous credentials, if any).
     pub(crate) fn set_credentials(&self, credentials: JellyfinCredentials) {
         {
             let mut s = self.state.lock().unwrap();
@@ -294,46 +261,47 @@ impl JellyfinSession {
         }
     }
 
-    fn auth_header(&self, token: Option<&str>) -> String {
-        let device_id = self.device_id();
-        let mut header = format!(
-            r#"MediaBrowser Client="{CLIENT_NAME}", Device="{CLIENT_NAME}", DeviceId="{device_id}", Version="{}""#,
-            env!("CARGO_PKG_VERSION")
-        );
-        if let Some(token) = token {
-            header.push_str(&format!(r#", Token="{token}""#));
-        }
-        header
+    /// `DeviceId` here is `creds.device_id` -- the *browser tab's own*
+    /// device id, read back from the login that produced `creds` -- not a
+    /// separate identity of the daemon's own (see this module's doc
+    /// comment for why there is no such thing).
+    fn auth_header(&self, creds: &JellyfinCredentials) -> String {
+        format!(
+            r#"MediaBrowser Client="{CLIENT_NAME}", Device="{CLIENT_NAME}", DeviceId="{}", Version="{}", Token="{}""#,
+            creds.device_id,
+            env!("CARGO_PKG_VERSION"),
+            creds.access_token
+        )
     }
 
     /// Resolve (and cache) this login's own `Sessions` id: the jellyfin-web
-    /// tab logged in with the same credentials registers a session under
-    /// the same `DeviceId`, so filtering `GET /Sessions` by it is sufficient
-    /// -- the same query `sessionPlayer.getTargets()` uses for the official
+    /// tab logged in with these credentials registers a session under the
+    /// same `DeviceId`, so filtering `GET /Sessions` by it is sufficient --
+    /// the same query `sessionPlayer.getTargets()` uses for the official
     /// app's own "Play On" list, just filtered *to* this device instead of
     /// excluding it (see the `castoff-jellyfin-integration-ux` report).
     fn resolve_session(&self) -> Result<SessionInfoDto> {
         let creds = self
             .credentials()
             .context("no Jellyfin login yet; nothing to control")?;
-        let device_id = self.device_id();
         let url = format!(
             "{}/Sessions?DeviceId={}",
             creds.server_url,
-            urlencode(&device_id)
+            urlencode(&creds.device_id)
         );
         let sessions: Vec<SessionInfoDto> = self
             .agent
             .get(&url)
-            .set("Authorization", &self.auth_header(Some(&creds.access_token)))
+            .set("Authorization", &self.auth_header(&creds))
             .call()
             .context("GET /Sessions failed")?
             .into_json()
             .context("GET /Sessions returned unparsable JSON")?;
         let session = sessions.into_iter().next().with_context(|| {
             format!(
-                "no Jellyfin session is registered for device {device_id:?} yet -- is the \
-                 jellyfin-web tab logged in and still open?"
+                "no Jellyfin session is registered for device {:?} yet -- is the \
+                 jellyfin-web tab logged in and still open?",
+                creds.device_id
             )
         })?;
         self.state.lock().unwrap().session_id = Some(session.id.clone());
@@ -357,7 +325,7 @@ impl JellyfinSession {
         let url = format!("{}/Sessions/{id}/Playing/{}", creds.server_url, command.as_str());
         self.agent
             .post(&url)
-            .set("Authorization", &self.auth_header(Some(&creds.access_token)))
+            .set("Authorization", &self.auth_header(&creds))
             .call()
             .with_context(|| format!("POST /Sessions/{id}/Playing/{} failed", command.as_str()))?;
         Ok(())
@@ -383,7 +351,7 @@ impl JellyfinSession {
         );
         self.agent
             .post(&url)
-            .set("Authorization", &self.auth_header(Some(&creds.access_token)))
+            .set("Authorization", &self.auth_header(&creds))
             .call()
             .with_context(|| format!("POST /Sessions/{id}/Playing/Seek failed"))?;
         Ok(())
@@ -398,7 +366,7 @@ impl JellyfinSession {
         let body = json!({ "Name": name, "Arguments": arguments.unwrap_or_default() });
         self.agent
             .post(&url)
-            .set("Authorization", &self.auth_header(Some(&creds.access_token)))
+            .set("Authorization", &self.auth_header(&creds))
             .send_json(body)
             .with_context(|| format!("POST /Sessions/{id}/Command ({name}) failed"))?;
         Ok(())
@@ -440,63 +408,119 @@ impl JellyfinSession {
         }))
     }
 
-    /// Complete a one-time Quick Connect login against `server_url`:
-    /// `POST /QuickConnect/Initiate`, hand the resulting code to `on_code`
-    /// (so a caller can show it on screen) and poll `GET /QuickConnect/Connect`
-    /// until a human approves it elsewhere, then redeem the secret
-    /// (`POST /Users/AuthenticateWithQuickConnect`) and adopt the resulting
-    /// credentials. Blocks for up to [`QUICK_CONNECT_TIMEOUT`] (matching the
-    /// server's own secret lifetime); callers run this off whatever thread
-    /// can afford to block (e.g. `spawn_blocking`, like every other `Player`
-    /// method).
-    ///
-    /// Deliberately does not attempt to also log the *browser tab* in with
-    /// the resulting token -- see this module's doc comment.
-    ///
-    /// Not called anywhere in the daemon yet -- see
-    /// `QUICK_CONNECT_POLL_INTERVAL`'s doc comment for why.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn login_with_quick_connect(
-        &self,
-        server_url: &str,
-        mut on_code: impl FnMut(&str),
-    ) -> Result<JellyfinCredentials> {
-        let server_url = server_url.trim_end_matches('/');
-        let device_id = self.device_id();
-        let pending = quick_connect_initiate(&self.agent, server_url, &device_id)?;
-        on_code(&pending.code);
+}
 
-        let deadline = std::time::Instant::now() + QUICK_CONNECT_TIMEOUT;
-        loop {
-            if quick_connect_check(&self.agent, server_url, &pending.secret)? {
-                break;
-            }
-            if std::time::Instant::now() >= deadline {
-                anyhow::bail!(
-                    "Jellyfin Quick Connect code {} was never approved within {:?}",
-                    pending.code,
-                    QUICK_CONNECT_TIMEOUT
-                );
-            }
-            std::thread::sleep(QUICK_CONNECT_POLL_INTERVAL);
+/// If `url` is a page served by a Jellyfin server this session isn't
+/// already logged into, probe whether it really is one (`probe_server`)
+/// and, if so, start the browser-driven login dance
+/// (`login_via_browser_tab`) on its own detached thread -- never on the
+/// caller's own stack, since it can block for minutes waiting on a human to
+/// approve the on-screen code. Called right after `webpage.show(url)`
+/// succeeds, from both the explicit webpage `Play` path and the async
+/// media-to-webpage fallback path (`player.rs`).
+pub(crate) fn maybe_start_login(jellyfin: &Arc<JellyfinSession>, profile_dir: PathBuf, url: &str) {
+    if jellyfin.controls(url) {
+        return; // cheap, in-memory check: no need for a thread at all.
+    }
+    let Some(origin) = origin_of(url).map(str::to_string) else {
+        return;
+    };
+    // Everything past this point touches the network (the probe, then the
+    // login dance itself), so none of it runs on the caller's own stack --
+    // `play_webpage`/`fall_back_to_browser` must stay as fast as they were
+    // for every *other* displayed page, Jellyfin or not.
+    let jellyfin = Arc::clone(jellyfin);
+    std::thread::spawn(move || {
+        if !probe_server(&jellyfin.agent, &origin) {
+            return;
         }
+        info!(origin, "detected a Jellyfin server; starting its Quick Connect login");
+        match login_via_browser_tab(&profile_dir, &origin) {
+            Ok(credentials) => {
+                info!(origin, "Jellyfin login completed");
+                jellyfin.set_credentials(credentials);
+            }
+            Err(e) => warn!(
+                origin,
+                error = %e,
+                "Jellyfin login via the displayed browser tab failed"
+            ),
+        }
+    });
+}
 
-        let credentials = quick_connect_authenticate(&self.agent, server_url, &pending.secret)?;
-        self.set_credentials(credentials.clone());
-        Ok(credentials)
+/// The login page's own Quick Connect button selector (confirmed from
+/// `jellyfin-web`'s `login/index.html`/`index.js`): hidden by default,
+/// shown once the page's own `GET /QuickConnect/Enabled` call resolves true.
+const QUICK_CONNECT_BUTTON_READY_JS: &str =
+    "(() => { const b = document.querySelector('.btnQuick'); return !!(b && !b.classList.contains('hide')); })()";
+const CLICK_QUICK_CONNECT_JS: &str = "document.querySelector('.btnQuick').click()";
+/// `window.ApiClient` is jellyfin-web's own deliberately-global live client
+/// instance (`ServerConnections.js`'s `window.ApiClient = apiClient`);
+/// `accessToken()` returns `null` until its internal login flow succeeds.
+const IS_LOGGED_IN_JS: &str =
+    "(() => !!(window.ApiClient && typeof window.ApiClient.accessToken === 'function' && window.ApiClient.accessToken()))()";
+const READ_CREDENTIALS_JS: &str = "({ accessToken: window.ApiClient.accessToken(), userId: window.ApiClient.getCurrentUserId(), deviceId: window.ApiClient.deviceId() })";
+
+/// Log in to Jellyfin by driving the login page already displayed in the
+/// browser engine via CDP: wait for its own Quick Connect button to become
+/// clickable, click it -- which runs jellyfin-web's *own* Initiate/poll/
+/// Authenticate dance and shows the code in its own dialog, so nothing here
+/// needs to display one -- then wait for a human to approve it elsewhere
+/// and read back the token/user/device id that flow already obtained. See
+/// this module's doc comment for why the daemon never calls Jellyfin's
+/// Quick Connect REST endpoints itself.
+///
+/// Blocks for up to [`QUICK_CONNECT_BUTTON_TIMEOUT`] plus
+/// [`LOGIN_WAIT_TIMEOUT`]; `maybe_start_login` is what keeps this off
+/// `Player::operation`'s lock and every other caller's own stack.
+fn login_via_browser_tab(profile_dir: &Path, server_origin: &str) -> Result<JellyfinCredentials> {
+    let http_port = cdp::wait_for_devtools_port(profile_dir, DEVTOOLS_PORT_TIMEOUT)?;
+    let agent = ureq::Agent::new();
+    let ws_url = cdp::discover_page_ws_url(&agent, http_port)?;
+    let mut session = cdp::CdpSession::connect(http_port, &ws_url)?;
+
+    wait_until(&mut session, QUICK_CONNECT_BUTTON_READY_JS, QUICK_CONNECT_BUTTON_TIMEOUT)
+        .context("Jellyfin's own Quick Connect button never became available on the login page")?;
+    session
+        .evaluate(CLICK_QUICK_CONNECT_JS)
+        .context("failed to click Jellyfin's Quick Connect button")?;
+
+    wait_until(&mut session, IS_LOGGED_IN_JS, LOGIN_WAIT_TIMEOUT)
+        .context("Jellyfin Quick Connect login was never approved")?;
+    let raw = session
+        .evaluate(READ_CREDENTIALS_JS)
+        .context("failed to read back Jellyfin's own login credentials")?;
+    let field = |name: &str| -> Result<String> {
+        raw.get(name)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .with_context(|| format!("window.ApiClient did not report a usable {name:?} after login"))
+    };
+    Ok(JellyfinCredentials {
+        server_url: server_origin.to_string(),
+        access_token: field("accessToken")?,
+        user_id: field("userId")?,
+        device_id: field("deviceId")?,
+    })
+}
+
+/// Poll `expression` (via CDP) every [`POLL_INTERVAL`] until it evaluates
+/// truthy or `timeout` elapses.
+fn wait_until(session: &mut cdp::CdpSession, expression: &str, timeout: Duration) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if session.evaluate(expression)?.as_bool() == Some(true) {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!("timed out after {timeout:?} waiting for {expression:?} to become true");
+        }
+        std::thread::sleep(POLL_INTERVAL);
     }
 }
 
-fn generate_device_id() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    format!("castoff-{nanos:x}-{:x}", std::process::id())
-}
-
-fn load_state(path: &std::path::Path) -> Option<JellyfinState> {
+fn load_credentials(path: &Path) -> Option<JellyfinCredentials> {
     match std::fs::read(path) {
         Ok(data) => serde_json::from_slice(&data).ok(),
         Err(_) => None,
@@ -504,12 +528,17 @@ fn load_state(path: &std::path::Path) -> Option<JellyfinState> {
 }
 
 /// Persist via write-then-rename, the same crash-safety pattern
-/// `queue.rs`'s `Queue::save` uses.
-fn try_save(state: &JellyfinState, path: &std::path::Path) -> Result<()> {
+/// `queue.rs`'s `Queue::save` uses. A no-op when there is nothing to
+/// persist yet (no login completed), so no empty/placeholder file is ever
+/// written before one exists.
+fn try_save(credentials: &Option<JellyfinCredentials>, path: &Path) -> Result<()> {
+    let Some(credentials) = credentials else {
+        return Ok(());
+    };
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let data = serde_json::to_vec_pretty(state)?;
+    let data = serde_json::to_vec_pretty(credentials)?;
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, &data)?;
     std::fs::rename(&tmp, path)?;
@@ -517,8 +546,8 @@ fn try_save(state: &JellyfinState, path: &std::path::Path) -> Result<()> {
 }
 
 /// Minimal query-string escaping for the one kind of value this module ever
-/// puts in a URL (a device id this daemon generated itself, see
-/// `generate_device_id`) -- not a general-purpose encoder.
+/// puts in a URL (the browser tab's own device id, read back via CDP) --
+/// not a general-purpose encoder.
 fn urlencode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
@@ -560,118 +589,7 @@ struct NowPlayingItemDto {
     run_time_ticks: Option<i64>,
 }
 
-// Everything below (through `probe_server`) is the Quick Connect login
-// itself: complete and unit-tested, but not called anywhere in the daemon
-// yet pending the open product decision of when a login is triggered and
-// how its code reaches the screen -- see `QUICK_CONNECT_POLL_INTERVAL`'s
-// doc comment above.
-
-/// A Quick Connect request that has been created but not yet approved.
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) struct QuickConnectPending {
-    pub(crate) secret: String,
-    pub(crate) code: String,
-}
-
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "PascalCase")]
-#[cfg_attr(not(test), allow(dead_code))]
-struct QuickConnectInitiateResponse {
-    secret: String,
-    code: String,
-}
-
-/// `POST /QuickConnect/Initiate` needs no prior auth, just the four
-/// non-empty `Client`/`Device`/`DeviceId`/`Version` header fields
-/// (`QuickConnectManager.cs`'s `TryConnect`).
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn quick_connect_initiate(
-    agent: &ureq::Agent,
-    server_url: &str,
-    device_id: &str,
-) -> Result<QuickConnectPending> {
-    let header = format!(
-        r#"MediaBrowser Client="{CLIENT_NAME}", Device="{CLIENT_NAME}", DeviceId="{device_id}", Version="{}""#,
-        env!("CARGO_PKG_VERSION")
-    );
-    let response: QuickConnectInitiateResponse = agent
-        .post(&format!("{server_url}/QuickConnect/Initiate"))
-        .set("Authorization", &header)
-        .call()
-        .context("POST /QuickConnect/Initiate failed")?
-        .into_json()
-        .context("POST /QuickConnect/Initiate returned unparsable JSON")?;
-    Ok(QuickConnectPending {
-        secret: response.secret,
-        code: response.code,
-    })
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "PascalCase")]
-#[cfg_attr(not(test), allow(dead_code))]
-struct QuickConnectStateResponse {
-    #[serde(default)]
-    authenticated: bool,
-}
-
-/// `GET /QuickConnect/Connect?secret=...`: whether a human has approved this
-/// request yet. Needs no auth either -- the secret itself is the capability.
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn quick_connect_check(agent: &ureq::Agent, server_url: &str, secret: &str) -> Result<bool> {
-    let response: QuickConnectStateResponse = agent
-        .get(&format!(
-            "{server_url}/QuickConnect/Connect?secret={}",
-            urlencode(secret)
-        ))
-        .call()
-        .context("GET /QuickConnect/Connect failed")?
-        .into_json()
-        .context("GET /QuickConnect/Connect returned unparsable JSON")?;
-    debug!(authenticated = response.authenticated, "Quick Connect poll");
-    Ok(response.authenticated)
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "PascalCase")]
-#[cfg_attr(not(test), allow(dead_code))]
-struct AuthenticationResultResponse {
-    access_token: String,
-    user: AuthenticatedUser,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "PascalCase")]
-#[cfg_attr(not(test), allow(dead_code))]
-struct AuthenticatedUser {
-    id: String,
-}
-
-/// `POST /Users/AuthenticateWithQuickConnect`: redeem an approved secret for
-/// the `AuthenticationResult` the approving human authorized
-/// (`QuickConnectManager.cs`'s `GetAuthorizedRequest` -- idempotent, so this
-/// can safely be retried).
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn quick_connect_authenticate(
-    agent: &ureq::Agent,
-    server_url: &str,
-    secret: &str,
-) -> Result<JellyfinCredentials> {
-    let response: AuthenticationResultResponse = agent
-        .post(&format!("{server_url}/Users/AuthenticateWithQuickConnect"))
-        .send_json(json!({ "Secret": secret }))
-        .context("POST /Users/AuthenticateWithQuickConnect failed")?
-        .into_json()
-        .context("POST /Users/AuthenticateWithQuickConnect returned unparsable JSON")?;
-    Ok(JellyfinCredentials {
-        server_url: server_url.to_string(),
-        access_token: response.access_token,
-        user_id: response.user.id,
-    })
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[cfg_attr(not(test), allow(dead_code))]
 struct PublicSystemInfo {
     #[serde(default, rename = "ProductName")]
     product_name: String,
@@ -680,10 +598,9 @@ struct PublicSystemInfo {
 /// Whether `origin` looks like a Jellyfin server: `GET /System/Info/Public`
 /// needs no auth and, on a real Jellyfin server, reports
 /// `"ProductName":"Jellyfin Server"` (confirmed live against
-/// `demo.jellyfin.org`). Meant to recognize a cast target automatically
-/// rather than requiring separate Jellyfin-specific setup, once the pending
-/// login-trigger decision wires it in -- not called anywhere yet.
-#[cfg_attr(not(test), allow(dead_code))]
+/// `demo.jellyfin.org`). This is how `maybe_start_login` recognizes a cast
+/// target automatically rather than requiring separate Jellyfin-specific
+/// setup.
 pub(crate) fn probe_server(agent: &ureq::Agent, origin: &str) -> bool {
     let Ok(response) = agent
         .get(&format!("{origin}/System/Info/Public"))
@@ -733,6 +650,7 @@ mod tests {
             server_url: "http://jellyfin.lan:8096".to_string(),
             access_token: "tok".to_string(),
             user_id: "user".to_string(),
+            device_id: "device".to_string(),
         });
         assert!(session.controls("http://jellyfin.lan:8096/web/index.html"));
         // Case-insensitive, matching `webpage.rs`'s own URL handling.
@@ -798,6 +716,7 @@ mod tests {
             server_url: server_url.to_string(),
             access_token: "test-token".to_string(),
             user_id: "test-user".to_string(),
+            device_id: "test-device".to_string(),
         });
         session
     }
@@ -939,67 +858,6 @@ mod tests {
     }
 
     #[test]
-    fn quick_connect_initiate_parses_the_secret_and_code() {
-        let mock = MockServer::sequence(vec![
-            json!({ "Authenticated": false, "Secret": "sek", "Code": "123456" }),
-        ]);
-        let agent = ureq::Agent::new();
-        let pending = quick_connect_initiate(&agent, &mock.base_url(), "device-1")
-            .expect("initiate");
-        assert_eq!(pending.secret, "sek");
-        assert_eq!(pending.code, "123456");
-    }
-
-    #[test]
-    fn quick_connect_check_reports_whether_it_was_approved() {
-        let mock = MockServer::sequence(vec![json!({ "Authenticated": true })]);
-        let agent = ureq::Agent::new();
-        let approved = quick_connect_check(&agent, &mock.base_url(), "sek").expect("check");
-        assert!(approved);
-    }
-
-    #[test]
-    fn quick_connect_authenticate_returns_usable_credentials() {
-        let mock = MockServer::sequence(vec![json!({
-            "AccessToken": "tok-123",
-            "User": { "Id": "user-456" },
-        })]);
-        let agent = ureq::Agent::new();
-        let creds = quick_connect_authenticate(&agent, &mock.base_url(), "sek")
-            .expect("authenticate");
-        assert_eq!(creds.access_token, "tok-123");
-        assert_eq!(creds.user_id, "user-456");
-        assert_eq!(creds.server_url, mock.base_url());
-    }
-
-    #[test]
-    fn login_with_quick_connect_polls_until_approved_then_authenticates() {
-        let mock = MockServer::sequence(vec![
-            json!({ "Authenticated": false, "Secret": "sek", "Code": "654321" }),
-            json!({ "Authenticated": false }), // first poll: not yet
-            json!({ "Authenticated": true }),  // second poll: approved
-            json!({ "AccessToken": "tok", "User": { "Id": "user" } }),
-        ]);
-        let session = JellyfinSession::ephemeral_for_test();
-        let mut shown_code = None;
-        // Avoid the real poll cadence slowing this test down: temporarily
-        // not possible without an injectable clock, so this test instead
-        // relies on the mock only ever returning two polls before approval.
-        let creds = {
-            // Shrink the interval for this one call via the env override
-            // tests use elsewhere in this daemon is overkill for a two-poll
-            // wait; accept the fixed real `QUICK_CONNECT_POLL_INTERVAL` here.
-            session.login_with_quick_connect(&mock.base_url(), |code| {
-                shown_code = Some(code.to_string());
-            })
-        }
-        .expect("login");
-        assert_eq!(shown_code, Some("654321".to_string()));
-        assert_eq!(creds.access_token, "tok");
-        assert_eq!(creds.user_id, "user");
-    }
-
-    #[test]
     fn probe_server_recognizes_a_jellyfin_response() {
         let mock = MockServer::sequence(vec![json!({ "ProductName": "Jellyfin Server" })]);
         let agent = ureq::Agent::new();
@@ -1014,33 +872,176 @@ mod tests {
     }
 
     #[test]
-    fn jellyfin_state_round_trips_through_a_file() {
+    fn jellyfin_credentials_round_trip_through_a_file() {
         let dir = std::env::temp_dir().join(format!(
             "castoff-jellyfin-test-{}-{}",
             std::process::id(),
-            generate_device_id()
+            free_port()
         ));
         let path = dir.join(STATE_FILE_NAME);
         let session = JellyfinSession::with_state_path(Some(path.clone()));
-        let device_id = session.device_id();
+        assert_eq!(session.credentials(), None, "nothing is persisted before a login");
         session.set_credentials(JellyfinCredentials {
             server_url: "http://jellyfin.lan".to_string(),
             access_token: "tok".to_string(),
             user_id: "user".to_string(),
+            device_id: "device".to_string(),
         });
         drop(session);
 
         let reloaded = JellyfinSession::with_state_path(Some(path.clone()));
-        assert_eq!(reloaded.device_id(), device_id);
         assert_eq!(
             reloaded.credentials(),
             Some(JellyfinCredentials {
                 server_url: "http://jellyfin.lan".to_string(),
                 access_token: "tok".to_string(),
                 user_id: "user".to_string(),
+                device_id: "device".to_string(),
             })
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    /// A single-connection mock Chromium DevTools endpoint: answers one
+    /// `GET /json/list` with a single page target, then performs the real
+    /// WebSocket upgrade for that target and answers each
+    /// `Runtime.evaluate` call in `script`, in order, with its value.
+    fn serve_mock_devtools(port: u16, script: Vec<serde_json::Value>) -> std::thread::JoinHandle<()> {
+        use std::io::{Read, Write};
+        use tungstenite::Message;
+
+        let listener = std::net::TcpListener::bind(("127.0.0.1", port)).expect("bind mock DevTools port");
+        std::thread::spawn(move || {
+            // `GET /json/list`.
+            let (mut stream, _) = listener.accept().expect("accept json/list connection");
+            let mut buf = [0u8; 2048];
+            let _ = stream.read(&mut buf);
+            let body = json!([{
+                "type": "page",
+                "webSocketDebuggerUrl": format!("ws://127.0.0.1:{port}/devtools/page/test"),
+            }])
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).expect("write json/list response");
+
+            // The DevTools WebSocket connection for that page.
+            let (stream, _) = listener.accept().expect("accept devtools websocket");
+            let mut socket = tungstenite::accept(stream).expect("mock DevTools WS handshake");
+            for value in script {
+                let text = loop {
+                    match socket.read().expect("read CDP request") {
+                        Message::Text(text) => break text,
+                        _ => continue,
+                    }
+                };
+                let id = serde_json::from_str::<serde_json::Value>(&text).unwrap()["id"].clone();
+                let reply = json!({ "id": id, "result": { "result": { "value": value } } });
+                socket
+                    .send(Message::Text(reply.to_string()))
+                    .expect("send mock CDP reply");
+            }
+        })
+    }
+
+    fn write_devtools_active_port(profile_dir: &Path, port: u16) {
+        std::fs::create_dir_all(profile_dir).unwrap();
+        std::fs::write(
+            profile_dir.join("DevToolsActivePort"),
+            format!("{port}\n/devtools/browser/mock\n"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn login_via_browser_tab_waits_for_the_button_then_reads_back_credentials() {
+        let port = free_port();
+        let profile_dir = std::env::temp_dir().join(format!(
+            "castoff-jellyfin-login-test-{}-{port}",
+            std::process::id()
+        ));
+        write_devtools_active_port(&profile_dir, port);
+        let server = serve_mock_devtools(
+            port,
+            vec![
+                json!(false), // Quick Connect button not ready yet
+                json!(true),  // button ready
+                json!(serde_json::Value::Null), // the click itself
+                json!(false), // not logged in yet
+                json!(true),  // approved
+                json!({ "accessToken": "tok", "userId": "user", "deviceId": "device" }),
+            ],
+        );
+
+        let creds =
+            login_via_browser_tab(&profile_dir, "http://jellyfin.lan").expect("login via tab");
+        assert_eq!(creds.server_url, "http://jellyfin.lan");
+        assert_eq!(creds.access_token, "tok");
+        assert_eq!(creds.user_id, "user");
+        assert_eq!(creds.device_id, "device");
+
+        server.join().unwrap();
+        let _ = std::fs::remove_dir_all(&profile_dir);
+    }
+
+    #[test]
+    fn login_via_browser_tab_fails_legibly_when_the_devtools_port_never_appears() {
+        let profile_dir = std::env::temp_dir().join(format!(
+            "castoff-jellyfin-login-missing-test-{}-{}",
+            std::process::id(),
+            free_port()
+        ));
+        let _ = std::fs::remove_dir_all(&profile_dir);
+
+        let err = login_via_browser_tab(&profile_dir, "http://jellyfin.lan")
+            .expect_err("no DevTools port ever appears");
+        assert!(err.to_string().contains("DevToolsActivePort"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn maybe_start_login_does_nothing_when_already_logged_into_this_origin() {
+        // No mock server at all: if this reached the network it would hang
+        // or error inside the background thread, which this test cannot
+        // observe directly, but it also must not panic or block the caller.
+        let session = Arc::new(logged_in_session("http://jellyfin.lan"));
+        maybe_start_login(
+            &session,
+            PathBuf::from("/nonexistent"),
+            "http://jellyfin.lan/web/index.html",
+        );
+        // Still the same credentials; nothing was reset or re-triggered.
+        assert_eq!(session.credentials().unwrap().access_token, "test-token");
+    }
+
+    #[test]
+    fn maybe_start_login_does_nothing_for_a_non_jellyfin_origin() {
+        let mock = MockServer::sequence(vec![json!({ "ProductName": "Grafana" })]);
+        let session = Arc::new(JellyfinSession::ephemeral_for_test());
+        maybe_start_login(
+            &session,
+            PathBuf::from("/nonexistent"),
+            &format!("{}/d/dashboard", mock.base_url()),
+        );
+        // The probe (and everything after it) now always runs on its own
+        // background thread, never on this call's own stack -- see
+        // `maybe_start_login`'s doc comment for why. `MockServer`'s `Drop`
+        // joins its one-request server thread, which only returns once the
+        // probe this test cares about has actually landed, so waiting for
+        // `mock` to drop here is itself the synchronization: no arbitrary
+        // sleep needed.
+        drop(mock);
+        assert_eq!(session.credentials(), None);
     }
 }

@@ -204,10 +204,25 @@ impl Browser {
             // kiosk with no mouse/keyboard for a user gesture to ever come
             // from regardless of which page is on screen.
             "--autoplay-policy=no-user-gesture-required".to_string(),
+            // An ephemeral, OS-assigned DevTools port: `jellyfin.rs`'s login
+            // flow (`maybe_start_login`/`login_via_browser_tab`) drives the
+            // displayed Jellyfin login page via CDP (`cdp.rs`) -- clicking
+            // its own Quick Connect button and reading back the token/user/
+            // device id its own login flow obtained, since that is
+            // `localStorage`-backed state no page from a different origin
+            // could write for it. `0` (rather than a fixed port) avoids any
+            // collision with another process, including a second
+            // `WebpageController` in this same test binary; the actual port
+            // Chromium picked is read back from its own
+            // `DevToolsActivePort` file (`cdp::wait_for_devtools_port`).
+            // Harmless for every other displayed page: nothing makes this
+            // daemon connect to it unless a Jellyfin server was detected.
+            "--remote-debugging-port=0".to_string(),
         ]
     }
 
-    /// Remove Chromium's process-singleton files from the profile directory.
+    /// Remove Chromium's process-singleton files from the profile directory,
+    /// plus the previous engine's `DevToolsActivePort`.
     ///
     /// Every browser in this controller shares one `--user-data-dir`, and
     /// Chromium admits only one browser per profile via these files. A
@@ -215,8 +230,18 @@ impl Browser {
     /// detect a lock whose pid is dead, but removing them after the previous
     /// engine has been reaped makes the restart deterministic instead of
     /// relying on that detection.
+    ///
+    /// `DevToolsActivePort` matters for the same reason: it is also written
+    /// once, at startup, under this same shared profile directory (see
+    /// `args`' `--remote-debugging-port=0`), and the next engine would not
+    /// rewrite it until *its own* DevTools HTTP server binds. Without
+    /// removing the stale file here, `cdp::wait_for_devtools_port` could
+    /// read the *previous*, now-dead engine's port instead of waiting for
+    /// the new one -- this is the one place in `show` where the old engine
+    /// is already confirmed gone and the new one has not spawned yet, so it
+    /// cannot race either side.
     fn clear_singleton_artifacts(&self) {
-        for name in ["SingletonLock", "SingletonSocket", "SingletonCookie"] {
+        for name in ["SingletonLock", "SingletonSocket", "SingletonCookie", "DevToolsActivePort"] {
             let path = self.profile_dir.join(name);
             match std::fs::remove_file(&path) {
                 Ok(()) => {}
@@ -224,8 +249,8 @@ impl Browser {
                 Err(e) => error!(
                     path = %path.display(),
                     error = %e,
-                    "failed to clear a stale browser profile singleton file; the next \
-                     engine start will fall back to Chromium's own stale-lock detection"
+                    "failed to clear a stale browser profile file; the next engine's \
+                     singleton-lock detection or DevTools port discovery may see stale state"
                 ),
             }
         }
@@ -338,6 +363,14 @@ impl WebpageController {
             .current
             .as_ref()
             .map(|p| p.url.clone())
+    }
+
+    /// This controller's shared `--user-data-dir`, fixed for its whole
+    /// lifetime (see `Browser::profile_dir`). `jellyfin.rs`'s
+    /// `maybe_start_login` reads `DevToolsActivePort` under it to find the
+    /// just-shown engine's own CDP port.
+    pub(crate) fn profile_dir(&self) -> PathBuf {
+        self.browser.profile_dir.clone()
     }
 
     /// Display `url`, replacing whatever page (if any) is on screen.

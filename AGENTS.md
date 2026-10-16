@@ -551,42 +551,64 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   does **not** include `socat`, matching the point above: `cast.sh` never actually calls it.
 
 - `daemon/src/jellyfin.rs` is castoff's Jellyfin **Session REST client** (`ureq`, the daemon's
-  first HTTP client dependency), not a second mpv process or a daemon-owned WebSocket client --
-  see README's "How Jellyfin control works". `Player::pause`/`resume`/`seek`/`set_volume`/the new
-  `remote_command` (FCast's private-extension `Opcode::RemoteCommand`, `fcast.rs`) route to it
-  instead of mpv whenever `WebpageController::active_url()`'s origin matches a logged-in
-  `JellyfinSession`'s `server_url` (`JellyfinSession::controls`); a non-Jellyfin page, or no login
-  at all, falls through to mpv exactly as before this feature existed.
-  **Quick Connect's secret is idempotent and device-bound to whoever called `Initiate`, not
-  whoever redeems it**: confirmed by reading the server's own `QuickConnectManager.cs` --
-  `AuthorizeRequest` (the human-approval step) creates exactly one `AuthenticationResult` tied to
-  the `DeviceId` that called `/QuickConnect/Initiate`, and `GetAuthorizedRequest` (what
-  `/Users/AuthenticateWithQuickConnect` calls) just returns that same cached result by secret,
-  repeatably, until it expires (10 minutes). So there is exactly one client identity per login, not
-  a separate "daemon backend" session distinct from "the browser tab's session" --
-  `JellyfinSession::login_with_quick_connect` is written on this basis (one fixed, persisted
-  `device_id` for everything this daemon does as a Jellyfin client).
-  **Still open, and why**: nothing in the daemon calls `login_with_quick_connect` yet.
-  `localStorage` (where jellyfin-web keeps its login, confirmed from the archived
-  `jellyfin-apiclient-javascript`'s `credentials.js`/`appStorage.js`: plain `localStorage.setItem`
-  under the key `jellyfin_credentials`) is strictly **origin-scoped** -- a page the daemon serves
-  from its own local port cannot write it for the Jellyfin server's origin, and Chromium's
-  on-disk `localStorage` backing store is an internal LevelDB encoding, not something to
-  hand-write from outside the browser either. That leaves either CDP (driving the already-open
-  tab's own JS, e.g. clicking its Quick Connect button or reading/setting `window.ApiClient`,
-  which jellyfin-web deliberately exposes globally) or some other mechanism neither verified nor
-  built here -- see README's own call-out of this as an open decision, and do not assume a
-  same-origin bootstrap page can solve it. Everything *downstream* of a login already works and is
-  unit-tested (`jellyfin.rs`'s and `player.rs`'s own `#[cfg(test)]` modules) against a mock server,
-  independent of how that login eventually happens.
-  **Test gotcha if you touch this**: every `Player` method that already calls `publish_status()`
-  (`pause`/`resume`/`seek`, and the new `remote_command`) now also polls Jellyfin's `GET /Sessions`
-  once more via `status()` when a Jellyfin page is active -- not just once per test scenario. A
-  mock server that serves an exact, finite response sequence undercounts and starves a later
-  request (seen first-hand: the naive version of `player.rs`'s `MockJellyfin` hung at test
-  teardown waiting on a response that would never come). `MockJellyfin` therefore cycles its
-  response list indefinitely and polls with a stop flag rather than blocking on `recv()` forever,
-  so `Drop` can always ask it to stop instead of risking that hang.
+  first HTTP client dependency) plus the login that bootstraps it -- not a second mpv process and
+  not a daemon-owned WebSocket client talking Jellyfin's own session protocol -- see README's "How
+  Jellyfin control works". `Player::pause`/`resume`/`seek`/`set_volume`/the new `remote_command`
+  (FCast's private-extension `Opcode::RemoteCommand`, `fcast.rs`) route to it instead of mpv
+  whenever `WebpageController::active_url()`'s origin matches a logged-in `JellyfinSession`'s
+  `server_url` (`JellyfinSession::controls`); a non-Jellyfin page, or no login at all, falls
+  through to mpv exactly as before this feature existed.
+  **The login itself is driven by a minimal CDP client (`daemon/src/cdp.rs`, `tungstenite`,
+  blocking/sync to match this daemon's thread-per-wait style), not by the daemon calling
+  Jellyfin's Quick Connect REST endpoints itself.** `localStorage` (where jellyfin-web keeps its
+  login, confirmed from the archived `jellyfin-apiclient-javascript`'s
+  `credentials.js`/`appStorage.js`: plain `localStorage.setItem` under the key
+  `jellyfin_credentials`) is strictly **origin-scoped** -- no page the daemon serves from its own
+  origin could write it for the Jellyfin server's, and Chromium's on-disk backing store for it is
+  an internal LevelDB encoding, not something to hand-write from outside the browser either. So
+  `jellyfin::maybe_start_login` instead drives the *already-displayed* Jellyfin login page via
+  CDP: clicks its own Quick Connect button (`.btnQuick` -- confirmed from `jellyfin-web`'s
+  `login/index.js`/`index.html`; it starts hidden and the page's own `viewshow` handler only shows
+  it once its own `GET /QuickConnect/Enabled` call resolves true, so a click must wait for that,
+  not just for page load), which runs jellyfin-web's *own* Initiate/poll/Authenticate dance and
+  shows the code in its own dialog -- the daemon never needs to display one -- then reads back the
+  resulting token/user/**device** id via `window.ApiClient.accessToken()`/`getCurrentUserId()`/
+  `deviceId()` (deliberately global, confirmed in `ServerConnections.js`). That device id (the
+  *browser tab's own*, not one the daemon invents) is what the REST client's `Authorization`
+  header and `GET /Sessions?DeviceId=...` use from then on -- there is no separate "daemon
+  device" identity to keep in sync with the tab's.
+  Chromium is launched with `--remote-debugging-port=0` (`webpage.rs`'s `Browser::args`;
+  OS-assigned, to avoid any port collision) and `cdp::wait_for_devtools_port` reads back the real
+  port from `<profile dir>/DevToolsActivePort`. That file lives under the profile directory every
+  engine from one `WebpageController` shares, so `Browser::clear_singleton_artifacts` -- already
+  the place a previous engine's stale singleton-lock files are removed before the replacement is
+  spawned -- also removes it there: *not* from `maybe_start_login`'s own background thread, which
+  would race the new engine's own write to that same path (delete-after-write would starve the
+  poll with no file ever reappearing; delete-before-write is safe only because it happens while
+  the old engine is confirmed gone and the new one has not spawned yet).
+  **The Jellyfin-origin probe, and the whole login dance after it, must never run synchronously on
+  `play_webpage`/`fall_back_to_browser`'s own call stack** -- `maybe_start_login` spawns a thread
+  for all of it (past the cheap, in-memory `controls()` check). An earlier version probed
+  synchronously there and, while not conclusively proven to cause it, measurably shifted timing
+  right before a pre-existing, `cargo test`-reproducible mpv-core concurrency hazard surfaced in
+  two different, unrelated tests across repeated runs -- exactly the kind of timing-sensitive
+  flakiness this file's own SIGSEGV entry above already documents hunting. Keep every network call
+  this module makes off that hot path regardless of whether it's ever proven as *the* cause.
+  **Quick Connect's secret is idempotent and device-bound to whoever called `Initiate`** (here,
+  the browser tab itself, never the daemon): confirmed by reading the server's own
+  `QuickConnectManager.cs` -- `AuthorizeRequest` (the human-approval step) creates exactly one
+  `AuthenticationResult` tied to the `DeviceId` that called `/QuickConnect/Initiate`, and
+  `GetAuthorizedRequest` (what `/Users/AuthenticateWithQuickConnect` calls) just returns that same
+  cached result by secret, repeatably, until it expires (10 minutes) -- which is why reading
+  `window.ApiClient` back after the click is sufficient and no second redemption is needed.
+  **Test gotcha if you touch the REST client**: every `Player` method that already calls
+  `publish_status()` (`pause`/`resume`/`seek`, and the new `remote_command`) now also polls
+  Jellyfin's `GET /Sessions` once more via `status()` when a Jellyfin page is active -- not just
+  once per test scenario. A mock server that serves an exact, finite response sequence undercounts
+  and starves a later request (seen first-hand: the naive version of `player.rs`'s `MockJellyfin`
+  hung at test teardown waiting on a response that would never come). `MockJellyfin` therefore
+  cycles its response list indefinitely and polls with a stop flag rather than blocking on
+  `recv()` forever, so `Drop` can always ask it to stop instead of risking that hang.
 
 ## Maintaining this file
 
