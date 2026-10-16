@@ -30,6 +30,26 @@ libc = "0.2"
 # minimal-dependency style; runs on its own thread, independent of the
 # tokio runtime the FCast server uses.
 tiny_http = "0.12"
+# Blocking HTTP client for the Jellyfin Session REST API (`daemon/src/jellyfin.rs`):
+# passthrough playback control, now-playing polling and remote-nav dispatch,
+# plus discovering the browser engine's DevTools HTTP endpoint (`cdp.rs`).
+# Every `Player` method this backs (`pause`/`resume`/`seek`/`set_volume`/the
+# new remote-command dispatch) is already a plain synchronous function called
+# via `spawn_blocking` from `main.rs`'s async dispatch, so a blocking client
+# fits that existing shape directly rather than threading a second, async
+# HTTP stack through the daemon -- the same "smallest dependency that fits
+# this crate's style" reasoning as `tiny_http` above, just for the client
+# side instead of the server side.
+ureq = { version = "2", features = ["json"] }
+# Blocking Chrome DevTools Protocol client (`daemon/src/cdp.rs`), used only to
+# drive the Jellyfin login page already displayed in the browser engine (click
+# its Quick Connect button, then read back the token/user/device id its own
+# login flow obtained) -- see README's "How Jellyfin control works". Plain
+# `tungstenite` (not `tokio-tungstenite`): the CDP session is used from the
+# same blocking background thread that waits, possibly for minutes, on a
+# human approving the on-screen code, which fits a thread-per-wait model, not
+# the async runtime `main.rs`'s FCast server uses for everything else.
+tungstenite = "0.24"
 
 [dev-dependencies]
 # Only used by `tests/webpage_display.rs`, which decodes the compositor's
