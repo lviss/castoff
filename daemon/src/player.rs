@@ -17,7 +17,7 @@ use crate::fcast::{
 };
 use crate::idle_screen::{IdleScreen, IdleScreenController, OnChange};
 use crate::images::ImageStore;
-use crate::jellyfin::JellyfinSession;
+use crate::jellyfin::{JellyfinSession, NowPlaying};
 use crate::overlay::PlaybackOverlay;
 use crate::queue::Queue;
 use crate::webpage::WebpageController;
@@ -668,23 +668,37 @@ impl Player {
     /// absent on failure" contract `metadata.rs`'s YouTube title lookup
     /// already uses.
     pub fn queue_state(&self) -> QueueStateMessage {
-        if self.jellyfin_controls_active_page() {
+        if let Some(now_playing) = self.jellyfin_now_playing_if_displayed() {
             if let Some(url) = self.webpage.active_url() {
-                if let Ok(Some(now_playing)) = self.jellyfin.now_playing() {
-                    return QueueStateMessage {
-                        generation_time: now_millis(),
-                        items: vec![QueueItemMessage {
-                            url,
-                            container: Some("text/html".to_string()),
-                            title: now_playing.title,
-                            duration_secs: now_playing.duration_secs,
-                        }],
-                        current_index: Some(0),
-                    };
-                }
+                return QueueStateMessage {
+                    generation_time: now_millis(),
+                    items: vec![QueueItemMessage {
+                        url,
+                        container: Some("text/html".to_string()),
+                        title: now_playing.title,
+                        duration_secs: now_playing.duration_secs,
+                    }],
+                    current_index: Some(0),
+                };
             }
         }
         self.queue.lock().unwrap().to_state_message()
+    }
+
+    /// Whether `queue_state()` is currently showing the synthetic one-item
+    /// Jellyfin placeholder instead of `self.queue` -- i.e. not just that a
+    /// Jellyfin page is displayed (`jellyfin_controls_active_page()`), but
+    /// that session actually has something playing right now. The
+    /// queue-jump opcodes below must share this exact condition: a jump
+    /// against `self.queue` while the placeholder is shown would act on an
+    /// index the client was never shown, and a jump while nothing is yet
+    /// playing in Jellyfin (e.g. still browsing its library) is really
+    /// against the real queue the client is seeing in that window.
+    fn jellyfin_now_playing_if_displayed(&self) -> Option<NowPlaying> {
+        if !self.jellyfin_controls_active_page() {
+            return None;
+        }
+        self.jellyfin.now_playing().ok().flatten()
     }
 
     /// Recompute and broadcast the current queue to every subscriber. Called
@@ -740,13 +754,18 @@ impl Player {
     /// `jump_backward`) and, if one exists, play it -- what the Android
     /// task's Next/Previous buttons call (`Opcode::QueueJumpForward`/
     /// `QueueJumpBackward` in `main.rs`). A no-op, not an error, when already
-    /// at either edge of the queue, and likewise while a Jellyfin page is
-    /// displayed: `queue_state()` is reporting that session's own one-item
-    /// placeholder then, not `self.queue`, and a jump against `self.queue`
-    /// here would silently play whatever unrelated item that index holds
-    /// instead of the item the client was just shown.
+    /// at either edge of the queue, and likewise whenever
+    /// `jellyfin_now_playing_if_displayed()` is showing the synthetic
+    /// Jellyfin placeholder `queue_state()` reports in that same case: a
+    /// jump against `self.queue` here would silently play whatever
+    /// unrelated item that index holds instead of the item the client was
+    /// just shown. Deliberately *not* gated on the page merely being
+    /// Jellyfin's (`jellyfin_controls_active_page()`) -- while that session
+    /// has nothing playing yet (e.g. still browsing its library),
+    /// `queue_state()` falls through to the real queue too, so a jump here
+    /// must act on it rather than silently no-op.
     pub fn queue_jump_forward(&self) -> Result<()> {
-        if self.jellyfin_controls_active_page() {
+        if self.jellyfin_now_playing_if_displayed().is_some() {
             return Ok(());
         }
         let _operation = self.operation.lock().unwrap();
@@ -759,7 +778,7 @@ impl Player {
 
     /// See `queue_jump_forward`.
     pub fn queue_jump_backward(&self) -> Result<()> {
-        if self.jellyfin_controls_active_page() {
+        if self.jellyfin_now_playing_if_displayed().is_some() {
             return Ok(());
         }
         let _operation = self.operation.lock().unwrap();
@@ -775,10 +794,10 @@ impl Player {
     /// tappable queue list calls (`Opcode::QueueJumpToIndex` in `main.rs`).
     /// Same shape and rollback-on-failed-load contract as `queue_jump_forward`/
     /// `queue_jump_backward`, including a no-op (not an error) for an
-    /// out-of-range index, or while a Jellyfin page is displayed (see
-    /// `queue_jump_forward`).
+    /// out-of-range index, or while the synthetic Jellyfin placeholder is
+    /// shown instead of the real queue (see `queue_jump_forward`).
     pub fn queue_jump_to_index(&self, index: usize) -> Result<()> {
-        if self.jellyfin_controls_active_page() {
+        if self.jellyfin_now_playing_if_displayed().is_some() {
             return Ok(());
         }
         let _operation = self.operation.lock().unwrap();
@@ -3326,7 +3345,11 @@ mod tests {
     /// whatever unrelated item happens to sit there.
     #[test]
     fn queue_jump_opcodes_are_a_no_op_while_a_jellyfin_page_is_displayed() {
-        let mock = MockJellyfin::serving(vec![serde_json::json!([{ "Id": "s1" }])]);
+        let mock = MockJellyfin::serving(vec![serde_json::json!([{
+            "Id": "s1",
+            "PlayState": { "PositionTicks": 0, "IsPaused": false },
+            "NowPlayingItem": { "Name": "Big Buck Bunny", "RunTimeTicks": 6_000_000_000i64 },
+        }])]);
         let jellyfin = Arc::new(crate::jellyfin::JellyfinSession::ephemeral_for_test());
         jellyfin.set_credentials(crate::jellyfin::JellyfinCredentials {
             server_url: mock.base_url(),
@@ -3363,6 +3386,56 @@ mod tests {
         assert!(
             player.webpage_active(),
             "no jump must have taken the screen away from the Jellyfin page"
+        );
+    }
+
+    /// The opposite sub-state from the test above: a Jellyfin page is
+    /// displayed but its session has nothing playing yet (e.g. a human is
+    /// still browsing its library right after logging in). `queue_state()`
+    /// falls through to the real queue in that window (see its own doc
+    /// comment), so the queue-jump opcodes must act on it too rather than
+    /// no-op -- the no-op guard must track `queue_state()`'s own condition,
+    /// not just "a Jellyfin page is on screen".
+    #[test]
+    fn queue_jump_opcodes_still_act_on_the_real_queue_while_nothing_plays_in_jellyfin_yet() {
+        let mock = MockJellyfin::serving(vec![serde_json::json!([{ "Id": "s1" }])]);
+        let jellyfin = Arc::new(crate::jellyfin::JellyfinSession::ephemeral_for_test());
+        jellyfin.set_credentials(crate::jellyfin::JellyfinCredentials {
+            server_url: mock.base_url(),
+            access_token: "tok".to_string(),
+            user_id: "user".to_string(),
+            device_id: "device".to_string(),
+        });
+
+        let dir = scratch_dir("jellyfin-queue-jump-still-works");
+        let browser = stub_browser(&dir, "browser-waiting", "sleep 300");
+        let player = headless_player_with_browser_and_jellyfin(&browser, jellyfin);
+        let jellyfin_url = format!("{}/web/index.html", mock.base_url());
+        player
+            .play(&webpage_play(&jellyfin_url))
+            .expect("the Jellyfin page must be accepted as a webpage Play");
+        let unrelated_media = "av://lavfi:testsrc=size=64x64:rate=10:duration=1";
+        player
+            .play(&PlayMessage {
+                url: Some(unrelated_media.to_string()),
+                ..Default::default()
+            })
+            .expect("enqueue an unrelated media item behind the Jellyfin page");
+
+        assert_eq!(
+            player.queue_state().items.len(),
+            2,
+            "with nothing yet playing in Jellyfin, queue_state() must report the real queue"
+        );
+
+        player
+            .queue_jump_forward()
+            .expect("jump forward against the real queue");
+
+        assert!(
+            !player.webpage_active(),
+            "the jump must have taken the screen away from the Jellyfin page, \
+             since queue_state() was reporting the real queue, not a placeholder"
         );
     }
 
