@@ -370,8 +370,10 @@ The daemon supervises the engine (`daemon/src/webpage.rs`):
   carrying the clock behind the page), but the content the sender asked for is live. A page has no
   mpv timeline, so `time`/`duration` are absent. `Pause`/`Resume`/`Seek`/`SetSpeed` do not apply to
   a page -- interactive control is out of scope for v1 -- except for a Jellyfin page, which routes
-  them to Jellyfin's own Session REST API instead of mpv; see
-  [How Jellyfin control works](#how-jellyfin-control-works).
+  `Pause`/`Resume`/`Seek`/`SetVolume` to Jellyfin's own Session REST API instead of mpv; see
+  [How Jellyfin control works](#how-jellyfin-control-works). `SetSpeed` still does not apply even
+  to a Jellyfin page -- there is no Jellyfin `GeneralCommand` this client sends for it -- so its
+  `PlaybackUpdate`'s `speed` is absent too, rather than reporting mpv's own unrelated idle speed.
 
 The daemon never re-fetches or re-renders the page on a timer: the engine keeps it live, and any
 refresh cadence belongs to the page itself (Grafana's auto-refresh, say), which is both the

@@ -740,8 +740,15 @@ impl Player {
     /// `jump_backward`) and, if one exists, play it -- what the Android
     /// task's Next/Previous buttons call (`Opcode::QueueJumpForward`/
     /// `QueueJumpBackward` in `main.rs`). A no-op, not an error, when already
-    /// at either edge of the queue.
+    /// at either edge of the queue, and likewise while a Jellyfin page is
+    /// displayed: `queue_state()` is reporting that session's own one-item
+    /// placeholder then, not `self.queue`, and a jump against `self.queue`
+    /// here would silently play whatever unrelated item that index holds
+    /// instead of the item the client was just shown.
     pub fn queue_jump_forward(&self) -> Result<()> {
+        if self.jellyfin_controls_active_page() {
+            return Ok(());
+        }
         let _operation = self.operation.lock().unwrap();
         let mut queue = self.queue.lock().unwrap();
         let previous = queue.position();
@@ -752,6 +759,9 @@ impl Player {
 
     /// See `queue_jump_forward`.
     pub fn queue_jump_backward(&self) -> Result<()> {
+        if self.jellyfin_controls_active_page() {
+            return Ok(());
+        }
         let _operation = self.operation.lock().unwrap();
         let mut queue = self.queue.lock().unwrap();
         let previous = queue.position();
@@ -765,8 +775,12 @@ impl Player {
     /// tappable queue list calls (`Opcode::QueueJumpToIndex` in `main.rs`).
     /// Same shape and rollback-on-failed-load contract as `queue_jump_forward`/
     /// `queue_jump_backward`, including a no-op (not an error) for an
-    /// out-of-range index.
+    /// out-of-range index, or while a Jellyfin page is displayed (see
+    /// `queue_jump_forward`).
     pub fn queue_jump_to_index(&self, index: usize) -> Result<()> {
+        if self.jellyfin_controls_active_page() {
+            return Ok(());
+        }
         let _operation = self.operation.lock().unwrap();
         let mut queue = self.queue.lock().unwrap();
         let previous = queue.position();
@@ -1093,7 +1107,13 @@ impl Player {
                 },
                 time: now_playing.position_secs,
                 duration: now_playing.duration_secs,
-                speed: base.speed,
+                // `SetSpeed` is not routed to Jellyfin (there is no
+                // `GeneralCommand` this client sends for it) and mpv's own
+                // `speed` property is unrelated to this tab's playback rate,
+                // so reporting it here would be a false reading rather than
+                // a real one -- same "absent, not misleading" contract as
+                // `time`/`duration` for a page with no mpv timeline.
+                speed: None,
             },
             Ok(None) => base,
             Err(e) => {
@@ -1103,8 +1123,19 @@ impl Player {
         }
     }
 
-    /// Current volume on FCast's 0.0-1.0 scale.
+    /// Current volume on FCast's 0.0-1.0 scale: the controlled Jellyfin
+    /// session's own `VolumeLevel` while a Jellyfin page is displayed (mpv's
+    /// `volume` property is unrelated to that tab's audio), falling back to
+    /// mpv's otherwise -- same "poll failure/nothing playing falls back"
+    /// contract `status()` already uses for Jellyfin's other fields.
     pub fn volume(&self) -> f64 {
+        if self.jellyfin_controls_active_page() {
+            if let Ok(Some(now_playing)) = self.jellyfin.now_playing() {
+                if let Some(volume) = now_playing.volume {
+                    return volume;
+                }
+            }
+        }
         let v: f64 = self.mpv.get_property("volume").unwrap_or(0.0);
         v / 100.0
     }
@@ -3251,6 +3282,88 @@ mod tests {
         assert_eq!(status.state, PlaybackState::Playing);
         assert_eq!(status.time, Some(5.0));
         assert_eq!(status.duration, Some(600.0));
+        assert_eq!(
+            status.speed, None,
+            "SetSpeed is not routed to Jellyfin, so mpv's own unrelated idle \
+             speed must not be reported as this tab's playback rate"
+        );
+    }
+
+    /// `volume()` must report the Jellyfin session's own `VolumeLevel` --
+    /// not mpv's unrelated (idle) volume -- while a page from the logged-in
+    /// server is displayed, so an FCast client's `VolumeUpdate` reply
+    /// reflects what `set_volume` actually changed.
+    #[test]
+    fn volume_reports_the_jellyfin_sessions_own_level_when_its_page_is_displayed() {
+        let mock = MockJellyfin::serving(vec![serde_json::json!([{
+            "Id": "s1",
+            "PlayState": { "PositionTicks": 0, "IsPaused": false, "VolumeLevel": 42 },
+            "NowPlayingItem": { "Name": "Big Buck Bunny", "RunTimeTicks": 6_000_000_000i64 },
+        }])]);
+        let jellyfin = Arc::new(crate::jellyfin::JellyfinSession::ephemeral_for_test());
+        jellyfin.set_credentials(crate::jellyfin::JellyfinCredentials {
+            server_url: mock.base_url(),
+            access_token: "tok".to_string(),
+            user_id: "user".to_string(),
+            device_id: "device".to_string(),
+        });
+
+        let dir = scratch_dir("jellyfin-volume-routing");
+        let browser = stub_browser(&dir, "browser-waiting", "sleep 300");
+        let player = headless_player_with_browser_and_jellyfin(&browser, jellyfin);
+        player
+            .play(&webpage_play(&format!("{}/web/index.html", mock.base_url())))
+            .expect("the Jellyfin page must be accepted as a webpage Play");
+
+        assert_eq!(player.volume(), 0.42);
+    }
+
+    /// The synthetic one-item queue `queue_state()` reports while a Jellyfin
+    /// page is displayed has no relation to `self.queue`'s own indices (see
+    /// `queue_state`'s doc comment), so a client that taps the displayed
+    /// entry and sends `QueueJumpToIndex(0)` -- or `QueueJumpForward`/
+    /// `QueueJumpBackward` -- must not act on castoff's own queue and play
+    /// whatever unrelated item happens to sit there.
+    #[test]
+    fn queue_jump_opcodes_are_a_no_op_while_a_jellyfin_page_is_displayed() {
+        let mock = MockJellyfin::serving(vec![serde_json::json!([{ "Id": "s1" }])]);
+        let jellyfin = Arc::new(crate::jellyfin::JellyfinSession::ephemeral_for_test());
+        jellyfin.set_credentials(crate::jellyfin::JellyfinCredentials {
+            server_url: mock.base_url(),
+            access_token: "tok".to_string(),
+            user_id: "user".to_string(),
+            device_id: "device".to_string(),
+        });
+
+        let dir = scratch_dir("jellyfin-queue-jump-no-op");
+        let browser = stub_browser(&dir, "browser-waiting", "sleep 300");
+        let player = headless_player_with_browser_and_jellyfin(&browser, jellyfin);
+        let jellyfin_url = format!("{}/web/index.html", mock.base_url());
+        player
+            .play(&webpage_play(&jellyfin_url))
+            .expect("the Jellyfin page must be accepted as a webpage Play");
+        let unrelated_media = "av://lavfi:testsrc=size=64x64:rate=10:duration=1";
+        player
+            .play(&PlayMessage {
+                url: Some(unrelated_media.to_string()),
+                ..Default::default()
+            })
+            .expect("enqueue an unrelated media item behind the Jellyfin page");
+
+        player
+            .queue_jump_forward()
+            .expect("jump forward must no-op, not error");
+        player
+            .queue_jump_backward()
+            .expect("jump backward must no-op, not error");
+        player
+            .queue_jump_to_index(0)
+            .expect("jump to index must no-op, not error");
+
+        assert!(
+            player.webpage_active(),
+            "no jump must have taken the screen away from the Jellyfin page"
+        );
     }
 
     /// `queue_state()` must report one synthetic entry for the Jellyfin

@@ -116,6 +116,10 @@ pub(crate) struct NowPlaying {
     pub(crate) duration_secs: Option<f64>,
     pub(crate) position_secs: Option<f64>,
     pub(crate) is_paused: bool,
+    /// FCast's 0.0-1.0 scale, converted from Jellyfin's 0-100
+    /// `PlayState.VolumeLevel` -- the same scale `set_volume` takes and
+    /// `Player::volume` reports back over FCast's `VolumeUpdate`.
+    pub(crate) volume: Option<f64>,
 }
 
 /// Jellyfin ticks are 100ns units (confirmed against jellyfin-web's own
@@ -405,6 +409,7 @@ impl JellyfinSession {
             duration_secs: item.run_time_ticks.map(ticks_to_secs),
             position_secs: play_state.position_ticks.map(ticks_to_secs),
             is_paused: play_state.is_paused,
+            volume: play_state.volume_level.map(|v| v as f64 / 100.0),
         }))
     }
 
@@ -583,6 +588,9 @@ struct PlayStateDto {
     position_ticks: Option<i64>,
     #[serde(default)]
     is_paused: bool,
+    /// 0-100 percentage (confirmed against `PlayerStateInfo.VolumeLevel`).
+    #[serde(default)]
+    volume_level: Option<i64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -848,7 +856,7 @@ mod tests {
     fn now_playing_reports_title_duration_and_position_from_ticks() {
         let mock = MockServer::sequence(vec![json!([{
             "Id": "s1",
-            "PlayState": { "PositionTicks": 50_000_000, "IsPaused": true },
+            "PlayState": { "PositionTicks": 50_000_000, "IsPaused": true, "VolumeLevel": 75 },
             "NowPlayingItem": { "Name": "Big Buck Bunny", "RunTimeTicks": 6_000_000_000i64 },
         }])]);
         let session = logged_in_session(&mock.base_url());
@@ -856,6 +864,7 @@ mod tests {
             .now_playing()
             .expect("now_playing")
             .expect("something is playing");
+        assert_eq!(now_playing.volume, Some(0.75));
         assert_eq!(now_playing.title, Some("Big Buck Bunny".to_string()));
         assert_eq!(now_playing.duration_secs, Some(600.0));
         assert_eq!(now_playing.position_secs, Some(5.0));
