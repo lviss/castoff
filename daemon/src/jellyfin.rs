@@ -541,6 +541,11 @@ fn try_save(credentials: &Option<JellyfinCredentials>, path: &Path) -> Result<()
     let data = serde_json::to_vec_pretty(credentials)?;
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, &data)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+    }
     std::fs::rename(&tmp, path)?;
     Ok(())
 }
