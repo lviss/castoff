@@ -210,6 +210,9 @@
           # `cage` and `grim` are test-only: `daemon/tests/webpage_display.rs`
           # runs a real headless Cage session with the real Chromium engine and
           # asserts on compositor output captured over `wlr-screencopy`.
+          # `perl`/`jq`/`curl` are what `scripts/cast.sh` and its test suite
+          # (`scripts/tests/`) need; `socat` backs the README's raw-frame
+          # manual-protocol examples -- see README's "Casting from a computer".
           packages = [
             pkgs.cargo
             pkgs.rustc
@@ -219,6 +222,10 @@
             pkgs.chromium
             pkgs.cage
             pkgs.grim
+            pkgs.perl
+            pkgs.socat
+            pkgs.jq
+            pkgs.curl
           ];
         };
     };
