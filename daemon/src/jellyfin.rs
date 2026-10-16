@@ -901,6 +901,21 @@ mod tests {
             user_id: "user".to_string(),
             device_id: "device".to_string(),
         });
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path)
+                .expect("persisted credentials file must exist")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(
+                mode, 0o600,
+                "the persisted Jellyfin credentials file must be readable/writable by \
+                 its owner only, since it holds a durable login token"
+            );
+        }
         drop(session);
 
         let reloaded = JellyfinSession::with_state_path(Some(path.clone()));
