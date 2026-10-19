@@ -318,7 +318,15 @@ impl JellyfinSession {
                 creds.device_id
             )
         })?;
-        self.state.lock().unwrap().session_id = Some(session.id.clone());
+        // This request can be in flight for up to `REQUEST_TIMEOUT` and land
+        // after a newer login has already replaced `creds` -- only cache the
+        // resolved id if it still belongs to the credentials that are
+        // actually current, so a stale resolution can't make a later command
+        // POST to the old server's session id under the new login.
+        let mut state = self.state.lock().unwrap();
+        if state.credentials.as_ref() == Some(&creds) {
+            state.session_id = Some(session.id.clone());
+        }
         Ok(session)
     }
 
@@ -387,8 +395,12 @@ impl JellyfinSession {
     }
 
     /// FCast's `SetVolume` is 0.0-1.0; Jellyfin's `SetVolume` general
-    /// command takes a 0-100 integer percentage.
+    /// command takes a 0-100 integer percentage. Clamped the same way
+    /// `player.rs`'s `to_mpv_volume` already clamps the mpv path, so an
+    /// out-of-contract value (e.g. `1.5`) can't reach Jellyfin as a
+    /// percentage it never issued (`"150"`).
     pub(crate) fn set_volume(&self, volume: f64) -> Result<()> {
+        let volume = volume.clamp(0.0, 1.0);
         let mut args = HashMap::new();
         args.insert("Volume", ((volume * 100.0).round() as i64).to_string());
         self.general_command("SetVolume", Some(args))?;
@@ -850,6 +862,63 @@ mod tests {
         );
     }
 
+    /// Regression test: a `resolve_session` started under the *old*
+    /// credentials can still be in flight when a newer login replaces them
+    /// (bounded only by `REQUEST_TIMEOUT`); if it lands after that, it must
+    /// not cache its resolved session id for the new credentials -- that
+    /// would send the next command to the old server's session id under the
+    /// new login. Reproduced directly: a mock server holds its response
+    /// until signaled, so a background `session_id()` call started against
+    /// the original credentials is still waiting when `set_credentials`
+    /// installs a different login; only then does the mock answer.
+    #[test]
+    fn resolve_session_does_not_cache_a_stale_resolution_after_a_newer_login() {
+        let server = Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let handle = std::thread::spawn(move || {
+            let request = server.recv().unwrap();
+            release_rx.recv().unwrap();
+            let _ = request.respond(
+                Response::from_string(json!([{ "Id": "old-session" }]).to_string())
+                    .with_header(json_header()),
+            );
+        });
+
+        let session = Arc::new(logged_in_session(&format!("http://{addr}")));
+        let resolving = {
+            let session = Arc::clone(&session);
+            std::thread::spawn(move || session.session_id())
+        };
+
+        // Give the background resolve a moment to actually issue its
+        // request (consumed by the mock's `server.recv()` above) before the
+        // newer login lands, so it really is resolving under the old
+        // credentials when they change underneath it.
+        std::thread::sleep(Duration::from_millis(50));
+        session.set_credentials(JellyfinCredentials {
+            server_url: "http://elsewhere.example".to_string(),
+            access_token: "new-token".to_string(),
+            user_id: "new-user".to_string(),
+            device_id: "new-device".to_string(),
+        });
+
+        release_tx.send(()).expect("release the held mock response");
+        let old_resolution = resolving.join().expect("resolving thread");
+        assert_eq!(
+            old_resolution.expect("the stale resolve itself still succeeds"),
+            "old-session"
+        );
+
+        assert!(
+            session.state.lock().unwrap().session_id.is_none(),
+            "a session id resolved under credentials that are no longer current must not be \
+             cached for the newer login that replaced them"
+        );
+
+        handle.join().unwrap();
+    }
+
     #[test]
     fn pause_and_resume_send_the_right_playstate_commands() {
         let mock = MockServer::sequence(vec![
@@ -910,6 +979,41 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(parsed["Name"], "SetVolume");
         assert_eq!(parsed["Arguments"]["Volume"], "42");
+        handle.join().unwrap();
+    }
+
+    /// An out-of-contract `SetVolume` (outside FCast's own 0.0-1.0 range)
+    /// must not reach Jellyfin as a percentage it never issued -- clamp
+    /// before converting, the same way `player.rs`'s `to_mpv_volume` already
+    /// clamps the mpv path.
+    #[test]
+    fn set_volume_clamps_out_of_range_values_before_converting() {
+        let server = Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let (tx, rx) = mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let r1 = server.recv().unwrap();
+            let _ = r1.respond(
+                Response::from_string(json!([{ "Id": "s1" }]).to_string())
+                    .with_header(json_header()),
+            );
+            let mut r2 = server.recv().unwrap();
+            let mut body = String::new();
+            r2.as_reader().read_to_string(&mut body).unwrap();
+            tx.send(body).unwrap();
+            let _ = r2.respond(Response::from_string("{}"));
+        });
+        let session = logged_in_session(&format!("http://{addr}"));
+        session.set_volume(1.5).expect("set_volume");
+        let body = rx.recv().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["Arguments"]["Volume"], "100");
+        assert_eq!(
+            session.last_set_volume(),
+            Some(1.0),
+            "the cached last-set volume must reflect the clamped value actually sent, not the \
+             out-of-contract input"
+        );
         handle.join().unwrap();
     }
 
