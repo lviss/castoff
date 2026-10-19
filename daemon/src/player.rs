@@ -131,6 +131,11 @@ struct Handles<'a> {
     /// owned `Arc` to hand to `jellyfin::maybe_start_login`, which moves it
     /// into a detached background thread.
     jellyfin: &'a Arc<JellyfinSession>,
+    /// Kept as `&Arc<...>`: `play_webpage` needs an owned `Arc` to hand to
+    /// `jellyfin::maybe_start_login`, which moves it into a detached
+    /// background thread so its own brief, bounded re-lock (see that
+    /// function's doc comment) can serialize against a real `Play`/`Stop`.
+    operation: &'a Arc<Mutex<()>>,
 }
 
 /// The play queue state `spawn_async_event_watcher`'s background thread needs
@@ -496,6 +501,28 @@ impl Player {
         )
     }
 
+    /// `with_browser_and_jellyfin` plus `with_browser_and_ytdlp`'s stub
+    /// `yt-dlp`/inline lookup -- for tests exercising the YouTube metadata
+    /// lookup's own queue republish (`run_metadata_lookup`) while a Jellyfin
+    /// page is displayed.
+    #[cfg(test)]
+    fn with_browser_jellyfin_and_ytdlp(
+        mpv: Arc<Mpv>,
+        browser_program: &str,
+        jellyfin: Arc<JellyfinSession>,
+        ytdlp_program: &str,
+    ) -> Result<Self> {
+        Self::build(
+            mpv,
+            Arc::new(WebpageController::with_program(browser_program)),
+            None,
+            Arc::new(ImageStore::ephemeral_for_test()),
+            jellyfin,
+            ytdlp_program.to_string(),
+            true,
+        )
+    }
+
     fn build(
         mpv: Arc<Mpv>,
         webpage: Arc<WebpageController>,
@@ -568,6 +595,7 @@ impl Player {
                     idle,
                     routing: &routing,
                     jellyfin: &jellyfin,
+                    operation: &operation,
                 };
                 auto_advance_queue(
                     &handles,
@@ -671,21 +699,8 @@ impl Player {
     /// absent on failure" contract `metadata.rs`'s YouTube title lookup
     /// already uses.
     pub fn queue_state(&self) -> QueueStateMessage {
-        if let Some(now_playing) = self.jellyfin_now_playing_if_displayed() {
-            if let Some(url) = self.webpage.active_url() {
-                return QueueStateMessage {
-                    generation_time: now_millis(),
-                    items: vec![QueueItemMessage {
-                        url,
-                        container: Some("text/html".to_string()),
-                        title: now_playing.title,
-                        duration_secs: now_playing.duration_secs,
-                    }],
-                    current_index: Some(0),
-                };
-            }
-        }
-        self.queue.lock().unwrap().to_state_message()
+        let queue = self.queue.lock().unwrap();
+        queue_state_message(&queue, &self.webpage, &self.jellyfin)
     }
 
     /// Whether `queue_state()` is currently showing the synthetic one-item
@@ -727,6 +742,7 @@ impl Player {
             idle: &self.idle,
             routing: &self.routing,
             jellyfin: &self.jellyfin,
+            operation: &self.operation,
         }
     }
 
@@ -853,6 +869,8 @@ impl Player {
                 &self.queue,
                 self.state_path.as_deref(),
                 &self.queue_tx,
+                &self.webpage,
+                &self.jellyfin,
                 rollback,
             );
         }
@@ -938,6 +956,8 @@ impl Player {
             &self.queue,
             self.state_path.as_deref(),
             &self.queue_tx,
+            &self.webpage,
+            &self.jellyfin,
             self.metadata_lookup_inline,
         );
 
@@ -951,6 +971,8 @@ impl Player {
                 &self.queue,
                 self.state_path.as_deref(),
                 &self.queue_tx,
+                &self.webpage,
+                &self.jellyfin,
                 rollback,
             );
         }
@@ -1147,15 +1169,22 @@ impl Player {
 
     /// Current volume on FCast's 0.0-1.0 scale: the controlled Jellyfin
     /// session's own `VolumeLevel` while a Jellyfin page is displayed (mpv's
-    /// `volume` property is unrelated to that tab's audio), falling back to
-    /// mpv's otherwise -- same "poll failure/nothing playing falls back"
-    /// contract `status()` already uses for Jellyfin's other fields.
+    /// `volume` property is unrelated to that tab's audio and `set_volume`
+    /// never touches it in that case), falling back to the last volume
+    /// `set_volume` itself successfully sent when Jellyfin has nothing to
+    /// report yet (e.g. nothing is playing there -- still browsing its
+    /// library is a normal window), and only falling through to mpv's own
+    /// property when neither is available (no Jellyfin page displayed at
+    /// all).
     pub fn volume(&self) -> f64 {
         if self.jellyfin_controls_active_page() {
             if let Ok(Some(now_playing)) = self.jellyfin.now_playing() {
                 if let Some(volume) = now_playing.volume {
                     return volume;
                 }
+            }
+            if let Some(volume) = self.jellyfin.last_set_volume() {
+                return volume;
             }
         }
         let v: f64 = self.mpv.get_property("volume").unwrap_or(0.0);
@@ -1380,7 +1409,7 @@ fn play_webpage(h: &Handles, url: &str) -> Result<()> {
     // isn't already logged into, this starts that login dance in the
     // background (see `jellyfin.rs`'s module doc comment) -- never here on
     // this call stack, since it can block for minutes waiting on a human.
-    crate::jellyfin::maybe_start_login(h.jellyfin, h.webpage, url);
+    crate::jellyfin::maybe_start_login(h.jellyfin, h.webpage, h.operation, url);
     h.mpv
         .command("stop", &[])
         .map_err(|e| anyhow::anyhow!("stop before displaying a web page failed: {e:?}"))?;
@@ -1454,6 +1483,45 @@ fn abort_loading_to_idle(h: &Handles) -> Result<()> {
 /// whether it found (and successfully submitted a load for) one, so the eof
 /// watcher knows whether to fall back to showing the idle clock itself.
 ///
+/// The current queue as the wire shape sent to FCast senders -- `queue`'s
+/// own persisted state normally, or -- while a Jellyfin page `jellyfin` is
+/// logged into is displayed and has something playing -- one synthetic
+/// entry reflecting *that* session's now-playing item instead (see
+/// `Player::queue_state`'s doc comment for why not a mirrored per-item
+/// queue). A free function, not a `Player` method, so every path that
+/// republishes the queue -- `Player::queue_state` itself,
+/// `auto_advance_queue`, `revert_queue_position` and `run_metadata_lookup`,
+/// the latter two reachable from contexts with no `&Player` to borrow from
+/// -- broadcasts the exact same shape; before this existed as a shared
+/// function, those three called `Queue::to_state_message()` directly, which
+/// could advertise a queue the jump opcodes (gated on this same condition,
+/// see `Player::jellyfin_now_playing_if_displayed`) would then silently
+/// refuse to act on.
+fn queue_state_message(
+    queue: &Queue,
+    webpage: &WebpageController,
+    jellyfin: &JellyfinSession,
+) -> QueueStateMessage {
+    let controls_active_page = webpage.active_url().is_some_and(|url| jellyfin.controls(&url));
+    if controls_active_page {
+        if let Some(now_playing) = jellyfin.now_playing().ok().flatten() {
+            if let Some(url) = webpage.active_url() {
+                return QueueStateMessage {
+                    generation_time: now_millis(),
+                    items: vec![QueueItemMessage {
+                        url,
+                        container: Some("text/html".to_string()),
+                        title: now_playing.title,
+                        duration_secs: now_playing.duration_secs,
+                    }],
+                    current_index: Some(0),
+                };
+            }
+        }
+    }
+    queue.to_state_message()
+}
+
 /// Takes the same field handles `Player`'s own methods use (`Handles`)
 /// rather than `&Player`, because this is built and threaded into
 /// `IdleScreenController::new` in `Player::build`, before a `Player` exists
@@ -1476,7 +1544,7 @@ fn auto_advance_queue(
     {
         let q = queue.lock().unwrap();
         q.save(state_path);
-        let _ = queue_tx.send_replace(q.to_state_message());
+        let _ = queue_tx.send_replace(queue_state_message(&q, h.webpage, h.jellyfin));
     }
     let rollback = index.map(|index| QueueRollback { index, previous });
     if let Err(e) = execute_play(h, &item, rollback) {
@@ -1485,7 +1553,7 @@ fn auto_advance_queue(
             url = item.url.as_deref().unwrap_or(""),
             "queue auto-advance failed to start the next item; returning to the idle clock"
         );
-        revert_queue_position(queue, state_path, queue_tx, rollback);
+        revert_queue_position(queue, state_path, queue_tx, h.webpage, h.jellyfin, rollback);
         return false;
     }
     let _ = status_tx.send_replace(snapshot_status(h.mpv, h.webpage, h.idle.is_wallpaper_active()));
@@ -1500,10 +1568,18 @@ fn auto_advance_queue(
 /// own synchronous failures, `auto_advance_queue`'s, and the asynchronous
 /// ones `spawn_async_event_watcher`/`fall_back_to_browser` resolve well
 /// after the position was already committed and broadcast.
+///
+/// Broadcasts through [`queue_state_message`], not `queue.to_state_message()`
+/// directly, so a revert while a Jellyfin page is displayed and playing
+/// republishes the same synthetic placeholder `Player::queue_state` would --
+/// otherwise a client would see the real (and, while that placeholder is
+/// shown, un-jumpable) queue reappear.
 fn revert_queue_position(
     queue: &Mutex<Queue>,
     state_path: Option<&Path>,
     queue_tx: &watch::Sender<QueueStateMessage>,
+    webpage: &WebpageController,
+    jellyfin: &JellyfinSession,
     rollback: Option<QueueRollback>,
 ) {
     let Some(rollback) = rollback else { return };
@@ -1513,7 +1589,7 @@ fn revert_queue_position(
     }
     queue.set_position(rollback.previous);
     queue.save(state_path);
-    let _ = queue_tx.send_replace(queue.to_state_message());
+    let _ = queue_tx.send_replace(queue_state_message(&queue, webpage, jellyfin));
 }
 
 /// Looks up `msg`'s title/length (`metadata::fetch_metadata`) and, once
@@ -1531,6 +1607,11 @@ fn revert_queue_position(
 /// reusable `index`) additionally catches a `clear` followed by a `push`
 /// that reused the same index for an unrelated entry, so that case is a
 /// no-op too instead of overwriting the wrong item's metadata.
+// `webpage`/`jellyfin` pushed this past clippy's default threshold, needed
+// so a metadata-driven republish also goes through `queue_state_message`
+// (see that function's doc comment); bundling these into a struct is a real
+// signature refactor left for a future pass, not a mechanical lint fix.
+#[allow(clippy::too_many_arguments)]
 fn run_metadata_lookup(
     url: &str,
     index: usize,
@@ -1539,6 +1620,8 @@ fn run_metadata_lookup(
     queue: &Arc<Mutex<Queue>>,
     state_path: Option<&Path>,
     queue_tx: &watch::Sender<QueueStateMessage>,
+    webpage: &WebpageController,
+    jellyfin: &JellyfinSession,
 ) {
     let Some(metadata) = crate::metadata::fetch_metadata(ytdlp_program, url) else {
         return;
@@ -1546,7 +1629,7 @@ fn run_metadata_lookup(
     let mut queue = queue.lock().unwrap();
     queue.set_metadata(index, id, metadata.title, metadata.duration_secs);
     queue.save(state_path);
-    let _ = queue_tx.send_replace(queue.to_state_message());
+    let _ = queue_tx.send_replace(queue_state_message(&queue, webpage, jellyfin));
 }
 
 /// Kicks off [`run_metadata_lookup`] for `msg`, scoped to URLs the daemon
@@ -1577,6 +1660,8 @@ fn spawn_metadata_lookup(
     queue: &Arc<Mutex<Queue>>,
     state_path: Option<&Path>,
     queue_tx: &watch::Sender<QueueStateMessage>,
+    webpage: &Arc<WebpageController>,
+    jellyfin: &Arc<JellyfinSession>,
     inline: bool,
 ) {
     let Some(url) = msg.url.clone() else { return };
@@ -1584,13 +1669,15 @@ fn spawn_metadata_lookup(
         return;
     }
     if inline {
-        run_metadata_lookup(&url, index, id, ytdlp_program, queue, state_path, queue_tx);
+        run_metadata_lookup(&url, index, id, ytdlp_program, queue, state_path, queue_tx, webpage, jellyfin);
         return;
     }
     let program = ytdlp_program.to_string();
     let queue = Arc::clone(queue);
     let state_path = state_path.map(Path::to_path_buf);
     let queue_tx = queue_tx.clone();
+    let webpage = Arc::clone(webpage);
+    let jellyfin = Arc::clone(jellyfin);
     std::thread::spawn(move || {
         run_metadata_lookup(
             &url,
@@ -1600,6 +1687,8 @@ fn spawn_metadata_lookup(
             &queue,
             state_path.as_deref(),
             &queue_tx,
+            &webpage,
+            &jellyfin,
         );
     });
 }
@@ -1768,6 +1857,7 @@ fn spawn_async_event_watcher(
                             &idle,
                             &webpage,
                             &jellyfin,
+                            &operation,
                             &status_tx,
                             QueueContext {
                                 queue: &queue.queue,
@@ -1790,6 +1880,8 @@ fn spawn_async_event_watcher(
                                 &queue.queue,
                                 queue.state_path.as_deref(),
                                 &queue.queue_tx,
+                                &webpage,
+                                &jellyfin,
                                 rollback,
                             );
                         }
@@ -1841,6 +1933,7 @@ fn fall_back_to_browser(
     idle: &IdleScreenController,
     webpage: &Arc<WebpageController>,
     jellyfin: &Arc<JellyfinSession>,
+    operation: &Arc<Mutex<()>>,
     status_tx: &watch::Sender<PlaybackUpdateMessage>,
     queue: QueueContext,
 ) {
@@ -1866,10 +1959,12 @@ fn fall_back_to_browser(
             queue.queue,
             queue.state_path,
             queue.queue_tx,
+            webpage,
+            jellyfin,
             queue.rollback,
         );
     } else {
-        crate::jellyfin::maybe_start_login(jellyfin, webpage, url);
+        crate::jellyfin::maybe_start_login(jellyfin, webpage, operation, url);
     }
     // This path never goes through a `Player` method: a successful `show`
     // flips `webpage.is_active()` from false to true, which is the
@@ -3156,6 +3251,32 @@ mod tests {
         player
     }
 
+    /// [`headless_player_with_browser_and_jellyfin`], but also pointing
+    /// `yt-dlp` at a caller-supplied stub (see `stub_ytdlp`), run inline --
+    /// for tests exercising the metadata lookup's own queue republish while
+    /// a Jellyfin page is displayed.
+    fn headless_player_with_browser_jellyfin_and_ytdlp(
+        browser_program: &Path,
+        jellyfin: Arc<crate::jellyfin::JellyfinSession>,
+        ytdlp_program: &Path,
+    ) -> Player {
+        let player = Player::with_browser_jellyfin_and_ytdlp(
+            headless_mpv(),
+            browser_program
+                .to_str()
+                .expect("stub browser path must be UTF-8"),
+            jellyfin,
+            ytdlp_program
+                .to_str()
+                .expect("stub yt-dlp path must be UTF-8"),
+        )
+        .expect("create player");
+        player
+            .show_idle_screen(IdleScreen::Clock)
+            .expect("show initial idle screen");
+        player
+    }
+
     /// `pause`/`resume`/`seek`/`set_volume` must route to the Jellyfin
     /// Session REST API, not mpv, once a page from the logged-in Jellyfin
     /// server's own origin is displayed -- the mechanism
@@ -3329,6 +3450,47 @@ mod tests {
         );
     }
 
+    /// Regression test for the gap in the TV-user-agent fix above: it is
+    /// keyed on *being already logged in* (`JellyfinSession::controls`),
+    /// which is false the very first time a given server's page is cast --
+    /// `play_webpage` shows it with the plain user agent, and only
+    /// `maybe_start_login`'s background probe later learns it is a Jellyfin
+    /// server. Without a relaunch, that first session would never get the
+    /// TV user agent and every `RemoteCommand` in it would be a silent
+    /// no-op until the page happened to be cast again. The real, observable
+    /// fix is that the daemon relaunches the still-displayed page itself,
+    /// with the TV user agent, once the probe confirms it.
+    ///
+    /// The probe-then-relaunch dance is fast enough (a handful of
+    /// milliseconds, all loopback) that it can -- and, confirmed empirically,
+    /// reliably does -- terminate the *original* (plain-user-agent) engine
+    /// before the kernel ever schedules it to run even its first
+    /// instruction: SIGTERM's default disposition kills unconditionally,
+    /// with no userspace code required to run first. So the original
+    /// display's own stub-log line is not a reliable signal of anything;
+    /// this only asserts on the relaunch's own `--user-agent=` line, which
+    /// is.
+    #[test]
+    fn jellyfin_pages_relaunch_with_a_tv_user_agent_even_on_the_first_not_yet_logged_in_cast() {
+        let mock = MockJellyfin::serving(vec![serde_json::json!({ "ProductName": "Jellyfin Server" })]);
+        let jellyfin = Arc::new(crate::jellyfin::JellyfinSession::ephemeral_for_test());
+
+        let dir = scratch_dir("jellyfin-first-cast-tv-user-agent-relaunch");
+        let browser = stub_browser(&dir, "browser-waiting", "sleep 300");
+        let player = headless_player_with_browser_and_jellyfin(&browser, jellyfin);
+        player
+            .play(&webpage_play(&format!("{}/web/index.html", mock.base_url())))
+            .expect("the Jellyfin page must be accepted as a webpage Play");
+
+        wait_for_log_contains(&dir, "--user-agent=");
+        let log = wait_for_stub_log(&dir).to_lowercase();
+        assert!(
+            log.contains("--user-agent=") && log.contains("tv"),
+            "the page must end up relaunched with the TV user agent even on the very first, \
+             not-yet-logged-in cast of a Jellyfin server: {log}"
+        );
+    }
+
     /// `status()` must report the real Jellyfin now-playing position and
     /// duration -- not mpv's own (idle) state -- while a page from the
     /// logged-in server is displayed, so a sender's progress bar reflects
@@ -3393,6 +3555,44 @@ mod tests {
             .expect("the Jellyfin page must be accepted as a webpage Play");
 
         assert_eq!(player.volume(), 0.42);
+    }
+
+    /// While a Jellyfin page is displayed but nothing is playing there yet
+    /// (a normal window: still browsing its library right after login,
+    /// exactly the sub-state `queue_jump_opcodes_still_act_on_the_real_queue_while_nothing_plays_in_jellyfin_yet`
+    /// below also covers), `set_volume` still routes to Jellyfin -- but
+    /// `now_playing()` has nothing to report back. `volume()` must echo the
+    /// value `set_volume` itself last sent there, not mpv's own unrelated
+    /// idle volume: before this was fixed, a client's slider would snap back
+    /// to mpv's default (1.0) right after successfully setting a different
+    /// one.
+    #[test]
+    fn volume_falls_back_to_the_last_value_set_when_jellyfin_has_nothing_playing_yet() {
+        let mock = MockJellyfin::serving(vec![serde_json::json!([{ "Id": "s1" }])]);
+        let jellyfin = Arc::new(crate::jellyfin::JellyfinSession::ephemeral_for_test());
+        jellyfin.set_credentials(crate::jellyfin::JellyfinCredentials {
+            server_url: mock.base_url(),
+            access_token: "tok".to_string(),
+            user_id: "user".to_string(),
+            device_id: "device".to_string(),
+        });
+
+        let dir = scratch_dir("jellyfin-volume-fallback-no-now-playing");
+        let browser = stub_browser(&dir, "browser-waiting", "sleep 300");
+        let player = headless_player_with_browser_and_jellyfin(&browser, jellyfin);
+        player
+            .play(&webpage_play(&format!("{}/web/index.html", mock.base_url())))
+            .expect("the Jellyfin page must be accepted as a webpage Play");
+
+        player
+            .set_volume(0.3)
+            .expect("set_volume must route to Jellyfin even with nothing playing yet");
+        assert_eq!(
+            player.volume(),
+            0.3,
+            "volume() must echo the last value set_volume sent to Jellyfin, not mpv's \
+             unrelated idle volume, while nothing is yet playing there"
+        );
     }
 
     /// The synthetic one-item queue `queue_state()` reports while a Jellyfin
@@ -3531,6 +3731,62 @@ mod tests {
         assert_eq!(queue.items[0].url, url);
         assert_eq!(queue.items[0].title, Some("Big Buck Bunny".to_string()));
         assert_eq!(queue.items[0].duration_secs, Some(600.0));
+    }
+
+    /// `run_metadata_lookup` (the YouTube title/duration resolution that
+    /// follows enqueueing a video) is a *third* publisher of the queue
+    /// broadcast, alongside `Player::queue_state()` itself and
+    /// `auto_advance_queue`/`revert_queue_position`. While a Jellyfin page is
+    /// displayed and playing, enqueueing a YouTube URL behind it must still
+    /// end up reporting the one-item Jellyfin placeholder after the (inline,
+    /// synchronous here) metadata lookup republishes -- not castoff's own
+    /// real, now-two-item queue, which the queue-jump opcodes (gated on this
+    /// same placeholder condition) would then silently refuse to act on.
+    #[test]
+    fn metadata_lookup_republish_still_reports_the_jellyfin_placeholder() {
+        let mock = MockJellyfin::serving(vec![serde_json::json!([{
+            "Id": "s1",
+            "PlayState": { "PositionTicks": 0, "IsPaused": false },
+            "NowPlayingItem": { "Name": "Big Buck Bunny", "RunTimeTicks": 6_000_000_000i64 },
+        }])]);
+        let jellyfin = Arc::new(crate::jellyfin::JellyfinSession::ephemeral_for_test());
+        jellyfin.set_credentials(crate::jellyfin::JellyfinCredentials {
+            server_url: mock.base_url(),
+            access_token: "tok".to_string(),
+            user_id: "user".to_string(),
+            device_id: "device".to_string(),
+        });
+
+        let dir = scratch_dir("jellyfin-metadata-lookup-queue-state");
+        let browser = stub_browser(&dir, "browser-waiting", "sleep 300");
+        let ytdlp = stub_ytdlp(&dir, "yt-dlp", r#"{"title": "A Video", "duration": 42.0}"#, 0);
+        let player =
+            headless_player_with_browser_jellyfin_and_ytdlp(&browser, jellyfin, &ytdlp);
+        player
+            .play(&webpage_play(&format!("{}/web/index.html", mock.base_url())))
+            .expect("the Jellyfin page must be accepted as a webpage Play");
+
+        // The Jellyfin page is "playing", so this only enqueues (`is_idle()`
+        // is false); the inline metadata lookup runs synchronously inside
+        // this same `play` call, so both publishes it and `publish_queue_state`
+        // make have already landed by the time `play` returns.
+        player
+            .play(&PlayMessage {
+                url: Some("https://www.youtube.com/watch?v=jNQXAC9IVRw".to_string()),
+                ..Default::default()
+            })
+            .expect("youtube play enqueues behind the displayed Jellyfin page");
+
+        let queue = player.queue_state();
+        assert_eq!(
+            queue.items.len(),
+            1,
+            "a Jellyfin page playing must still report its one-item placeholder, not the \
+             real (now two-item) queue, after a metadata-lookup republish: {:?}",
+            queue.items
+        );
+        assert_eq!(queue.current_index, Some(0));
+        assert_eq!(queue.items[0].title.as_deref(), Some("Big Buck Bunny"));
     }
 
     /// Casting media while a page is displayed must take the screen back:

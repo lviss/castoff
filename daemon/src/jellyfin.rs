@@ -47,7 +47,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::cdp;
 use crate::fcast::RemoteCommand;
@@ -190,6 +190,13 @@ struct SessionState {
     /// Cached `Sessions` id for `credentials`' device, resolved lazily
     /// (`resolve_session`) and invalidated whenever `credentials` changes.
     session_id: Option<String>,
+    /// The last volume (FCast's 0.0-1.0 scale) `set_volume` successfully sent,
+    /// invalidated on a fresh login same as `session_id`. `Player::volume`
+    /// falls back to this when `now_playing` has nothing to report (e.g.
+    /// nothing is playing in the Jellyfin session yet) instead of mpv's own
+    /// unrelated `volume` property, which `set_volume` never touches while
+    /// this session controls the displayed page.
+    last_set_volume: Option<f64>,
 }
 
 /// Owns castoff's Jellyfin login (if any) and every Session REST call made
@@ -216,6 +223,7 @@ impl JellyfinSession {
             state: Mutex::new(SessionState {
                 credentials,
                 session_id: None,
+                last_set_volume: None,
             }),
             state_path,
         }
@@ -247,6 +255,7 @@ impl JellyfinSession {
             let mut s = self.state.lock().unwrap();
             s.credentials = Some(credentials);
             s.session_id = None;
+            s.last_set_volume = None;
         }
         self.persist();
     }
@@ -382,7 +391,15 @@ impl JellyfinSession {
     pub(crate) fn set_volume(&self, volume: f64) -> Result<()> {
         let mut args = HashMap::new();
         args.insert("Volume", ((volume * 100.0).round() as i64).to_string());
-        self.general_command("SetVolume", Some(args))
+        self.general_command("SetVolume", Some(args))?;
+        self.state.lock().unwrap().last_set_volume = Some(volume);
+        Ok(())
+    }
+
+    /// The last volume `set_volume` successfully sent, if any since the
+    /// current login -- see `SessionState::last_set_volume`.
+    pub(crate) fn last_set_volume(&self) -> Option<f64> {
+        self.state.lock().unwrap().last_set_volume
     }
 
     /// Directional/select navigation (castoff's new FCast
@@ -418,23 +435,41 @@ impl JellyfinSession {
 
 /// If `url` is a page served by a Jellyfin server this session isn't
 /// already logged into, probe whether it really is one (`probe_server`)
-/// and, if so, start the browser-driven login dance
-/// (`login_via_browser_tab`) on its own detached thread -- never on the
-/// caller's own stack, since it can block for minutes waiting on a human to
-/// approve the on-screen code. Called right after `webpage.show(url)`
+/// and, if so, relaunch it with the TV user agent (see
+/// `webpage.rs`'s `JELLYFIN_TV_USER_AGENT`) and start the browser-driven
+/// login dance (`login_via_browser_tab`) on its own detached thread -- never
+/// on the caller's own stack, since it can block for minutes waiting on a
+/// human to approve the on-screen code. Called right after `webpage.show(url)`
 /// succeeds, from both the explicit webpage `Play` path and the async
 /// media-to-webpage fallback path (`player.rs`).
 ///
-/// A later `Play` can replace the displayed engine (and, with it,
-/// `DevToolsActivePort` under the shared profile dir) while this thread is
-/// still mid-dance, which would otherwise let it drive a *different* page's
-/// tab to completion and persist its credentials under this call's
+/// `play_webpage`/`fall_back_to_browser` only know `jellyfin.controls(url)`
+/// at display time, which is false until a login has already happened once
+/// -- so the page they show is launched with the plain user agent even when
+/// it turns out to be a Jellyfin server. Without relaunching it here, the
+/// *first* session against a given server would never get the TV user
+/// agent, and every `RemoteCommand` in it would be a silent no-op (see
+/// `webpage.rs`'s `JELLYFIN_TV_USER_AGENT` doc comment for why) until the
+/// page happened to be cast again later. The relaunch -- and the staleness
+/// check guarding it -- runs under `operation`, the same lock
+/// `Player::play`/`stop` hold across their own whole webpage swap: without
+/// it, a real `Play` racing this background thread could have its own
+/// `webpage.show` silently clobbered by this thread's relaunch of the
+/// *old* page once the probe resolves slightly later. The dance itself
+/// stays off that lock (see above), since it is not bounded the way a
+/// relaunch is.
+///
+/// A later `Play` can still replace the displayed engine (and, with it,
+/// `DevToolsActivePort` under the shared profile dir) while the dance
+/// itself is mid-flight, which would otherwise let it drive a *different*
+/// page's tab to completion and persist its credentials under this call's
 /// `server_origin`. Before persisting, the credentials arm re-checks that
 /// `webpage`'s active URL is still the one this login was started for, and
 /// drops the result otherwise.
 pub(crate) fn maybe_start_login(
     jellyfin: &Arc<JellyfinSession>,
     webpage: &Arc<WebpageController>,
+    operation: &Arc<Mutex<()>>,
     url: &str,
 ) {
     if jellyfin.controls(url) {
@@ -449,6 +484,7 @@ pub(crate) fn maybe_start_login(
     // for every *other* displayed page, Jellyfin or not.
     let jellyfin = Arc::clone(jellyfin);
     let webpage = Arc::clone(webpage);
+    let operation = Arc::clone(operation);
     let profile_dir = webpage.profile_dir();
     let url = url.to_string();
     std::thread::spawn(move || {
@@ -456,6 +492,26 @@ pub(crate) fn maybe_start_login(
             return;
         }
         info!(origin, "detected a Jellyfin server; starting its Quick Connect login");
+        let relaunched = {
+            let _operation = operation.lock().unwrap();
+            if webpage.active_url().as_deref() != Some(url.as_str()) {
+                false
+            } else if let Err(e) = webpage.show(&url, true) {
+                warn!(
+                    origin,
+                    url,
+                    error = %e,
+                    "failed to relaunch the Jellyfin page with a TV user agent; its \
+                     RemoteCommand navigation may not focus anything this session"
+                );
+                false
+            } else {
+                true
+            }
+        };
+        if !relaunched {
+            return;
+        }
         match login_via_browser_tab(&profile_dir, &origin) {
             Ok(credentials) => {
                 if webpage.active_url().as_deref() != Some(url.as_str()) {
@@ -507,7 +563,10 @@ const READ_CREDENTIALS_JS: &str = "({ accessToken: window.ApiClient.accessToken(
 /// `Player::operation`'s lock and every other caller's own stack.
 fn login_via_browser_tab(profile_dir: &Path, server_origin: &str) -> Result<JellyfinCredentials> {
     let http_port = cdp::wait_for_devtools_port(profile_dir, DEVTOOLS_PORT_TIMEOUT)?;
-    let agent = ureq::Agent::new();
+    // Timed out, like every other request this module makes (`JellyfinSession::agent`,
+    // `cdp::CdpSession`'s `READ_TIMEOUT`): a DevTools HTTP endpoint that accepts but
+    // never answers must not wedge this detached login thread indefinitely.
+    let agent = ureq::AgentBuilder::new().timeout(REQUEST_TIMEOUT).build();
     let ws_url = cdp::discover_page_ws_url(&agent, http_port)?;
     let mut session = cdp::CdpSession::connect(http_port, &ws_url)?;
 
@@ -641,14 +700,24 @@ struct PublicSystemInfo {
 /// target automatically rather than requiring separate Jellyfin-specific
 /// setup.
 pub(crate) fn probe_server(agent: &ureq::Agent, origin: &str) -> bool {
-    let Ok(response) = agent
-        .get(&format!("{origin}/System/Info/Public"))
-        .call()
-    else {
-        return false;
+    let response = match agent.get(&format!("{origin}/System/Info/Public")).call() {
+        Ok(response) => response,
+        Err(e) => {
+            debug!(
+                origin,
+                error = %e,
+                "Jellyfin probe request failed (not reachable, or not a Jellyfin server -- \
+                 e.g. a self-signed/private-CA HTTPS certificate this agent does not trust)"
+            );
+            return false;
+        }
     };
-    let Ok(info) = response.into_json::<PublicSystemInfo>() else {
-        return false;
+    let info = match response.into_json::<PublicSystemInfo>() {
+        Ok(info) => info,
+        Err(e) => {
+            debug!(origin, error = %e, "Jellyfin probe response was not the expected JSON shape");
+            return false;
+        }
     };
     info.product_name.eq_ignore_ascii_case("Jellyfin Server")
 }
@@ -970,12 +1039,22 @@ mod tests {
     /// `GET /json/list` with a single page target, then performs the real
     /// WebSocket upgrade for that target and answers each
     /// `Runtime.evaluate` call in `script`, in order, with its value.
-    fn serve_mock_devtools(port: u16, script: Vec<serde_json::Value>) -> std::thread::JoinHandle<()> {
+    ///
+    /// Binds its listener (on an OS-assigned port, returned alongside the
+    /// handle) *before* returning, so a caller that writes `DevToolsActivePort`
+    /// with the returned port right after this call can never have a login
+    /// thread read that file and find nothing listening yet -- the race a
+    /// fixed, caller-chosen port used to leave open, which could otherwise
+    /// make `login_via_browser_tab` fail fast and this mock's own
+    /// `listener.accept()` then block forever with no second party ever
+    /// connecting.
+    fn serve_mock_devtools(script: Vec<serde_json::Value>) -> (u16, std::thread::JoinHandle<()>) {
         use std::io::{Read, Write};
         use tungstenite::Message;
 
-        let listener = std::net::TcpListener::bind(("127.0.0.1", port)).expect("bind mock DevTools port");
-        std::thread::spawn(move || {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind mock DevTools port");
+        let port = listener.local_addr().expect("mock DevTools listener has a local addr").port();
+        let handle = std::thread::spawn(move || {
             // `GET /json/list`.
             let (mut stream, _) = listener.accept().expect("accept json/list connection");
             let mut buf = [0u8; 2048];
@@ -1008,7 +1087,8 @@ mod tests {
                     .send(Message::Text(reply.to_string()))
                     .expect("send mock CDP reply");
             }
-        })
+        });
+        (port, handle)
     }
 
     fn write_devtools_active_port(profile_dir: &Path, port: u16) {
@@ -1022,23 +1102,20 @@ mod tests {
 
     #[test]
     fn login_via_browser_tab_waits_for_the_button_then_reads_back_credentials() {
-        let port = free_port();
         let profile_dir = std::env::temp_dir().join(format!(
-            "castoff-jellyfin-login-test-{}-{port}",
-            std::process::id()
+            "castoff-jellyfin-login-test-{}-{}",
+            std::process::id(),
+            free_port()
         ));
+        let (port, server) = serve_mock_devtools(vec![
+            json!(false), // Quick Connect button not ready yet
+            json!(true),  // button ready
+            json!(serde_json::Value::Null), // the click itself
+            json!(false), // not logged in yet
+            json!(true),  // approved
+            json!({ "accessToken": "tok", "userId": "user", "deviceId": "device" }),
+        ]);
         write_devtools_active_port(&profile_dir, port);
-        let server = serve_mock_devtools(
-            port,
-            vec![
-                json!(false), // Quick Connect button not ready yet
-                json!(true),  // button ready
-                json!(serde_json::Value::Null), // the click itself
-                json!(false), // not logged in yet
-                json!(true),  // approved
-                json!({ "accessToken": "tok", "userId": "user", "deviceId": "device" }),
-            ],
-        );
 
         let creds =
             login_via_browser_tab(&profile_dir, "http://jellyfin.lan").expect("login via tab");
@@ -1072,7 +1149,8 @@ mod tests {
         // observe directly, but it also must not panic or block the caller.
         let session = Arc::new(logged_in_session("http://jellyfin.lan"));
         let webpage = Arc::new(WebpageController::with_program("true"));
-        maybe_start_login(&session, &webpage, "http://jellyfin.lan/web/index.html");
+        let operation = Arc::new(Mutex::new(()));
+        maybe_start_login(&session, &webpage, &operation, "http://jellyfin.lan/web/index.html");
         // Still the same credentials; nothing was reset or re-triggered.
         assert_eq!(session.credentials().unwrap().access_token, "test-token");
     }
@@ -1082,7 +1160,8 @@ mod tests {
         let mock = MockServer::sequence(vec![json!({ "ProductName": "Grafana" })]);
         let session = Arc::new(JellyfinSession::ephemeral_for_test());
         let webpage = Arc::new(WebpageController::with_program("true"));
-        maybe_start_login(&session, &webpage, &format!("{}/d/dashboard", mock.base_url()));
+        let operation = Arc::new(Mutex::new(()));
+        maybe_start_login(&session, &webpage, &operation, &format!("{}/d/dashboard", mock.base_url()));
         // The probe (and everything after it) now always runs on its own
         // background thread, never on this call's own stack -- see
         // `maybe_start_login`'s doc comment for why. `MockServer`'s `Drop`
@@ -1098,24 +1177,68 @@ mod tests {
     /// just sleeps, so `WebpageController::show` has a real, long-lived
     /// process to track as "the displayed page" -- mirrors `player.rs`'s
     /// own `stub_browser` test helper, kept local here since it's the only
-    /// thing in this module that needs one.
+    /// thing in this module that needs one. Appends `"<pid> <argv...>"` per
+    /// invocation to `<dir>/stub.log` (see `wait_for_log_contains`), so a
+    /// test can tell `maybe_start_login`'s own TV-user-agent relaunch apart
+    /// from the original display by its `--user-agent=` flag. A relaunch
+    /// that arrives fast enough can terminate the original process before
+    /// the kernel ever schedules it to run even its first instruction (SIGTERM's
+    /// default disposition kills unconditionally, with no userspace code
+    /// required to run first) -- confirmed to happen reliably for this stub,
+    /// since `maybe_start_login`'s probe-then-relaunch is a handful of
+    /// milliseconds end to end. So the original display's own log line is
+    /// *not* a reliable signal of anything; only the relaunch's `--user-agent=`
+    /// line is.
     fn sleeping_stub_browser(dir: &Path) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
 
         let script = dir.join("browser-waiting");
-        std::fs::write(&script, "#!/bin/sh\nsleep 300\n").expect("write stub browser");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\necho \"$$ $@\" >> \"{log}\"\nsleep 300\n",
+                log = dir.join("stub.log").display(),
+            ),
+        )
+        .expect("write stub browser");
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
             .expect("make stub browser executable");
         script
     }
 
-    /// Regression test for the race `maybe_start_login`'s doc comment now
-    /// describes: a second `Play` can replace the displayed page while the
-    /// login thread for the *first* page is still mid-flight (here,
-    /// deliberately after the probe/login dance has already started against
-    /// page A, before it persists anything). The thread must notice the
-    /// displayed page no longer matches what it started with and discard the
-    /// result rather than persist credentials under the wrong `server_url`.
+    /// Block until `<dir>/stub.log` contains `needle` -- mirrors `player.rs`'s
+    /// own `wait_for_log_contains` test helper.
+    fn wait_for_log_contains(dir: &Path, needle: &str) {
+        let log = dir.join("stub.log");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let seen = std::fs::read_to_string(&log)
+                .map(|contents| contents.contains(needle))
+                .unwrap_or(false);
+            if seen {
+                return;
+            }
+            if Instant::now() >= deadline {
+                let contents = std::fs::read_to_string(&log).unwrap_or_default();
+                panic!("the stub browser log never contained {needle:?}; log contents: {contents:?}");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Regression test for the two staleness races `maybe_start_login`'s doc
+    /// comment now describes. First, its own TV-user-agent relaunch (held
+    /// under `operation`) must only touch page A while page A is still
+    /// genuinely the displayed page -- verified here simply by letting that
+    /// relaunch run to completion (its `--user-agent=` log line, the only
+    /// reliable signal -- see `sleeping_stub_browser`'s doc comment) before
+    /// the page changes underneath it. Second -- and this is the race the
+    /// test is really about -- a later `Play` can still replace the
+    /// displayed page while the login dance that follows is in flight
+    /// (deliberately *not* held under `operation`, since it can block for
+    /// minutes on a human); the thread must notice the displayed page no
+    /// longer matches what it started with and discard the result rather
+    /// than persist credentials under the wrong `server_url`.
     #[test]
     fn maybe_start_login_discards_credentials_if_the_displayed_page_changed_before_login_finished() {
         let dir = std::env::temp_dir().join(format!(
@@ -1129,6 +1252,7 @@ mod tests {
         let mock = MockServer::sequence(vec![json!({ "ProductName": "Jellyfin Server" })]);
         let url_a = format!("{}/web/index.html", mock.base_url());
         let session = Arc::new(JellyfinSession::ephemeral_for_test());
+        let operation = Arc::new(Mutex::new(()));
 
         let browser = sleeping_stub_browser(&dir);
         let webpage = Arc::new(WebpageController::with_program(
@@ -1136,14 +1260,18 @@ mod tests {
         ));
         webpage.show(&url_a, false).expect("show page A");
 
-        // Start the login thread for page A: it has nothing to read yet (the
-        // stub browser never writes its own `DevToolsActivePort`), so it is
-        // still polling when the page changes underneath it below.
-        maybe_start_login(&session, &webpage, &url_a);
+        // Start the login thread for page A. Once the probe confirms it is a
+        // Jellyfin server, it relaunches page A itself under `operation`
+        // (still page A, now with the TV user agent) before starting the CDP
+        // dance -- wait for that relaunch's own log line so the
+        // supersession below lands inside the dance itself, not racing the
+        // relaunch.
+        maybe_start_login(&session, &webpage, &operation, &url_a);
+        wait_for_log_contains(&dir, "--user-agent=");
 
-        // A second `Play` supersedes page A with a different page before the
+        // A second `Play` supersedes page A with a different page while the
         // login dance (still polling the shared `DevToolsActivePort`/CDP
-        // socket under the same profile dir) has finished. `show` clears any
+        // socket under the same profile dir) is in flight. `show` clears any
         // stale `DevToolsActivePort` before spawning the replacement, so the
         // file simulating the new engine's own port must be written *after*
         // this call, not before -- writing it earlier would just have this
@@ -1152,17 +1280,13 @@ mod tests {
             .show("http://elsewhere.example/other", false)
             .expect("show page B, superseding page A");
 
-        let devtools_port = free_port();
+        let (devtools_port, devtools) = serve_mock_devtools(vec![
+            json!(true), // button ready
+            json!(serde_json::Value::Null), // the click itself
+            json!(true), // approved
+            json!({ "accessToken": "tok", "userId": "user", "deviceId": "device" }),
+        ]);
         write_devtools_active_port(&webpage.profile_dir(), devtools_port);
-        let devtools = serve_mock_devtools(
-            devtools_port,
-            vec![
-                json!(true), // button ready
-                json!(serde_json::Value::Null), // the click itself
-                json!(true), // approved
-                json!({ "accessToken": "tok", "userId": "user", "deviceId": "device" }),
-            ],
-        );
 
         devtools.join().unwrap();
         drop(mock);
