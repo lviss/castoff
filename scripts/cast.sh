@@ -53,6 +53,7 @@ OPCODE_QUEUE_JUMP_BACKWARD=17
 OPCODE_CLEAR_QUEUE=18
 OPCODE_QUEUE_JUMP_TO_INDEX=19
 OPCODE_SET_IMAGE_WALLPAPER=20
+OPCODE_REMOTE_COMMAND=22
 
 usage() {
     cat <<'EOF'
@@ -79,6 +80,10 @@ Queue (castoff private extension):
   queue-prev             jump to the previous queue item
   queue-clear            empty the queue (stops playback first if current)
   queue-jump INDEX       jump straight to an index in the queue
+
+Remote navigation (castoff private extension; dispatched to whichever source
+currently accepts one, e.g. a displayed Jellyfin page):
+  remote up|down|left|right|select|back
 
 Images (castoff private extension; upload travels over HTTP, not FCast):
   upload-image FILE [--content-type TYPE] [--display] [--wallpaper]
@@ -251,6 +256,32 @@ cmd_queue_jump() {
     print_reply "$reply"
 }
 
+# Maps a human-friendly direction to RemoteCommandMessage's command value
+# (daemon/src/fcast.rs's RemoteCommand enum), used by cmd_remote.
+remote_command_name() {
+    case "$1" in
+        up) echo "MoveUp" ;;
+        down) echo "MoveDown" ;;
+        left) echo "MoveLeft" ;;
+        right) echo "MoveRight" ;;
+        select) echo "Select" ;;
+        back) echo "Back" ;;
+        *) die "remote: unknown direction '$1' (want up|down|left|right|select|back)" ;;
+    esac
+}
+
+cmd_remote() {
+    local direction="${1:-}"
+    [[ -n "$direction" ]] || die "remote requires a direction (up|down|left|right|select|back)"
+    local command
+    command="$(remote_command_name "$direction")"
+    local body
+    body="$(jq -nc --arg command "$command" '{command: $command}')" || die "remote: could not build the RemoteCommand body"
+    local reply
+    reply="$(send_command "$OPCODE_REMOTE_COMMAND" "$body")" || die "remote command failed"
+    print_reply "$reply"
+}
+
 # Best-effort Content-Type guess from a file's extension, for upload-image
 # when --content-type isn't given. The daemon only checks the type starts
 # with "image/" (daemon/src/upload.rs), so an exact subtype match isn't
@@ -367,6 +398,7 @@ main() {
         queue-prev) cmd_queue_prev "$@" ;;
         queue-clear) cmd_queue_clear "$@" ;;
         queue-jump) cmd_queue_jump "$@" ;;
+        remote) cmd_remote "$@" ;;
         upload-image) cmd_upload_image "$@" ;;
         set-wallpaper) cmd_set_wallpaper "$@" ;;
         help) usage ;;

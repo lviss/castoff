@@ -543,6 +543,7 @@ scripts/cast.sh ping
 scripts/cast.sh play 'https://www.youtube.com/watch?v=dQw4w9WgXcQ'
 scripts/cast.sh volume 0.5
 scripts/cast.sh queue-request
+scripts/cast.sh remote select
 scripts/cast.sh upload-image photo.jpg --display --wallpaper
 scripts/cast.sh --help   # full command list
 ```
