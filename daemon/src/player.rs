@@ -699,8 +699,7 @@ impl Player {
     /// absent on failure" contract `metadata.rs`'s YouTube title lookup
     /// already uses.
     pub fn queue_state(&self) -> QueueStateMessage {
-        let queue = self.queue.lock().unwrap();
-        queue_state_message(&queue, &self.webpage, &self.jellyfin)
+        queue_state_message(&self.queue, &self.webpage, &self.jellyfin)
     }
 
     /// Whether `queue_state()` is currently showing the synthetic one-item
@@ -1483,43 +1482,59 @@ fn abort_loading_to_idle(h: &Handles) -> Result<()> {
 /// whether it found (and successfully submitted a load for) one, so the eof
 /// watcher knows whether to fall back to showing the idle clock itself.
 ///
+/// The synthetic one-item Jellyfin placeholder `queue_state_message` reports
+/// in place of the real queue, if a Jellyfin page is displayed and has
+/// something playing right now. Deliberately takes no `Queue` lock at all:
+/// `jellyfin.now_playing()` is a blocking HTTP call bounded only by
+/// Jellyfin's own `REQUEST_TIMEOUT` (10s), and `queue_state_message`'s own
+/// callers must never hold the shared `Queue` mutex across that call --
+/// doing so once stalled every other queue mutation (`Play`,
+/// `QueueJumpForward`/`Backward`/`ToIndex`, `ClearQueue`, auto-advance) for
+/// up to the same 10s whenever the Jellyfin server was slow or unreachable.
+fn jellyfin_queue_placeholder(
+    webpage: &WebpageController,
+    jellyfin: &JellyfinSession,
+) -> Option<QueueStateMessage> {
+    let url = webpage.active_url()?;
+    if !jellyfin.controls(&url) {
+        return None;
+    }
+    let now_playing = jellyfin.now_playing().ok().flatten()?;
+    Some(QueueStateMessage {
+        generation_time: now_millis(),
+        items: vec![QueueItemMessage {
+            url,
+            container: Some("text/html".to_string()),
+            title: now_playing.title,
+            duration_secs: now_playing.duration_secs,
+        }],
+        current_index: Some(0),
+    })
+}
+
 /// The current queue as the wire shape sent to FCast senders -- `queue`'s
-/// own persisted state normally, or -- while a Jellyfin page `jellyfin` is
-/// logged into is displayed and has something playing -- one synthetic
-/// entry reflecting *that* session's now-playing item instead (see
-/// `Player::queue_state`'s doc comment for why not a mirrored per-item
-/// queue). A free function, not a `Player` method, so every path that
-/// republishes the queue -- `Player::queue_state` itself,
+/// own persisted state normally, or `jellyfin_queue_placeholder`'s synthetic
+/// entry instead (see `Player::queue_state`'s doc comment for why not a
+/// mirrored per-item queue). A free function, not a `Player` method, so
+/// every path that republishes the queue -- `Player::queue_state` itself,
 /// `auto_advance_queue`, `revert_queue_position` and `run_metadata_lookup`,
 /// the latter two reachable from contexts with no `&Player` to borrow from
 /// -- broadcasts the exact same shape; before this existed as a shared
 /// function, those three called `Queue::to_state_message()` directly, which
 /// could advertise a queue the jump opcodes (gated on this same condition,
 /// see `Player::jellyfin_now_playing_if_displayed`) would then silently
-/// refuse to act on.
+/// refuse to act on. Takes `&Mutex<Queue>`, not an already-locked `&Queue`:
+/// it only locks `queue` for the fallback `to_state_message()` branch, after
+/// `jellyfin_queue_placeholder`'s own network call (if any) has already
+/// returned -- every caller must mutate/save the queue in its own, separate
+/// locked section *before* calling this, not hold that lock across it.
 fn queue_state_message(
-    queue: &Queue,
+    queue: &Mutex<Queue>,
     webpage: &WebpageController,
     jellyfin: &JellyfinSession,
 ) -> QueueStateMessage {
-    let controls_active_page = webpage.active_url().is_some_and(|url| jellyfin.controls(&url));
-    if controls_active_page {
-        if let Some(now_playing) = jellyfin.now_playing().ok().flatten() {
-            if let Some(url) = webpage.active_url() {
-                return QueueStateMessage {
-                    generation_time: now_millis(),
-                    items: vec![QueueItemMessage {
-                        url,
-                        container: Some("text/html".to_string()),
-                        title: now_playing.title,
-                        duration_secs: now_playing.duration_secs,
-                    }],
-                    current_index: Some(0),
-                };
-            }
-        }
-    }
-    queue.to_state_message()
+    jellyfin_queue_placeholder(webpage, jellyfin)
+        .unwrap_or_else(|| queue.lock().unwrap().to_state_message())
 }
 
 /// Takes the same field handles `Player`'s own methods use (`Handles`)
@@ -1541,11 +1556,8 @@ fn auto_advance_queue(
         return false;
     };
     let index = { queue.lock().unwrap().position() };
-    {
-        let q = queue.lock().unwrap();
-        q.save(state_path);
-        let _ = queue_tx.send_replace(queue_state_message(&q, h.webpage, h.jellyfin));
-    }
+    queue.lock().unwrap().save(state_path);
+    let _ = queue_tx.send_replace(queue_state_message(queue, h.webpage, h.jellyfin));
     let rollback = index.map(|index| QueueRollback { index, previous });
     if let Err(e) = execute_play(h, &item, rollback) {
         error!(
@@ -1583,13 +1595,15 @@ fn revert_queue_position(
     rollback: Option<QueueRollback>,
 ) {
     let Some(rollback) = rollback else { return };
-    let mut queue = queue.lock().unwrap();
-    if queue.position() != Some(rollback.index) {
-        return;
+    {
+        let mut locked = queue.lock().unwrap();
+        if locked.position() != Some(rollback.index) {
+            return;
+        }
+        locked.set_position(rollback.previous);
+        locked.save(state_path);
     }
-    queue.set_position(rollback.previous);
-    queue.save(state_path);
-    let _ = queue_tx.send_replace(queue_state_message(&queue, webpage, jellyfin));
+    let _ = queue_tx.send_replace(queue_state_message(queue, webpage, jellyfin));
 }
 
 /// Looks up `msg`'s title/length (`metadata::fetch_metadata`) and, once
@@ -1626,10 +1640,12 @@ fn run_metadata_lookup(
     let Some(metadata) = crate::metadata::fetch_metadata(ytdlp_program, url) else {
         return;
     };
-    let mut queue = queue.lock().unwrap();
-    queue.set_metadata(index, id, metadata.title, metadata.duration_secs);
-    queue.save(state_path);
-    let _ = queue_tx.send_replace(queue_state_message(&queue, webpage, jellyfin));
+    {
+        let mut locked = queue.lock().unwrap();
+        locked.set_metadata(index, id, metadata.title, metadata.duration_secs);
+        locked.save(state_path);
+    }
+    let _ = queue_tx.send_replace(queue_state_message(queue, webpage, jellyfin));
 }
 
 /// Kicks off [`run_metadata_lookup`] for `msg`, scoped to URLs the daemon
@@ -3731,6 +3747,108 @@ mod tests {
         assert_eq!(queue.items[0].url, url);
         assert_eq!(queue.items[0].title, Some("Big Buck Bunny".to_string()));
         assert_eq!(queue.items[0].duration_secs, Some(600.0));
+    }
+
+    /// A mock Jellyfin server that only answers after `delay`, handling
+    /// each request on its own thread so concurrent callers are actually
+    /// served concurrently -- the shape needed to prove `queue_state_message`
+    /// doesn't serialize concurrent callers through the shared `Queue` mutex
+    /// while one of them is waiting on a slow Jellyfin response (see
+    /// `jellyfin_queue_placeholder`'s doc comment).
+    struct SlowMockJellyfin {
+        addr: String,
+        stop: Arc<std::sync::atomic::AtomicBool>,
+        handle: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl SlowMockJellyfin {
+        fn serving(delay: Duration, body: serde_json::Value) -> Self {
+            let server = tiny_http::Server::http("127.0.0.1:0").expect("bind slow mock Jellyfin");
+            let addr = server.server_addr().to_string();
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let thread_stop = Arc::clone(&stop);
+            let handle = std::thread::spawn(move || {
+                use std::sync::atomic::Ordering;
+                while !thread_stop.load(Ordering::Relaxed) {
+                    let Ok(Some(request)) = server.recv_timeout(Duration::from_millis(100)) else {
+                        continue;
+                    };
+                    let body = body.to_string();
+                    std::thread::spawn(move || {
+                        std::thread::sleep(delay);
+                        let _ = request.respond(tiny_http::Response::from_string(body));
+                    });
+                }
+            });
+            Self {
+                addr,
+                stop,
+                handle: Some(handle),
+            }
+        }
+
+        fn base_url(&self) -> String {
+            format!("http://{}", self.addr)
+        }
+    }
+
+    impl Drop for SlowMockJellyfin {
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            if let Some(h) = self.handle.take() {
+                let _ = h.join();
+            }
+        }
+    }
+
+    /// Regression test for the lock-ordering hazard fixed in
+    /// `queue_state_message`/`jellyfin_queue_placeholder`: the shared `Queue`
+    /// mutex must never be held across `jellyfin.now_playing()`'s blocking
+    /// HTTP call. Before the fix, every `queue_state()` call locked `Queue`
+    /// *before* polling Jellyfin, so two concurrent callers against a slow
+    /// server would serialize -- the second waiting out the full network
+    /// delay twice (once for the first caller's lock to release, once for
+    /// its own poll) instead of both polling concurrently and only briefly
+    /// touching the queue. Two concurrent `queue_state()` calls against a
+    /// server that takes `delay` to answer must therefore both finish in
+    /// well under `2 * delay`.
+    #[test]
+    fn concurrent_queue_state_polls_do_not_serialize_through_the_queue_lock() {
+        let delay = Duration::from_millis(500);
+        let mock = SlowMockJellyfin::serving(delay, serde_json::json!([{ "Id": "s1" }]));
+        let jellyfin = Arc::new(crate::jellyfin::JellyfinSession::ephemeral_for_test());
+        jellyfin.set_credentials(crate::jellyfin::JellyfinCredentials {
+            server_url: mock.base_url(),
+            access_token: "tok".to_string(),
+            user_id: "user".to_string(),
+            device_id: "device".to_string(),
+        });
+
+        let dir = scratch_dir("jellyfin-concurrent-slow-queue-state");
+        let browser = stub_browser(&dir, "browser-waiting", "sleep 300");
+        let player = Arc::new(headless_player_with_browser_and_jellyfin(&browser, jellyfin));
+        player
+            .play(&webpage_play(&format!("{}/web/index.html", mock.base_url())))
+            .expect("the Jellyfin page must be accepted as a webpage Play");
+
+        let start = Instant::now();
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let player = Arc::clone(&player);
+                std::thread::spawn(move || player.queue_state())
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("queue_state thread");
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < delay * 3 / 2,
+            "two concurrent queue_state() calls against a {delay:?}-slow Jellyfin server took \
+             {elapsed:?}; they must each wait on their own unlocked network call rather than \
+             being serialized through the Queue mutex (that would take close to {:?})",
+            delay * 2
+        );
     }
 
     /// `run_metadata_lookup` (the YouTube title/duration resolution that
