@@ -120,7 +120,10 @@ pub struct Player {
 /// list.
 struct Handles<'a> {
     mpv: &'a Mpv,
-    webpage: &'a WebpageController,
+    /// Kept as `&Arc<...>` (not `&WebpageController`): `play_webpage` needs
+    /// an owned `Arc` to hand to `jellyfin::maybe_start_login`, which moves
+    /// it into a detached background thread.
+    webpage: &'a Arc<WebpageController>,
     overlay: &'a PlaybackOverlay,
     idle: &'a IdleScreenController,
     routing: &'a Mutex<Routing>,
@@ -1377,7 +1380,7 @@ fn play_webpage(h: &Handles, url: &str) -> Result<()> {
     // isn't already logged into, this starts that login dance in the
     // background (see `jellyfin.rs`'s module doc comment) -- never here on
     // this call stack, since it can block for minutes waiting on a human.
-    crate::jellyfin::maybe_start_login(h.jellyfin, h.webpage.profile_dir(), url);
+    crate::jellyfin::maybe_start_login(h.jellyfin, h.webpage, url);
     h.mpv
         .command("stop", &[])
         .map_err(|e| anyhow::anyhow!("stop before displaying a web page failed: {e:?}"))?;
@@ -1836,7 +1839,7 @@ fn fall_back_to_browser(
     mpv_error: &libmpv2::Error,
     mpv: &Mpv,
     idle: &IdleScreenController,
-    webpage: &WebpageController,
+    webpage: &Arc<WebpageController>,
     jellyfin: &Arc<JellyfinSession>,
     status_tx: &watch::Sender<PlaybackUpdateMessage>,
     queue: QueueContext,
@@ -1866,7 +1869,7 @@ fn fall_back_to_browser(
             queue.rollback,
         );
     } else {
-        crate::jellyfin::maybe_start_login(jellyfin, webpage.profile_dir(), url);
+        crate::jellyfin::maybe_start_login(jellyfin, webpage, url);
     }
     // This path never goes through a `Player` method: a successful `show`
     // flips `webpage.is_active()` from false to true, which is the

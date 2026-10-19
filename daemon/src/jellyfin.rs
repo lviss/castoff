@@ -51,6 +51,7 @@ use tracing::{info, warn};
 
 use crate::cdp;
 use crate::fcast::RemoteCommand;
+use crate::webpage::WebpageController;
 
 /// Castoff's fixed client identity presented to Jellyfin for every Session
 /// REST call (the `DeviceId` comes from the logged-in credentials instead --
@@ -423,7 +424,19 @@ impl JellyfinSession {
 /// approve the on-screen code. Called right after `webpage.show(url)`
 /// succeeds, from both the explicit webpage `Play` path and the async
 /// media-to-webpage fallback path (`player.rs`).
-pub(crate) fn maybe_start_login(jellyfin: &Arc<JellyfinSession>, profile_dir: PathBuf, url: &str) {
+///
+/// A later `Play` can replace the displayed engine (and, with it,
+/// `DevToolsActivePort` under the shared profile dir) while this thread is
+/// still mid-dance, which would otherwise let it drive a *different* page's
+/// tab to completion and persist its credentials under this call's
+/// `server_origin`. Before persisting, the credentials arm re-checks that
+/// `webpage`'s active URL is still the one this login was started for, and
+/// drops the result otherwise.
+pub(crate) fn maybe_start_login(
+    jellyfin: &Arc<JellyfinSession>,
+    webpage: &Arc<WebpageController>,
+    url: &str,
+) {
     if jellyfin.controls(url) {
         return; // cheap, in-memory check: no need for a thread at all.
     }
@@ -435,6 +448,9 @@ pub(crate) fn maybe_start_login(jellyfin: &Arc<JellyfinSession>, profile_dir: Pa
     // `play_webpage`/`fall_back_to_browser` must stay as fast as they were
     // for every *other* displayed page, Jellyfin or not.
     let jellyfin = Arc::clone(jellyfin);
+    let webpage = Arc::clone(webpage);
+    let profile_dir = webpage.profile_dir();
+    let url = url.to_string();
     std::thread::spawn(move || {
         if !probe_server(&jellyfin.agent, &origin) {
             return;
@@ -442,6 +458,16 @@ pub(crate) fn maybe_start_login(jellyfin: &Arc<JellyfinSession>, profile_dir: Pa
         info!(origin, "detected a Jellyfin server; starting its Quick Connect login");
         match login_via_browser_tab(&profile_dir, &origin) {
             Ok(credentials) => {
+                if webpage.active_url().as_deref() != Some(url.as_str()) {
+                    warn!(
+                        origin,
+                        url,
+                        "Jellyfin login completed, but the displayed page has since \
+                         changed; discarding these credentials rather than risk \
+                         persisting them under the wrong server"
+                    );
+                    return;
+                }
                 info!(origin, "Jellyfin login completed");
                 jellyfin.set_credentials(credentials);
             }
@@ -1045,11 +1071,8 @@ mod tests {
         // or error inside the background thread, which this test cannot
         // observe directly, but it also must not panic or block the caller.
         let session = Arc::new(logged_in_session("http://jellyfin.lan"));
-        maybe_start_login(
-            &session,
-            PathBuf::from("/nonexistent"),
-            "http://jellyfin.lan/web/index.html",
-        );
+        let webpage = Arc::new(WebpageController::with_program("true"));
+        maybe_start_login(&session, &webpage, "http://jellyfin.lan/web/index.html");
         // Still the same credentials; nothing was reset or re-triggered.
         assert_eq!(session.credentials().unwrap().access_token, "test-token");
     }
@@ -1058,11 +1081,8 @@ mod tests {
     fn maybe_start_login_does_nothing_for_a_non_jellyfin_origin() {
         let mock = MockServer::sequence(vec![json!({ "ProductName": "Grafana" })]);
         let session = Arc::new(JellyfinSession::ephemeral_for_test());
-        maybe_start_login(
-            &session,
-            PathBuf::from("/nonexistent"),
-            &format!("{}/d/dashboard", mock.base_url()),
-        );
+        let webpage = Arc::new(WebpageController::with_program("true"));
+        maybe_start_login(&session, &webpage, &format!("{}/d/dashboard", mock.base_url()));
         // The probe (and everything after it) now always runs on its own
         // background thread, never on this call's own stack -- see
         // `maybe_start_login`'s doc comment for why. `MockServer`'s `Drop`
@@ -1072,5 +1092,88 @@ mod tests {
         // sleep needed.
         drop(mock);
         assert_eq!(session.credentials(), None);
+    }
+
+    /// Writes an executable stub standing in for the browser engine that
+    /// just sleeps, so `WebpageController::show` has a real, long-lived
+    /// process to track as "the displayed page" -- mirrors `player.rs`'s
+    /// own `stub_browser` test helper, kept local here since it's the only
+    /// thing in this module that needs one.
+    fn sleeping_stub_browser(dir: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let script = dir.join("browser-waiting");
+        std::fs::write(&script, "#!/bin/sh\nsleep 300\n").expect("write stub browser");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("make stub browser executable");
+        script
+    }
+
+    /// Regression test for the race `maybe_start_login`'s doc comment now
+    /// describes: a second `Play` can replace the displayed page while the
+    /// login thread for the *first* page is still mid-flight (here,
+    /// deliberately after the probe/login dance has already started against
+    /// page A, before it persists anything). The thread must notice the
+    /// displayed page no longer matches what it started with and discard the
+    /// result rather than persist credentials under the wrong `server_url`.
+    #[test]
+    fn maybe_start_login_discards_credentials_if_the_displayed_page_changed_before_login_finished() {
+        let dir = std::env::temp_dir().join(format!(
+            "castoff-jellyfin-stale-login-test-{}-{}",
+            std::process::id(),
+            free_port()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create scratch dir");
+
+        let mock = MockServer::sequence(vec![json!({ "ProductName": "Jellyfin Server" })]);
+        let url_a = format!("{}/web/index.html", mock.base_url());
+        let session = Arc::new(JellyfinSession::ephemeral_for_test());
+
+        let browser = sleeping_stub_browser(&dir);
+        let webpage = Arc::new(WebpageController::with_program(
+            browser.to_str().expect("stub browser path must be UTF-8"),
+        ));
+        webpage.show(&url_a).expect("show page A");
+
+        let devtools_port = free_port();
+        write_devtools_active_port(&webpage.profile_dir(), devtools_port);
+        let devtools = serve_mock_devtools(
+            devtools_port,
+            vec![
+                json!(true), // button ready
+                json!(serde_json::Value::Null), // the click itself
+                json!(true), // approved
+                json!({ "accessToken": "tok", "userId": "user", "deviceId": "device" }),
+            ],
+        );
+
+        // A second `Play` supersedes page A with a different page before the
+        // login dance (still polling the shared `DevToolsActivePort`/CDP
+        // socket under the same profile dir) has finished.
+        webpage
+            .show("http://elsewhere.example/other")
+            .expect("show page B, superseding page A");
+
+        maybe_start_login(&session, &webpage, &url_a);
+
+        devtools.join().unwrap();
+        drop(mock);
+        // Give the login thread's own credentials check a moment to run
+        // after the mock DevTools server's last reply landed.
+        let mut saw_credentials = false;
+        for _ in 0..50 {
+            if session.credentials().is_some() {
+                saw_credentials = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !saw_credentials,
+            "credentials for the superseded page must never be persisted"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
