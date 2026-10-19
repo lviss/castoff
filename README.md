@@ -412,7 +412,11 @@ the server, and the daemon becomes an authenticated REST client *of that same se
 - **Now-playing/queue display.** `status`/`RequestQueue` poll `GET /Sessions` for the real
   currently-playing item and report it as `PlaybackUpdate`'s `time`/`duration` and one evolving
   `QueueState` entry -- not a mirrored per-item queue, since Jellyfin's own session has a separate
-  playlist the daemon does not control.
+  playlist the daemon does not control. While that one-item placeholder is shown,
+  `QueueJumpForward`/`QueueJumpBackward`/`QueueJumpToIndex` are a no-op (still reply with
+  `QueueState`) rather than acting on castoff's own queue underneath it; they jump normally again
+  once nothing is yet playing in the Jellyfin session (e.g. still browsing its library), when
+  `QueueState` is reporting the real queue too.
 - **Directional/select remote navigation.** A new private-extension FCast opcode,
   `RemoteCommand` (`MoveUp`/`MoveDown`/`MoveLeft`/`MoveRight`/`Select`/`Back`), dispatches
   Jellyfin's own `GeneralCommand` vocabulary -- the same mechanism a real remote's D-pad drives --
