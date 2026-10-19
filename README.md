@@ -421,7 +421,10 @@ the server, and the daemon becomes an authenticated REST client *of that same se
   `RemoteCommand` (`MoveUp`/`MoveDown`/`MoveLeft`/`MoveRight`/`Select`/`Back`), dispatches
   Jellyfin's own `GeneralCommand` vocabulary -- the same mechanism a real remote's D-pad drives --
   so browsing the library before anything is playing doesn't need the general "remote control an
-  arbitrary page" capability this daemon doesn't have.
+  arbitrary page" capability this daemon doesn't have. This only visibly moves anything because the
+  Jellyfin tab is launched with a TV-flavored `--user-agent` (`webpage.rs`'s
+  `JELLYFIN_TV_USER_AGENT`) -- without it, jellyfin-web never auto-focuses an element on load, and a
+  `GeneralCommand` has no focused element to move.
 
 The `--autoplay-policy=no-user-gesture-required` Chromium flag (`webpage.rs`'s `Browser::args`) is
 what makes a server-issued command actually start playback in the tab: without it, Chromium

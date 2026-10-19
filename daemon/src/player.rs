@@ -1375,7 +1375,7 @@ fn play_webpage(h: &Handles, url: &str) -> Result<()> {
     // Bring the engine up before touching mpv, so a failure to start one (no
     // browser installed) is reported to the sender and leaves mpv's
     // playback (if any) untouched.
-    h.webpage.show(url)?;
+    h.webpage.show(url, h.jellyfin.controls(url))?;
     // If this page's origin turns out to be a Jellyfin server the daemon
     // isn't already logged into, this starts that login dance in the
     // background (see `jellyfin.rs`'s module doc comment) -- never here on
@@ -1854,7 +1854,7 @@ fn fall_back_to_browser(
     // the page, and stays there if the engine cannot be started either.
     let _ = mpv.command("stop", &[]);
     let _ = idle.show(IdleScreen::Clock);
-    if let Err(e) = webpage.show(url) {
+    if let Err(e) = webpage.show(url, jellyfin.controls(url)) {
         error!(
             url,
             error = %e,
@@ -3271,6 +3271,61 @@ mod tests {
         assert!(
             err.to_string().contains("no displayed Jellyfin page"),
             "unexpected error: {err}"
+        );
+    }
+
+    /// Reproduces a live bug report: `RemoteCommand`s (`MoveUp`/`MoveDown`/
+    /// `Back`) reached the Jellyfin server but never visibly moved anything
+    /// in the tab. Root cause was jellyfin-web only auto-focusing an element
+    /// in its TV layout mode (`webpage.rs`'s `JELLYFIN_TV_USER_AGENT` doc
+    /// comment), so the real, observable fix is that the actual Chromium
+    /// argv castoff launches for a Jellyfin page includes a TV-flavored
+    /// `--user-agent` -- and does *not* for a plain (non-Jellyfin) page,
+    /// where it would just be dead weight.
+    #[test]
+    fn jellyfin_pages_launch_chromium_with_a_tv_user_agent() {
+        let mock = MockJellyfin::serving(vec![serde_json::json!([{ "Id": "s1" }])]);
+        let jellyfin = Arc::new(crate::jellyfin::JellyfinSession::ephemeral_for_test());
+        jellyfin.set_credentials(crate::jellyfin::JellyfinCredentials {
+            server_url: mock.base_url(),
+            access_token: "tok".to_string(),
+            user_id: "user".to_string(),
+            device_id: "device".to_string(),
+        });
+
+        let dir = scratch_dir("jellyfin-tv-user-agent");
+        let browser = stub_browser(&dir, "browser-waiting", "sleep 300");
+        let player = headless_player_with_browser_and_jellyfin(&browser, jellyfin);
+        player
+            .play(&webpage_play(&format!("{}/web/index.html", mock.base_url())))
+            .expect("the Jellyfin page must be accepted as a webpage Play");
+
+        let log = wait_for_stub_log(&dir).to_lowercase();
+        assert!(
+            log.contains("--user-agent=") && log.contains("tv"),
+            "a displayed Jellyfin page must launch Chromium with a TV-flavored \
+             --user-agent (jellyfin-web only auto-focuses on load in TV layout \
+             mode, which is what makes D-pad navigation move anything); argv was: {log}"
+        );
+    }
+
+    /// The same TV user-agent override must *not* apply to a plain,
+    /// non-Jellyfin page -- it would be meaningless there and this project's
+    /// intent is scoped to Jellyfin's own navigation gap, not a general
+    /// browser behavior change.
+    #[test]
+    fn non_jellyfin_pages_do_not_get_the_tv_user_agent() {
+        let dir = scratch_dir("jellyfin-tv-user-agent-not-applied");
+        let browser = stub_browser(&dir, "browser-waiting", "sleep 300");
+        let player = headless_player_with_browser(&browser);
+        player
+            .play(&webpage_play("http://127.0.0.1:9/dashboard"))
+            .expect("a webpage play must be accepted");
+
+        let log = wait_for_stub_log(&dir).to_lowercase();
+        assert!(
+            !log.contains("--user-agent="),
+            "a plain dashboard page must not get the Jellyfin-only TV user-agent: {log}"
         );
     }
 

@@ -1134,7 +1134,7 @@ mod tests {
         let webpage = Arc::new(WebpageController::with_program(
             browser.to_str().expect("stub browser path must be UTF-8"),
         ));
-        webpage.show(&url_a).expect("show page A");
+        webpage.show(&url_a, false).expect("show page A");
 
         // Start the login thread for page A: it has nothing to read yet (the
         // stub browser never writes its own `DevToolsActivePort`), so it is
@@ -1149,7 +1149,7 @@ mod tests {
         // this call, not before -- writing it earlier would just have this
         // call delete it again.
         webpage
-            .show("http://elsewhere.example/other")
+            .show("http://elsewhere.example/other", false)
             .expect("show page B, superseding page A");
 
         let devtools_port = free_port();

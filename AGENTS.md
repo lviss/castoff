@@ -609,6 +609,21 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   hung at test teardown waiting on a response that would never come). `MockJellyfin` therefore
   cycles its response list indefinitely and polls with a stop flag rather than blocking on
   `recv()` forever, so `Drop` can always ask it to stop instead of risking that hang.
+  **`RemoteCommand` reaching the server is not the same as it visibly doing anything.** A live bug
+  report showed `POST /Sessions/{id}/Command` succeeding (no error anywhere, same code path
+  `SetVolume` already uses successfully) with nothing moving on screen for `MoveUp`/`MoveDown`/
+  `Back`. Root cause, confirmed by reading jellyfin-web's actual source (not assumed from the
+  research report, which claimed TV layout mode was *not* required here -- that claim did not hold
+  up): a route's list view only auto-focuses an item on load (`src/apps/modern/routes/home.tsx`'s
+  `autoFocus: previousIndex == null && layoutManager.tv`) when `layoutManager.tv` is true, which
+  itself only becomes true from a `tv`-containing (case-insensitive) substring in the user agent
+  (`src/scripts/browser.js`'s `isTv`) -- there is no other trigger. Without it,
+  `document.activeElement` stays `<body>`, and `inputManager.handleCommand`'s `focusManager.moveUp`/
+  `select` (`sourceElement.click()`) on that element are genuine no-ops. Fixed by a `tv_ui: bool`
+  threaded through `Browser::args`/`spawn`/`WebpageController::show` (`webpage.rs`'s
+  `JELLYFIN_TV_USER_AGENT`, set from `JellyfinSession::controls(url)` at both `play_webpage` and
+  `fall_back_to_browser`), adding a TV-flavored `--user-agent` only for a Jellyfin page -- see
+  README's "How Jellyfin control works" for the user-facing summary.
 
 ## Maintaining this file
 
