@@ -1136,6 +1136,22 @@ mod tests {
         ));
         webpage.show(&url_a).expect("show page A");
 
+        // Start the login thread for page A: it has nothing to read yet (the
+        // stub browser never writes its own `DevToolsActivePort`), so it is
+        // still polling when the page changes underneath it below.
+        maybe_start_login(&session, &webpage, &url_a);
+
+        // A second `Play` supersedes page A with a different page before the
+        // login dance (still polling the shared `DevToolsActivePort`/CDP
+        // socket under the same profile dir) has finished. `show` clears any
+        // stale `DevToolsActivePort` before spawning the replacement, so the
+        // file simulating the new engine's own port must be written *after*
+        // this call, not before -- writing it earlier would just have this
+        // call delete it again.
+        webpage
+            .show("http://elsewhere.example/other")
+            .expect("show page B, superseding page A");
+
         let devtools_port = free_port();
         write_devtools_active_port(&webpage.profile_dir(), devtools_port);
         let devtools = serve_mock_devtools(
@@ -1147,15 +1163,6 @@ mod tests {
                 json!({ "accessToken": "tok", "userId": "user", "deviceId": "device" }),
             ],
         );
-
-        // A second `Play` supersedes page A with a different page before the
-        // login dance (still polling the shared `DevToolsActivePort`/CDP
-        // socket under the same profile dir) has finished.
-        webpage
-            .show("http://elsewhere.example/other")
-            .expect("show page B, superseding page A");
-
-        maybe_start_login(&session, &webpage, &url_a);
 
         devtools.join().unwrap();
         drop(mock);
