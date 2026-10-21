@@ -18,7 +18,7 @@ use crate::fcast::{
 };
 use crate::idle_screen::{IdleScreen, IdleScreenController, OnChange};
 use crate::images::ImageStore;
-use crate::jellyfin::JellyfinSession;
+use crate::jellyfin::{JellyfinSession, NowPlaying};
 use crate::overlay::PlaybackOverlay;
 use crate::queue::Queue;
 use crate::webpage::WebpageController;
@@ -795,9 +795,10 @@ impl Player {
     /// possibly long-past `queue_state_message` call (e.g. the last
     /// `Play`/`RequestQueue`) -- that flag alone can go stale if the Jellyfin
     /// tab's own session starts (or stops) playing something with no queue
-    /// mutation in between. See that method's own doc comment for why a
-    /// *failed* fresh poll falls back to the cached flag instead of being
-    /// treated as a confirmed "nothing playing". Deliberately *not* gated on
+    /// mutation in between. See `jellyfin_queue_placeholder`'s own doc
+    /// comment for why a *failed* fresh poll falls back to the cached flag
+    /// instead of being treated as a confirmed "nothing playing".
+    /// Deliberately *not* gated on
     /// the page merely being Jellyfin's (`jellyfin_controls_active_page()`)
     /// -- while that session has nothing playing yet (e.g. still browsing
     /// its library), `queue_state()` falls through to the real queue too, so
@@ -849,40 +850,20 @@ impl Player {
     /// Fresh (not blindly cached) check for whether the synthetic Jellyfin
     /// placeholder is what `queue_state()` would report right now -- see
     /// `queue_jump_forward`'s doc comment for why the jump opcodes must not
-    /// trust `self.jellyfin_placeholder_active` without first refreshing it
-    /// through this same call.
+    /// trust `self.jellyfin_placeholder_active` without first refreshing it.
     ///
-    /// Uses the same three checks `jellyfin_queue_placeholder` does (an
-    /// active Jellyfin page, then `now_playing()`), but -- unlike that
-    /// function, whose only caller (`queue_state_message`) only ever runs
-    /// right after a queue mutation already committed to publishing
-    /// *something* -- a poll failure here is treated as inconclusive, not as
-    /// a confirmed "nothing is playing": falling back to the real queue on a
-    /// transient `now_playing()` error (the server going slow/unreachable
-    /// for a moment) would let a jump proceed against `self.queue` even
-    /// though the client was just shown the placeholder and nothing has
-    /// actually changed. So only a *successful* poll updates
-    /// `self.jellyfin_placeholder_active` and this method's return value;
-    /// an error leaves the cached flag (and thus the decision) exactly as
-    /// it was.
+    /// Goes through the exact same `jellyfin_queue_placeholder` function
+    /// `queue_state_message` itself calls, rather than keeping a second,
+    /// separately-written copy of the same decision: that function is the
+    /// single writer of `self.jellyfin_placeholder_active`, with its own doc
+    /// comment explaining why a failed poll leaves the flag untouched
+    /// instead of being read as a confirmed "nothing is playing" -- having
+    /// two independent writers with different error semantics on one shared
+    /// flag is exactly what let the flag and this guard's decision disagree
+    /// before.
     fn jellyfin_placeholder_showing(&self) -> bool {
-        let Some(url) = self.webpage.active_url() else {
-            self.jellyfin_placeholder_active.store(false, Ordering::Relaxed);
-            return false;
-        };
-        if !self.jellyfin.controls(&url) {
-            self.jellyfin_placeholder_active.store(false, Ordering::Relaxed);
-            return false;
-        }
-        match self.jellyfin.now_playing() {
-            Ok(now_playing) => {
-                let showing = now_playing.is_some();
-                self.jellyfin_placeholder_active
-                    .store(showing, Ordering::Relaxed);
-                showing
-            }
-            Err(_) => self.jellyfin_placeholder_active.load(Ordering::Relaxed),
-        }
+        jellyfin_queue_placeholder(&self.webpage, &self.jellyfin, &self.jellyfin_placeholder_active)
+            .is_some()
     }
 
     /// Empty the play queue (see `queue::Queue::clear`) -- what the Android
@@ -1553,15 +1534,44 @@ fn abort_loading_to_idle(h: &Handles) -> Result<()> {
 /// doing so once stalled every other queue mutation (`Play`,
 /// `QueueJumpForward`/`Backward`/`ToIndex`, `ClearQueue`, auto-advance) for
 /// up to the same 10s whenever the Jellyfin server was slow or unreachable.
+///
+/// This is the *single* writer of `placeholder_active`
+/// (`Player::jellyfin_placeholder_showing`, the queue-jump guard, calls this
+/// same function rather than keeping its own copy of this logic) -- a
+/// *confirmed* `now_playing()` result (`Ok`, whether or not something is
+/// actually playing) always overwrites the flag, but a failed poll leaves it
+/// untouched and instead falls back to whatever it last confirmed: a
+/// definitive "nothing playing" and an inconclusive "couldn't tell" must not
+/// collapse into the same `None`, or a transient failure from one caller
+/// (e.g. a `RequestQueue` reply) could clobber the flag to `false` and make a
+/// *different* caller (e.g. a queue-jump opcode) wrongly conclude the
+/// placeholder isn't showing even though Jellyfin may still genuinely have
+/// something playing.
 fn jellyfin_queue_placeholder(
     webpage: &WebpageController,
     jellyfin: &JellyfinSession,
+    placeholder_active: &AtomicBool,
 ) -> Option<QueueStateMessage> {
-    let url = webpage.active_url()?;
+    let Some(url) = webpage.active_url() else {
+        placeholder_active.store(false, Ordering::Relaxed);
+        return None;
+    };
     if !jellyfin.controls(&url) {
+        placeholder_active.store(false, Ordering::Relaxed);
         return None;
     }
-    let now_playing = jellyfin.now_playing().ok().flatten()?;
+    let now_playing = match jellyfin.now_playing() {
+        Ok(now_playing) => {
+            placeholder_active.store(now_playing.is_some(), Ordering::Relaxed);
+            now_playing?
+        }
+        Err(_) => {
+            if !placeholder_active.load(Ordering::Relaxed) {
+                return None;
+            }
+            NowPlaying::default()
+        }
+    };
     Some(QueueStateMessage {
         generation_time: now_millis(),
         items: vec![QueueItemMessage {
@@ -1590,9 +1600,10 @@ fn jellyfin_queue_placeholder(
 /// `jellyfin_queue_placeholder`'s own network call (if any) has already
 /// returned -- every caller must mutate/save the queue in its own, separate
 /// locked section *before* calling this, not hold that lock across it.
-/// Records whether this computation returned the placeholder into
-/// `placeholder_active`, so the queue-jump opcodes can gate on the mode that
-/// was actually just broadcast instead of re-polling Jellyfin themselves
+/// `jellyfin_queue_placeholder` itself records whether this computation
+/// found the placeholder into `placeholder_active`, so the queue-jump
+/// opcodes can gate on the mode that was actually just broadcast instead of
+/// re-polling Jellyfin with their own, separately-written copy of the flag
 /// (see `Player`'s field of the same name).
 fn queue_state_message(
     queue: &Mutex<Queue>,
@@ -1600,8 +1611,7 @@ fn queue_state_message(
     jellyfin: &JellyfinSession,
     placeholder_active: &AtomicBool,
 ) -> QueueStateMessage {
-    let placeholder = jellyfin_queue_placeholder(webpage, jellyfin);
-    placeholder_active.store(placeholder.is_some(), Ordering::Relaxed);
+    let placeholder = jellyfin_queue_placeholder(webpage, jellyfin, placeholder_active);
     placeholder.unwrap_or_else(|| queue.lock().unwrap().to_state_message())
 }
 
@@ -3874,18 +3884,20 @@ mod tests {
         );
     }
 
-    /// Regression test: the queue-jump guard must gate on the mode that was
-    /// actually last broadcast to clients (`jellyfin_placeholder_active`),
-    /// not re-derive it from a fresh, independent `now_playing()` poll of
-    /// its own -- a poll a moment later can disagree with the one that
-    /// produced the broadcast the client actually saw (the server's state
-    /// moved on, or the poll simply fails). Reproduced directly: once the
-    /// client has been shown the placeholder, the mock Jellyfin server is
-    /// torn down -- simulating it going slow/unreachable -- before the jump
-    /// is sent. A guard that re-polled would see that failure, treat it as
-    /// "nothing is playing", and wrongly let the jump proceed against the
-    /// real queue; the fixed guard needs no further network access at all to
-    /// make the same correct no-op decision.
+    /// Regression test: the queue-jump guard *does* make a fresh
+    /// `now_playing()` poll of its own on every jump (see
+    /// `jellyfin_placeholder_showing`'s doc comment), but a failed poll must
+    /// fall back to the last confirmed state instead of being read as a
+    /// confirmed "nothing is playing" -- otherwise a poll a moment after the
+    /// one that produced the broadcast the client actually saw could
+    /// disagree with it (the server going slow/unreachable in between).
+    /// Reproduced directly: once the client has been shown the placeholder,
+    /// the mock Jellyfin server is torn down -- simulating it going
+    /// slow/unreachable -- before the jump is sent. A guard that treated
+    /// this poll failure as a confirmed "nothing is playing" would wrongly
+    /// let the jump proceed against the real queue; the fixed guard falls
+    /// back to the cached flag instead and makes the same correct no-op
+    /// decision.
     #[test]
     fn queue_jump_opcodes_honor_the_last_broadcast_mode_even_if_the_server_goes_unreachable() {
         let mock = MockJellyfin::serving(vec![serde_json::json!([{
