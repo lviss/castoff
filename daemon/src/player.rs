@@ -70,17 +70,17 @@ pub struct Player {
     /// controllable source through FCast's existing opcodes rather than a
     /// parallel control path.
     jellyfin: Arc<JellyfinSession>,
-    /// Whether the *last* `queue_state_message` computation (by any
-    /// publisher: `queue_state()` itself, auto-advance, a reverted queue
-    /// position, or a metadata-lookup republish) returned the synthetic
-    /// Jellyfin placeholder rather than the real queue -- see
-    /// `queue_state_message`'s doc comment. `queue_jump_forward`/`backward`/
-    /// `to_index` gate on this instead of re-polling `jellyfin.now_playing()`
-    /// themselves: a second, independent poll can disagree with the one that
-    /// decided what the client was actually just shown (the server can
-    /// answer differently a few hundred milliseconds apart, or one poll can
-    /// fail while the other succeeds), which could silently let a jump act on
-    /// `self.queue` while the client is still looking at the placeholder.
+    /// The last *confirmed* answer (by any publisher: `queue_state()`
+    /// itself, auto-advance, a reverted queue position, or a metadata-lookup
+    /// republish, all via `jellyfin_queue_placeholder`) to whether the
+    /// synthetic Jellyfin placeholder is showing rather than the real queue
+    /// -- see `jellyfin_queue_placeholder`'s doc comment, the single writer
+    /// of this flag. `queue_jump_forward`/`backward`/`to_index` go through
+    /// `Player::jellyfin_placeholder_showing`, which makes its own fresh poll
+    /// before deciding and only falls back to this cached value when that
+    /// poll fails -- so a transient Jellyfin outage can't be misread as a
+    /// confirmed "nothing playing" and let a jump act on `self.queue` while
+    /// the client is still looking at the placeholder.
     jellyfin_placeholder_active: Arc<AtomicBool>,
     /// Broadcasts the latest `PlaybackUpdate`-shaped snapshot whenever any
     /// method below changes playback state, or an async transition does (a
@@ -1602,9 +1602,11 @@ fn jellyfin_queue_placeholder(
 /// locked section *before* calling this, not hold that lock across it.
 /// `jellyfin_queue_placeholder` itself records whether this computation
 /// found the placeholder into `placeholder_active`, so the queue-jump
-/// opcodes can gate on the mode that was actually just broadcast instead of
-/// re-polling Jellyfin with their own, separately-written copy of the flag
-/// (see `Player`'s field of the same name).
+/// opcodes (via `Player::jellyfin_placeholder_showing`, which calls back
+/// into `jellyfin_queue_placeholder` rather than keeping a second,
+/// separately-written copy of this decision) can gate on a flag that is
+/// never written two different ways (see `Player`'s field of the same
+/// name).
 fn queue_state_message(
     queue: &Mutex<Queue>,
     webpage: &WebpageController,
