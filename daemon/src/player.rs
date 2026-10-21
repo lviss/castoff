@@ -785,23 +785,25 @@ impl Player {
     /// `jump_backward`) and, if one exists, play it -- what the Android
     /// task's Next/Previous buttons call (`Opcode::QueueJumpForward`/
     /// `QueueJumpBackward` in `main.rs`). A no-op, not an error, when already
-    /// at either edge of the queue, and likewise whenever the last
-    /// `queue_state_message` computation (`self.jellyfin_placeholder_active`)
-    /// showed the synthetic Jellyfin placeholder `queue_state()` reports in
-    /// that case: a jump against `self.queue` here would silently play
-    /// whatever unrelated item that index holds instead of the item the
-    /// client was just shown. Gated on that cached flag, not a fresh
-    /// `jellyfin.now_playing()` poll of its own: two independent polls a few
-    /// hundred milliseconds apart can disagree (the server answers
-    /// differently, or one poll fails while the other doesn't), which could
-    /// let a jump act on `self.queue` while the client is still looking at
-    /// the placeholder it was actually shown. Deliberately *not* gated on the
-    /// page merely being Jellyfin's (`jellyfin_controls_active_page()`) --
-    /// while that session has nothing playing yet (e.g. still browsing its
-    /// library), `queue_state()` falls through to the real queue too, so a
-    /// jump here must act on it rather than silently no-op.
+    /// at either edge of the queue, and likewise whenever the synthetic
+    /// Jellyfin placeholder `queue_state()` reports is currently in play: a
+    /// jump against `self.queue` here would silently play whatever unrelated
+    /// item that index holds instead of the item the client was just shown.
+    /// Gated on `jellyfin_placeholder_showing`, which refreshes the decision
+    /// with a fresh poll immediately before reading it rather than trusting
+    /// `self.jellyfin_placeholder_active` as last written by some unrelated,
+    /// possibly long-past `queue_state_message` call (e.g. the last
+    /// `Play`/`RequestQueue`) -- that flag alone can go stale if the Jellyfin
+    /// tab's own session starts (or stops) playing something with no queue
+    /// mutation in between. See that method's own doc comment for why a
+    /// *failed* fresh poll falls back to the cached flag instead of being
+    /// treated as a confirmed "nothing playing". Deliberately *not* gated on
+    /// the page merely being Jellyfin's (`jellyfin_controls_active_page()`)
+    /// -- while that session has nothing playing yet (e.g. still browsing
+    /// its library), `queue_state()` falls through to the real queue too, so
+    /// a jump here must act on it rather than silently no-op.
     pub fn queue_jump_forward(&self) -> Result<()> {
-        if self.jellyfin_placeholder_active.load(Ordering::Relaxed) {
+        if self.jellyfin_placeholder_showing() {
             return Ok(());
         }
         let _operation = self.operation.lock().unwrap();
@@ -814,7 +816,7 @@ impl Player {
 
     /// See `queue_jump_forward`.
     pub fn queue_jump_backward(&self) -> Result<()> {
-        if self.jellyfin_placeholder_active.load(Ordering::Relaxed) {
+        if self.jellyfin_placeholder_showing() {
             return Ok(());
         }
         let _operation = self.operation.lock().unwrap();
@@ -833,7 +835,7 @@ impl Player {
     /// out-of-range index, or while the synthetic Jellyfin placeholder is
     /// shown instead of the real queue (see `queue_jump_forward`).
     pub fn queue_jump_to_index(&self, index: usize) -> Result<()> {
-        if self.jellyfin_placeholder_active.load(Ordering::Relaxed) {
+        if self.jellyfin_placeholder_showing() {
             return Ok(());
         }
         let _operation = self.operation.lock().unwrap();
@@ -842,6 +844,45 @@ impl Player {
         let item = queue.jump_to(index).cloned();
         drop(queue);
         self.play_jumped_item(item, previous)
+    }
+
+    /// Fresh (not blindly cached) check for whether the synthetic Jellyfin
+    /// placeholder is what `queue_state()` would report right now -- see
+    /// `queue_jump_forward`'s doc comment for why the jump opcodes must not
+    /// trust `self.jellyfin_placeholder_active` without first refreshing it
+    /// through this same call.
+    ///
+    /// Uses the same three checks `jellyfin_queue_placeholder` does (an
+    /// active Jellyfin page, then `now_playing()`), but -- unlike that
+    /// function, whose only caller (`queue_state_message`) only ever runs
+    /// right after a queue mutation already committed to publishing
+    /// *something* -- a poll failure here is treated as inconclusive, not as
+    /// a confirmed "nothing is playing": falling back to the real queue on a
+    /// transient `now_playing()` error (the server going slow/unreachable
+    /// for a moment) would let a jump proceed against `self.queue` even
+    /// though the client was just shown the placeholder and nothing has
+    /// actually changed. So only a *successful* poll updates
+    /// `self.jellyfin_placeholder_active` and this method's return value;
+    /// an error leaves the cached flag (and thus the decision) exactly as
+    /// it was.
+    fn jellyfin_placeholder_showing(&self) -> bool {
+        let Some(url) = self.webpage.active_url() else {
+            self.jellyfin_placeholder_active.store(false, Ordering::Relaxed);
+            return false;
+        };
+        if !self.jellyfin.controls(&url) {
+            self.jellyfin_placeholder_active.store(false, Ordering::Relaxed);
+            return false;
+        }
+        match self.jellyfin.now_playing() {
+            Ok(now_playing) => {
+                let showing = now_playing.is_some();
+                self.jellyfin_placeholder_active
+                    .store(showing, Ordering::Relaxed);
+                showing
+            }
+            Err(_) => self.jellyfin_placeholder_active.load(Ordering::Relaxed),
+        }
     }
 
     /// Empty the play queue (see `queue::Queue::clear`) -- what the Android
@@ -3310,6 +3351,64 @@ mod tests {
         }
     }
 
+    /// A mock Jellyfin server whose response can be swapped at runtime via
+    /// `set_response`, for the one test that needs the *same* session to
+    /// start reporting a `NowPlayingItem` with no queue mutation (and so no
+    /// `queue_state_message` republish) in between -- `MockJellyfin::serving`
+    /// cycles through a fixed list and can't model "the server's answer
+    /// changed because the tab did something, not because castoff did".
+    struct SwitchableJellyfin {
+        addr: String,
+        response: Arc<Mutex<serde_json::Value>>,
+        stop: Arc<std::sync::atomic::AtomicBool>,
+        handle: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl SwitchableJellyfin {
+        fn serving(initial: serde_json::Value) -> Self {
+            let server = tiny_http::Server::http("127.0.0.1:0").expect("bind mock Jellyfin");
+            let addr = server.server_addr().to_string();
+            let response = Arc::new(Mutex::new(initial));
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let thread_response = Arc::clone(&response);
+            let thread_stop = Arc::clone(&stop);
+            let handle = std::thread::spawn(move || {
+                use std::sync::atomic::Ordering;
+                while !thread_stop.load(Ordering::Relaxed) {
+                    let Ok(Some(request)) = server.recv_timeout(Duration::from_millis(100))
+                    else {
+                        continue;
+                    };
+                    let body = thread_response.lock().unwrap().clone();
+                    let _ = request.respond(tiny_http::Response::from_string(body.to_string()));
+                }
+            });
+            Self {
+                addr,
+                response,
+                stop,
+                handle: Some(handle),
+            }
+        }
+
+        fn base_url(&self) -> String {
+            format!("http://{}", self.addr)
+        }
+
+        fn set_response(&self, value: serde_json::Value) {
+            *self.response.lock().unwrap() = value;
+        }
+    }
+
+    impl Drop for SwitchableJellyfin {
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            if let Some(h) = self.handle.take() {
+                let _ = h.join();
+            }
+        }
+    }
+
     /// [`headless_player_with_browser`], but with a `JellyfinSession`
     /// supplied instead of a fresh, logged-out one -- so routing tests can
     /// pre-authenticate it against a mock server.
@@ -3834,6 +3933,71 @@ mod tests {
             "the jump must honor the placeholder mode the client was last shown, not a fresh \
              poll that (with the server now gone) would have failed and wrongly let the jump \
              proceed"
+        );
+    }
+
+    /// Regression test for the "stale cached placeholder flag" finding: the
+    /// opposite staleness direction from the test above. There, a *failed*
+    /// poll had to fall back to the last known (showing) state; here, the
+    /// Jellyfin tab's own session starts playing something entirely on its
+    /// own, with no castoff-side queue mutation (and so no
+    /// `queue_state_message` republish) in between to refresh
+    /// `jellyfin_placeholder_active`. The jump guard must still notice, via
+    /// its own fresh poll immediately before deciding, rather than act on
+    /// the stale cached `false` and tear down the Jellyfin page to play an
+    /// unrelated queued item the client was never shown.
+    #[test]
+    fn queue_jump_forward_notices_the_jellyfin_session_starting_to_play_with_no_republish_in_between()
+    {
+        let mock = SwitchableJellyfin::serving(serde_json::json!([{
+            "Id": "s1",
+            "PlayState": { "PositionTicks": 0, "IsPaused": false },
+        }]));
+        let jellyfin = Arc::new(crate::jellyfin::JellyfinSession::ephemeral_for_test());
+        jellyfin.set_credentials(crate::jellyfin::JellyfinCredentials {
+            server_url: mock.base_url(),
+            access_token: "tok".to_string(),
+            user_id: "user".to_string(),
+            device_id: "device".to_string(),
+        });
+
+        let dir = scratch_dir("jellyfin-queue-jump-notices-session-starting");
+        let browser = stub_browser(&dir, "browser-waiting", "sleep 300");
+        let player = headless_player_with_browser_and_jellyfin(&browser, jellyfin);
+        let jellyfin_url = format!("{}/web/index.html", mock.base_url());
+        player
+            .play(&webpage_play(&jellyfin_url))
+            .expect("the Jellyfin page must be accepted as a webpage Play");
+        let unrelated_media = "av://lavfi:testsrc=size=64x64:rate=10:duration=1";
+        player
+            .play(&PlayMessage {
+                url: Some(unrelated_media.to_string()),
+                ..Default::default()
+            })
+            .expect("enqueue an unrelated media item behind the Jellyfin page");
+        assert!(
+            !player.jellyfin_placeholder_active.load(Ordering::Relaxed),
+            "nothing was playing in Jellyfin yet, so the cached flag must still be false"
+        );
+
+        // The Jellyfin tab's own session now starts playing something on its
+        // own -- no castoff-side queue mutation runs to refresh the cached
+        // flag.
+        mock.set_response(serde_json::json!([{
+            "Id": "s1",
+            "PlayState": { "PositionTicks": 0, "IsPaused": false },
+            "NowPlayingItem": { "Name": "Big Buck Bunny", "RunTimeTicks": 6_000_000_000i64 },
+        }]));
+
+        player
+            .queue_jump_forward()
+            .expect("jump forward must no-op, not error, once Jellyfin itself is playing something");
+
+        assert!(
+            player.webpage_active(),
+            "the jump must notice (via its own fresh poll) that the Jellyfin session now has \
+             something playing and no-op, instead of acting on the stale cached flag and \
+             tearing down the Jellyfin page to play the unrelated queued item"
         );
     }
 
