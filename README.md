@@ -449,6 +449,17 @@ jellyfin-web deliberately exposes globally. This all runs on its own background 
 `Player` operation's lock, since waiting on a human can take minutes; a page that is not a
 Jellyfin server, or one the daemon is already logged into, never spawns that thread at all.
 
+**Surviving a daemon restart.** The login above persists durably in `jellyfin.json`, but the
+*browser's* own session does not -- its profile lives under `/tmp`, keyed by the daemon's own
+process id, so a restart gives it an empty one even though `jellyfin.json` still has a valid
+token. `jellyfin::maybe_restore_session` covers exactly that gap: whenever the daemon is already
+logged into a displayed page's origin but that page's own `window.ApiClient` is unset (a fresh
+profile, not an active session), it writes jellyfin-web's own `jellyfin_credentials` entry
+straight into that page's `localStorage` via the same CDP connection and reloads, so jellyfin-web's
+own startup bootstrap picks the token back up itself -- the same mechanism a real browser's
+session-restore-on-reload already is, just seeded by the daemon. No Quick Connect dance repeats
+unless Jellyfin has actually revoked the token server-side.
+
 ### On-screen feedback: loading indicator and start/stop fade
 
 A `Play` that has been accepted but has not started rendering yet does not leave the screen

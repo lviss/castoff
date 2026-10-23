@@ -624,6 +624,36 @@ This file is the project's committed home for project-intrinsic agent knowledge:
   `JELLYFIN_TV_USER_AGENT`, set from `JellyfinSession::controls(url)` at both `play_webpage` and
   `fall_back_to_browser`), adding a TV-flavored `--user-agent` only for a Jellyfin page -- see
   README's "How Jellyfin control works" for the user-facing summary.
+  **Jellyfin login surviving a daemon restart is a browser-storage problem, not a
+  credentials-storage one.** `jellyfin.json` was already durable; the gap was that
+  `webpage.rs`'s browser profile (`castoff-browser-<pid>-<seq>` under `/tmp`) is keyed by the
+  daemon's own pid, so a restart hands the tab a fresh, empty profile while the daemon's REST
+  client still has a perfectly valid token -- the tab sits at its login screen, `remote_command`
+  fails outright (`resolve_session` finds no session for the stored device id), and the daemon
+  never re-triggers Quick Connect since `JellyfinSession::controls(url)` is (correctly) still
+  true. `jellyfin::maybe_restore_session` (called alongside `maybe_start_login` at both
+  `play_webpage`/`fall_back_to_browser`, same staleness re-check on `webpage.active_url()`) fixes
+  this the way a real browser's own session-restore-on-reload already works: when
+  `window.ApiClient` is unset on the just-shown tab (`HAS_API_CLIENT_JS`) but durable credentials
+  exist, it writes jellyfin-web's own `jellyfin_credentials` `localStorage` entry
+  (`restore_session_js`) via the existing CDP connection and reloads, letting jellyfin-web's own
+  startup bootstrap (confirmed from the archived `jellyfin-apiclient-javascript`'s
+  `connectionManager.js`: `getLastUsedServer` picks the server with the newest
+  `DateLastAccessed`, `validateAuthentication` re-checks the token against
+  `GET /System/Info`/`X-MediaBrowser-Token` before trusting it, `onAuthenticated` re-establishes
+  the live session) do the rest -- no second write path, no risk of the daemon's injected blob
+  disagreeing with what jellyfin-web itself would have written. Needs `JellyfinCredentials`'
+  new `server_id` field (`window.ApiClient.serverId()`, read back in the same `login_via_browser_tab`
+  call as the other fields) for `Servers[].Id` -- `connectionManager.js`'s `getServerInfo`/
+  `getLastUsedServer` both key by it. `#[serde(default)]` keeps a pre-this-field `jellyfin.json`
+  loadable; `maybe_restore_session` just stays a no-op for it (empty `server_id`) rather than
+  injecting a blob with no server identity. Within one daemon lifetime this is correctly a
+  no-op on every `Play` after the first -- the browser profile (and its `localStorage`) is shared
+  across `show()` calls, so the tab already carries its own live session and `window.ApiClient` is
+  already set; only a fresh-process profile triggers the restore. Not independently round-tripped
+  against a live server (this daemon still never calls Jellyfin's own bootstrap endpoints itself,
+  by design) -- the mechanism is the one `jellyfin-web`'s own source already documents using for
+  exactly this, but confirm on a real server if this specific path is ever in question.
 
 ## Maintaining this file
 

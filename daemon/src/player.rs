@@ -1452,6 +1452,11 @@ fn play_webpage(h: &Handles, url: &str) -> Result<()> {
     // background (see `jellyfin.rs`'s module doc comment) -- never here on
     // this call stack, since it can block for minutes waiting on a human.
     crate::jellyfin::maybe_start_login(h.jellyfin, h.webpage, h.operation, url);
+    // The inverse case: the daemon is already logged in (durable
+    // `jellyfin.json`), but a daemon restart gave the browser a fresh,
+    // empty profile with no session of its own -- see
+    // `maybe_restore_session`'s doc comment.
+    crate::jellyfin::maybe_restore_session(h.jellyfin, h.webpage, url);
     h.mpv
         .command("stop", &[])
         .map_err(|e| anyhow::anyhow!("stop before displaying a web page failed: {e:?}"))?;
@@ -2096,6 +2101,7 @@ fn fall_back_to_browser(
         );
     } else {
         crate::jellyfin::maybe_start_login(jellyfin, webpage, operation, url);
+        crate::jellyfin::maybe_restore_session(jellyfin, webpage, url);
     }
     // This path never goes through a `Player` method: a successful `show`
     // flips `webpage.is_active()` from false to true, which is the
@@ -3485,6 +3491,7 @@ mod tests {
             access_token: "tok".to_string(),
             user_id: "user".to_string(),
             device_id: "device".to_string(),
+            server_id: "srv-1".to_string(),
         });
 
         let dir = scratch_dir("jellyfin-playback-routing");
@@ -3550,6 +3557,7 @@ mod tests {
             access_token: "tok".to_string(),
             user_id: "user".to_string(),
             device_id: "device".to_string(),
+            server_id: "srv-1".to_string(),
         });
 
         let dir = scratch_dir("jellyfin-remote-command-routing");
@@ -3601,6 +3609,7 @@ mod tests {
             access_token: "tok".to_string(),
             user_id: "user".to_string(),
             device_id: "device".to_string(),
+            server_id: "srv-1".to_string(),
         });
 
         let dir = scratch_dir("jellyfin-tv-user-agent");
@@ -3697,6 +3706,7 @@ mod tests {
             access_token: "tok".to_string(),
             user_id: "user".to_string(),
             device_id: "device".to_string(),
+            server_id: "srv-1".to_string(),
         });
 
         let dir = scratch_dir("jellyfin-status-routing");
@@ -3734,6 +3744,7 @@ mod tests {
             access_token: "tok".to_string(),
             user_id: "user".to_string(),
             device_id: "device".to_string(),
+            server_id: "srv-1".to_string(),
         });
 
         let dir = scratch_dir("jellyfin-volume-routing");
@@ -3764,6 +3775,7 @@ mod tests {
             access_token: "tok".to_string(),
             user_id: "user".to_string(),
             device_id: "device".to_string(),
+            server_id: "srv-1".to_string(),
         });
 
         let dir = scratch_dir("jellyfin-volume-fallback-no-now-playing");
@@ -3803,6 +3815,7 @@ mod tests {
             access_token: "tok".to_string(),
             user_id: "user".to_string(),
             device_id: "device".to_string(),
+            server_id: "srv-1".to_string(),
         });
 
         let dir = scratch_dir("jellyfin-queue-jump-no-op");
@@ -3852,6 +3865,7 @@ mod tests {
             access_token: "tok".to_string(),
             user_id: "user".to_string(),
             device_id: "device".to_string(),
+            server_id: "srv-1".to_string(),
         });
 
         let dir = scratch_dir("jellyfin-queue-jump-still-works");
@@ -3913,6 +3927,7 @@ mod tests {
             access_token: "tok".to_string(),
             user_id: "user".to_string(),
             device_id: "device".to_string(),
+            server_id: "srv-1".to_string(),
         });
 
         let dir = scratch_dir("jellyfin-queue-jump-honors-last-broadcast");
@@ -3973,6 +3988,7 @@ mod tests {
             access_token: "tok".to_string(),
             user_id: "user".to_string(),
             device_id: "device".to_string(),
+            server_id: "srv-1".to_string(),
         });
 
         let dir = scratch_dir("jellyfin-queue-jump-notices-session-starting");
@@ -4033,6 +4049,7 @@ mod tests {
             access_token: "tok".to_string(),
             user_id: "user".to_string(),
             device_id: "device".to_string(),
+            server_id: "srv-1".to_string(),
         });
 
         let dir = scratch_dir("jellyfin-queue-state-routing");
@@ -4171,6 +4188,7 @@ mod tests {
             access_token: "tok".to_string(),
             user_id: "user".to_string(),
             device_id: "device".to_string(),
+            server_id: "srv-1".to_string(),
         });
 
         let dir = scratch_dir("jellyfin-concurrent-slow-queue-state");
@@ -4222,6 +4240,7 @@ mod tests {
             access_token: "tok".to_string(),
             user_id: "user".to_string(),
             device_id: "device".to_string(),
+            server_id: "srv-1".to_string(),
         });
 
         let dir = scratch_dir("jellyfin-metadata-lookup-queue-state");

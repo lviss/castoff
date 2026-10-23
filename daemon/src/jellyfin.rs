@@ -104,6 +104,18 @@ pub(crate) struct JellyfinCredentials {
     /// (`GET /Sessions?DeviceId=...`) -- see this module's doc comment for
     /// why there is no separate daemon-chosen device id.
     pub(crate) device_id: String,
+    /// The server's own system id (`window.ApiClient.serverId()`), read back
+    /// alongside the other fields. Only used by `maybe_restore_session` to
+    /// rebuild jellyfin-web's own `jellyfin_credentials` localStorage entry
+    /// (`Credentials.Servers[].Id`, confirmed from the archived
+    /// `jellyfin-apiclient-javascript`'s `connectionManager.js`:
+    /// `getServerInfo`/`getLastUsedServer` both key servers by this exact
+    /// field) after a daemon restart wipes the browser's own session -- see
+    /// that function's doc comment. `#[serde(default)]` so a `jellyfin.json`
+    /// written before this field existed still loads (session restoration
+    /// just stays a no-op for it; the REST client itself never needed this).
+    #[serde(default)]
+    pub(crate) server_id: String,
 }
 
 /// Jellyfin's now-playing state for the controlled session, in the shape
@@ -548,6 +560,174 @@ pub(crate) fn maybe_start_login(
     });
 }
 
+/// Jellyfin's own `localStorage` key for its login session
+/// (`jellyfin-apiclient-javascript`'s `Credentials`: `this.key = key ||
+/// 'jellyfin_credentials'` -- confirmed from its archived source).
+const CREDENTIALS_STORAGE_KEY: &str = "jellyfin_credentials";
+
+/// Whether the displayed tab's own `window.ApiClient` is already set --
+/// i.e. jellyfin-web itself has already restored (or is restoring) a login
+/// from its *own* storage, the ordinary case for every `Play` after the
+/// first one in a daemon's lifetime (the browser profile, and its
+/// `localStorage`, is shared across every `show()` call within one process
+/// -- see `maybe_restore_session`'s doc comment). `false` is the one signal
+/// that function needs to act on: a fresh, empty profile with no session in
+/// it at all.
+const HAS_API_CLIENT_JS: &str =
+    "(() => typeof window.ApiClient !== 'undefined' && window.ApiClient !== null)()";
+
+/// Build the `jellyfin_credentials` JSON `localStorage` entry jellyfin-web's
+/// own `ConnectionManager`/`Credentials` read on startup to decide which
+/// server/session to restore (see `maybe_restore_session`'s doc comment for
+/// the mechanism, and `JellyfinCredentials::server_id`'s doc comment for the
+/// field-by-field source). `DateLastAccessed` matters even though this
+/// restoration has exactly one server to offer: `ConnectionManager`'s
+/// `getLastUsedServer` sorts `Servers` by it and takes the max, so it must
+/// be "now", not left at zero. Double-encoding (`blob.to_string()`, then
+/// `serde_json::to_string` on *that* string) turns the inner JSON into a
+/// properly quoted and escaped JS string literal regardless of what
+/// characters appear in the token/url -- no manual escaping, no injection
+/// risk from a value this module did not itself generate.
+fn restore_session_js(creds: &JellyfinCredentials) -> String {
+    let date_last_accessed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let blob = json!({
+        "Servers": [{
+            "Id": creds.server_id,
+            "AccessToken": creds.access_token,
+            "UserId": creds.user_id,
+            "ManualAddress": creds.server_url,
+            "DateLastAccessed": date_last_accessed,
+            // ConnectionMode.Manual (`connectionManager.js`) -- matches how
+            // this daemon's own REST client always talks to `server_url`
+            // directly, never via local/remote network discovery.
+            "LastConnectionMode": 2,
+        }]
+    });
+    let js_literal = serde_json::to_string(&blob.to_string()).expect("a String always serializes");
+    format!("localStorage.setItem('{CREDENTIALS_STORAGE_KEY}', {js_literal})")
+}
+
+/// Jellyfin login survives a daemon restart (`jellyfin.json`'s whole point),
+/// but the *browser's* own session does not: `webpage.rs`'s
+/// `Browser::profile_dir` is `castoff-browser-<pid>-<seq>` under `/tmp`,
+/// keyed by the daemon's own (new, every restart) pid, so a fresh process
+/// gets a fresh, empty profile and jellyfin-web's own `localStorage` is
+/// empty even though the daemon's REST client still has a perfectly valid
+/// token. Left alone, the displayed tab sits at its login screen while the
+/// daemon's `Pause`/`SetVolume`/etc. calls keep succeeding against a session
+/// nothing is actually watching, and `remote_command` fails outright
+/// (`resolve_session` finds no session registered for the stored device id).
+///
+/// This restores the *browser's* side the way a user resuming an
+/// already-logged-in tab would: inject jellyfin-web's own
+/// `jellyfin_credentials` localStorage entry (`restore_session_js`) and
+/// reload, so its own startup bootstrap
+/// (`ConnectionManager`/`ServerConnections`, confirmed from the archived
+/// `jellyfin-apiclient-javascript`'s `connectionManager.js`:
+/// `getLastUsedServer`/`validateAuthentication`/`onAuthenticated`) picks up
+/// the existing token and re-establishes the session itself -- the same
+/// mechanism a real browser's own session-restore-on-reload already is,
+/// just seeded by the daemon rather than by a previous page visit.
+/// `validateAuthentication` re-checks the token against the server
+/// (`GET /System/Info` with `X-MediaBrowser-Token`) before trusting it, so a
+/// token Jellyfin has since revoked server-side falls back to the login
+/// screen exactly as it would for a real user, rather than wedging on a
+/// dead token. Not independently round-tripped against a live server (this
+/// daemon never calls Jellyfin's own bootstrap endpoints itself, by design
+/// -- see this module's doc comment); the mechanism is the one
+/// `jellyfin-web`'s own source already documents using for exactly this.
+///
+/// Only acts when `jellyfin.controls(url)` is true (there is nothing
+/// durable to restore otherwise -- that case is `maybe_start_login`'s) and
+/// the just-shown tab's own `window.ApiClient` is unset (`HAS_API_CLIENT_JS`):
+/// within one daemon lifetime the browser profile is shared across every
+/// `show()` call, so every `Play` after the first already carries its own
+/// live session and this stays correctly a no-op (no reload flicker on the
+/// common path). A `jellyfin.json` persisted before `server_id` existed
+/// (empty string) also makes this a no-op -- there is nothing valid to
+/// build a `Servers[].Id` from. Called on its own detached thread for the
+/// same reason `maybe_start_login` is: CDP round trips must never run on
+/// `play_webpage`/`fall_back_to_browser`'s own call stack. Re-checks
+/// `webpage.active_url()` immediately before writing anything, the same
+/// staleness guard `maybe_start_login` uses -- a newer `Play` can replace
+/// the displayed engine while the CDP round trip above is in flight, and
+/// without this check this function could write Jellyfin's credentials
+/// into, and reload, whatever unrelated page is now actually on screen.
+pub(crate) fn maybe_restore_session(
+    jellyfin: &Arc<JellyfinSession>,
+    webpage: &Arc<WebpageController>,
+    url: &str,
+) {
+    if !jellyfin.controls(url) {
+        return;
+    }
+    let Some(creds) = jellyfin.credentials() else {
+        return;
+    };
+    if creds.server_id.is_empty() {
+        return;
+    }
+    let webpage = Arc::clone(webpage);
+    let profile_dir = webpage.profile_dir();
+    let url = url.to_string();
+    std::thread::spawn(move || {
+        let http_port = match cdp::wait_for_devtools_port(&profile_dir, DEVTOOLS_PORT_TIMEOUT) {
+            Ok(port) => port,
+            Err(e) => {
+                warn!(error = %e, "could not reach the displayed page's DevTools port to restore its Jellyfin session");
+                return;
+            }
+        };
+        let agent = ureq::AgentBuilder::new().timeout(REQUEST_TIMEOUT).build();
+        let ws_url = match cdp::discover_page_ws_url(&agent, http_port) {
+            Ok(url) => url,
+            Err(e) => {
+                warn!(error = %e, "could not discover the displayed page's DevTools target to restore its Jellyfin session");
+                return;
+            }
+        };
+        let mut session = match cdp::CdpSession::connect(http_port, &ws_url) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(error = %e, "could not open a DevTools session to restore the displayed page's Jellyfin session");
+                return;
+            }
+        };
+        match session.evaluate(HAS_API_CLIENT_JS) {
+            Ok(serde_json::Value::Bool(true)) => return, // already has a live session.
+            Ok(_) => {} // a fresh profile with nothing logged in; proceed to restore.
+            Err(e) => {
+                warn!(error = %e, "could not check whether the displayed Jellyfin page already has a live session");
+                return;
+            }
+        }
+        // A newer `Play` can replace the displayed engine (and, with it,
+        // `DevToolsActivePort` under the shared profile dir) while the CDP
+        // round trip above is in flight -- the same race `maybe_start_login`
+        // guards against. Without this check, a wrong-origin page could get
+        // Jellyfin's credentials written into *its* storage and reloaded
+        // out from under whoever is now looking at it.
+        if webpage.active_url().as_deref() != Some(url.as_str()) {
+            return;
+        }
+        if let Err(e) = session.evaluate(&restore_session_js(&creds)) {
+            warn!(error = %e, "failed to restore the Jellyfin session into the displayed page's own storage");
+            return;
+        }
+        info!("restored Jellyfin's own browser session from durable credentials after a daemon restart");
+        // Reloading tears down this CDP session (the renderer's execution
+        // context goes away mid-navigation), so a read error/timeout on
+        // this specific call is the expected shape of success here, not a
+        // real failure -- the localStorage write above already landed and
+        // was confirmed. See `cdp::CdpSession::evaluate`'s own doc comment
+        // for why a torn-down engine surfaces as a read timeout.
+        let _ = session.evaluate("location.reload()");
+    });
+}
+
 /// The login page's own Quick Connect button selector (confirmed from
 /// `jellyfin-web`'s `login/index.html`/`index.js`): hidden by default,
 /// shown once the page's own `GET /QuickConnect/Enabled` call resolves true.
@@ -559,7 +739,7 @@ const CLICK_QUICK_CONNECT_JS: &str = "document.querySelector('.btnQuick').click(
 /// `accessToken()` returns `null` until its internal login flow succeeds.
 const IS_LOGGED_IN_JS: &str =
     "(() => !!(window.ApiClient && typeof window.ApiClient.accessToken === 'function' && window.ApiClient.accessToken()))()";
-const READ_CREDENTIALS_JS: &str = "({ accessToken: window.ApiClient.accessToken(), userId: window.ApiClient.getCurrentUserId(), deviceId: window.ApiClient.deviceId() })";
+const READ_CREDENTIALS_JS: &str = "({ accessToken: window.ApiClient.accessToken(), userId: window.ApiClient.getCurrentUserId(), deviceId: window.ApiClient.deviceId(), serverId: window.ApiClient.serverId() })";
 
 /// Log in to Jellyfin by driving the login page already displayed in the
 /// browser engine via CDP: wait for its own Quick Connect button to become
@@ -604,6 +784,7 @@ fn login_via_browser_tab(profile_dir: &Path, server_origin: &str) -> Result<Jell
         access_token: field("accessToken")?,
         user_id: field("userId")?,
         device_id: field("deviceId")?,
+        server_id: field("serverId")?,
     })
 }
 
@@ -771,6 +952,7 @@ mod tests {
             access_token: "tok".to_string(),
             user_id: "user".to_string(),
             device_id: "device".to_string(),
+            server_id: "srv-1".to_string(),
         });
         assert!(session.controls("http://jellyfin.lan:8096/web/index.html"));
         // Case-insensitive, matching `webpage.rs`'s own URL handling.
@@ -837,6 +1019,7 @@ mod tests {
             access_token: "test-token".to_string(),
             user_id: "test-user".to_string(),
             device_id: "test-device".to_string(),
+            server_id: "srv-1".to_string(),
         });
         session
     }
@@ -901,6 +1084,7 @@ mod tests {
             access_token: "new-token".to_string(),
             user_id: "new-user".to_string(),
             device_id: "new-device".to_string(),
+            server_id: "srv-1".to_string(),
         });
 
         release_tx.send(()).expect("release the held mock response");
@@ -1099,6 +1283,7 @@ mod tests {
             access_token: "tok".to_string(),
             user_id: "user".to_string(),
             device_id: "device".to_string(),
+            server_id: "srv-1".to_string(),
         });
 
         #[cfg(unix)]
@@ -1125,6 +1310,7 @@ mod tests {
                 access_token: "tok".to_string(),
                 user_id: "user".to_string(),
                 device_id: "device".to_string(),
+                server_id: "srv-1".to_string(),
             })
         );
 
@@ -1195,6 +1381,57 @@ mod tests {
         (port, handle)
     }
 
+    /// Same as `serve_mock_devtools`, but also returns each request's own
+    /// `params.expression` (in order) instead of discarding it -- for
+    /// asserting on exactly what was evaluated, not just the canned replies
+    /// fed back.
+    fn serve_mock_devtools_capturing(
+        script: Vec<serde_json::Value>,
+    ) -> (u16, std::thread::JoinHandle<Vec<String>>) {
+        use std::io::{Read, Write};
+        use tungstenite::Message;
+
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind mock DevTools port");
+        let port = listener.local_addr().expect("mock DevTools listener has a local addr").port();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept json/list connection");
+            let mut buf = [0u8; 2048];
+            let _ = stream.read(&mut buf);
+            let body = json!([{
+                "type": "page",
+                "webSocketDebuggerUrl": format!("ws://127.0.0.1:{port}/devtools/page/test"),
+            }])
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).expect("write json/list response");
+
+            let (stream, _) = listener.accept().expect("accept devtools websocket");
+            let mut socket = tungstenite::accept(stream).expect("mock DevTools WS handshake");
+            let mut captured = Vec::new();
+            for value in script {
+                let text = loop {
+                    match socket.read().expect("read CDP request") {
+                        Message::Text(text) => break text,
+                        _ => continue,
+                    }
+                };
+                let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+                captured.push(parsed["params"]["expression"].as_str().unwrap_or_default().to_string());
+                let id = parsed["id"].clone();
+                let reply = json!({ "id": id, "result": { "result": { "value": value } } });
+                socket
+                    .send(Message::Text(reply.to_string()))
+                    .expect("send mock CDP reply");
+            }
+            captured
+        });
+        (port, handle)
+    }
+
     fn write_devtools_active_port(profile_dir: &Path, port: u16) {
         std::fs::create_dir_all(profile_dir).unwrap();
         std::fs::write(
@@ -1217,7 +1454,7 @@ mod tests {
             json!(serde_json::Value::Null), // the click itself
             json!(false), // not logged in yet
             json!(true),  // approved
-            json!({ "accessToken": "tok", "userId": "user", "deviceId": "device" }),
+            json!({ "accessToken": "tok", "userId": "user", "deviceId": "device", "serverId": "srv-1" }),
         ]);
         write_devtools_active_port(&profile_dir, port);
 
@@ -1388,7 +1625,7 @@ mod tests {
             json!(true), // button ready
             json!(serde_json::Value::Null), // the click itself
             json!(true), // approved
-            json!({ "accessToken": "tok", "userId": "user", "deviceId": "device" }),
+            json!({ "accessToken": "tok", "userId": "user", "deviceId": "device", "serverId": "srv-1" }),
         ]);
         write_devtools_active_port(&webpage.profile_dir(), devtools_port);
 
@@ -1408,6 +1645,164 @@ mod tests {
             !saw_credentials,
             "credentials for the superseded page must never be persisted"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The exact shape jellyfin-web's own `ConnectionManager`/`Credentials`
+    /// read from `localStorage` on startup (see `restore_session_js`'s doc
+    /// comment for the source citations) -- a pure-function test, since
+    /// this value has no return value to observe once actually injected
+    /// into a page.
+    #[test]
+    fn restore_session_js_builds_the_exact_credentials_blob_jellyfin_web_reads() {
+        let creds = JellyfinCredentials {
+            server_url: "http://jellyfin.lan:8096".to_string(),
+            access_token: "tok".to_string(),
+            user_id: "user-1".to_string(),
+            device_id: "device-1".to_string(),
+            server_id: "server-guid-1".to_string(),
+        };
+        let js = restore_session_js(&creds);
+
+        let prefix = "localStorage.setItem('jellyfin_credentials', ";
+        assert!(js.starts_with(prefix) && js.ends_with(')'), "unexpected shape: {js}");
+        let js_literal = &js[prefix.len()..js.len() - 1];
+        // The JS string literal is itself valid JSON (see the function's own
+        // doc comment on double-encoding), so it can be parsed the same way.
+        let inner_json: String = serde_json::from_str(js_literal).expect("a valid JS/JSON string literal");
+        let blob: serde_json::Value = serde_json::from_str(&inner_json).expect("valid JSON");
+
+        let server = &blob["Servers"][0];
+        assert_eq!(server["Id"], "server-guid-1");
+        assert_eq!(server["AccessToken"], "tok");
+        assert_eq!(server["UserId"], "user-1");
+        assert_eq!(server["ManualAddress"], "http://jellyfin.lan:8096");
+        assert_eq!(server["LastConnectionMode"], 2);
+        let date_last_accessed = server["DateLastAccessed"].as_u64().expect("a numeric timestamp");
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        assert!(
+            date_last_accessed > 0 && date_last_accessed <= now_ms,
+            "DateLastAccessed must be a real, current timestamp (ConnectionManager.getLastUsedServer \
+             sorts Servers by it), got {date_last_accessed} (now: {now_ms})"
+        );
+    }
+
+    #[test]
+    fn maybe_restore_session_does_nothing_for_a_non_jellyfin_origin() {
+        // No durable credentials at all: nothing to restore, must return
+        // before ever touching the network/CDP.
+        let session = Arc::new(JellyfinSession::ephemeral_for_test());
+        let webpage = Arc::new(WebpageController::with_program("true"));
+        maybe_restore_session(&session, &webpage, "http://other.example.com/web/index.html");
+    }
+
+    #[test]
+    fn maybe_restore_session_does_nothing_when_server_id_is_missing() {
+        // Simulates a `jellyfin.json` persisted before `server_id` existed
+        // (`#[serde(default)]` leaves it empty) -- there is nothing valid to
+        // build a `Servers[].Id` from, so this must stay a no-op rather than
+        // inject a blob jellyfin-web would reject or mismatch.
+        let session = Arc::new(JellyfinSession::ephemeral_for_test());
+        session.set_credentials(JellyfinCredentials {
+            server_url: "http://jellyfin.lan".to_string(),
+            access_token: "tok".to_string(),
+            user_id: "user".to_string(),
+            device_id: "device".to_string(),
+            server_id: String::new(),
+        });
+        let webpage = Arc::new(WebpageController::with_program("true"));
+        maybe_restore_session(&session, &webpage, "http://jellyfin.lan/web/index.html");
+    }
+
+    /// The common case for every `Play` after the first one in a daemon's
+    /// lifetime: the browser profile (and its `localStorage`) is shared
+    /// across `show()` calls, so the tab already has its own live session
+    /// and nothing needs restoring. Scripting the mock with exactly one
+    /// reply and joining its thread with a bounded wait is the deterministic
+    /// signal that the code asked only the one question
+    /// (`HAS_API_CLIENT_JS`) and stopped -- a wrongful second request would
+    /// find the mock's listener already gone and error out instead of
+    /// hanging the test.
+    #[test]
+    fn maybe_restore_session_does_nothing_when_the_browser_already_has_a_live_session() {
+        let dir = std::env::temp_dir().join(format!(
+            "castoff-jellyfin-restore-live-test-{}-{}",
+            std::process::id(),
+            free_port()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create scratch dir");
+
+        let session = Arc::new(logged_in_session("http://jellyfin.lan"));
+        let webpage = Arc::new(WebpageController::with_program("true"));
+        webpage.show("http://jellyfin.lan/web/index.html", false).expect("show the page");
+
+        let (port, server) = serve_mock_devtools(vec![json!(true)]); // already has window.ApiClient
+        write_devtools_active_port(&webpage.profile_dir(), port);
+
+        maybe_restore_session(&session, &webpage, "http://jellyfin.lan/web/index.html");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !server.is_finished() {
+            assert!(Instant::now() < deadline, "the mock DevTools server never finished -- maybe_restore_session asked more than the one expected question");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        server.join().unwrap();
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The real fix (review-7): after a daemon restart, `jellyfin.json`
+    /// still has valid durable credentials but the browser's own profile is
+    /// fresh and has no session (`window.ApiClient` unset) -- this is the
+    /// one case that must inject the stored credentials and reload.
+    #[test]
+    fn maybe_restore_session_injects_credentials_when_the_browser_has_no_session() {
+        let dir = std::env::temp_dir().join(format!(
+            "castoff-jellyfin-restore-fresh-test-{}-{}",
+            std::process::id(),
+            free_port()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create scratch dir");
+
+        let session = Arc::new(logged_in_session("http://jellyfin.lan"));
+        let webpage = Arc::new(WebpageController::with_program("true"));
+        webpage.show("http://jellyfin.lan/web/index.html", true).expect("show the page");
+
+        let (port, requests) = serve_mock_devtools_capturing(vec![
+            json!(false),                   // no window.ApiClient: a fresh, wiped profile
+            json!(serde_json::Value::Null), // the localStorage.setItem call's own return value
+            json!(serde_json::Value::Null), // location.reload()'s own return value (best-effort)
+        ]);
+        write_devtools_active_port(&webpage.profile_dir(), port);
+
+        maybe_restore_session(&session, &webpage, "http://jellyfin.lan/web/index.html");
+
+        let captured = requests.join().unwrap();
+        assert_eq!(captured.len(), 3, "unexpected request sequence: {captured:?}");
+        assert_eq!(captured[0], HAS_API_CLIENT_JS);
+        // Decode the same way `restore_session_js_builds_...` does: the JS
+        // expression is `localStorage.setItem('jellyfin_credentials', <JS
+        // string literal>)`, and that literal is itself a JSON string
+        // (double-encoded, see `restore_session_js`'s doc comment), so a raw
+        // substring match on `captured[1]` would be matching escaped text,
+        // not the real JSON content.
+        let prefix = "localStorage.setItem('jellyfin_credentials', ";
+        assert!(captured[1].starts_with(prefix) && captured[1].ends_with(')'), "unexpected shape: {}", captured[1]);
+        let js_literal = &captured[1][prefix.len()..captured[1].len() - 1];
+        let inner_json: String = serde_json::from_str(js_literal).expect("a valid JS/JSON string literal");
+        let blob: serde_json::Value = serde_json::from_str(&inner_json).expect("valid JSON");
+        let server = &blob["Servers"][0];
+        assert_eq!(server["AccessToken"], "test-token", "must carry the real, stored credentials: {blob}");
+        assert_eq!(server["UserId"], "test-user");
+        assert_eq!(server["Id"], "srv-1");
+        assert_eq!(server["ManualAddress"], "http://jellyfin.lan");
+        assert_eq!(captured[2], "location.reload()");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
