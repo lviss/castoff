@@ -444,7 +444,7 @@ drives that page via a minimal Chrome DevTools Protocol client (`daemon/src/cdp.
 Connect button -- which runs jellyfin-web's *own* Initiate/poll/Authenticate dance and shows the
 code in its own dialog, so the daemon never needs to display one itself -- waits (up to ten
 minutes, matching the server's own secret lifetime) for a human to approve it elsewhere, then
-reads back the token/user/device id that flow already obtained via `window.ApiClient`, which
+reads back the token/user/device/server id that flow already obtained via `window.ApiClient`, which
 jellyfin-web deliberately exposes globally. This all runs on its own background thread, off any
 `Player` operation's lock, since waiting on a human can take minutes; a page that is not a
 Jellyfin server, or one the daemon is already logged into, never spawns that thread at all.
