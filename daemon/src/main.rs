@@ -1,6 +1,8 @@
+mod cdp;
 mod fcast;
 mod idle_screen;
 mod images;
+mod jellyfin;
 mod metadata;
 mod overlay;
 mod player;
@@ -21,8 +23,8 @@ use tracing::{debug, error, info, warn};
 
 use fcast::{
     ImageWallpaperUpdateMessage, Opcode, PlayMessage, PlaybackErrorMessage, PlaybackState,
-    PlaybackUpdateMessage, QueueJumpToIndexMessage, QueueStateMessage, SeekMessage,
-    SetImageWallpaperMessage, SetSpeedMessage, SetVolumeMessage, VersionMessage,
+    PlaybackUpdateMessage, QueueJumpToIndexMessage, QueueStateMessage, RemoteCommandMessage,
+    SeekMessage, SetImageWallpaperMessage, SetSpeedMessage, SetVolumeMessage, VersionMessage,
 };
 use player::Player;
 
@@ -308,6 +310,13 @@ async fn dispatch(writer: &SharedWriter, player: &Arc<Player>, frame: fcast::Fra
             info!(speed = msg.speed, "received SetSpeed");
             let p = Arc::clone(player);
             tokio::task::spawn_blocking(move || p.set_speed(msg.speed)).await??;
+            send_status(writer, player).await
+        }
+        Opcode::RemoteCommand => {
+            let msg: RemoteCommandMessage = serde_json::from_slice(&frame.body)?;
+            info!(command = ?msg.command, "received RemoteCommand");
+            let p = Arc::clone(player);
+            tokio::task::spawn_blocking(move || p.remote_command(msg.command)).await??;
             send_status(writer, player).await
         }
         Opcode::RequestQueue => {

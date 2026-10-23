@@ -163,6 +163,29 @@ test_malformed_header_fails_loudly() {
     assert_contains "the error explains the KEY=VALUE requirement" "$out" "KEY=VALUE"
 }
 
+test_remote_sends_the_right_command_name() {
+    local port_file; port_file="$(mktemp -u)"
+    perl "$SCRIPT_DIR/fake-fcast-server.pl" --port-file "$port_file" --scenario echo-request &
+    local server_pid=$!
+    local port; port="$(read_port "$port_file")"
+
+    local out
+    out="$(CASTOFF_PORT="$port" "$CAST_SH" remote up)"
+    wait "$server_pid" 2>/dev/null
+    rm -f "$port_file"
+
+    assert_eq "remote up sends RemoteCommandMessage{command: MoveUp}" "MoveUp" "$(jq -r '.command' <<<"$out")"
+}
+
+test_remote_rejects_an_unknown_direction() {
+    local out status
+    out="$("$CAST_SH" remote sideways 2>&1)"
+    status=$?
+
+    assert_status_nonzero "remote exits nonzero for an unknown direction" "$status"
+    assert_contains "the error names the bad direction" "$out" "sideways"
+}
+
 test_missing_dependency_fails_with_a_clear_message() {
     # Strips every jq-bearing directory out of PATH (leaving perl/curl
     # reachable) to reproduce the captain's real report: `nix shell` (not
@@ -194,6 +217,8 @@ test_ping_fails_loudly_when_server_closes_without_a_reply
 test_upload_image
 test_play_transmits_headers
 test_malformed_header_fails_loudly
+test_remote_sends_the_right_command_name
+test_remote_rejects_an_unknown_direction
 test_missing_dependency_fails_with_a_clear_message
 
 echo "passed: $pass failed: $fail"

@@ -62,6 +62,37 @@ const KILL_GRACE: Duration = Duration::from_secs(2);
 /// arbitrary string from ever reaching Chromium's argv.
 const ALLOWED_SCHEMES: [&str; 3] = ["http://", "https://", "file://"];
 
+/// Launched for a Jellyfin page (`tv_ui` in `Browser::args`/`spawn`/
+/// `WebpageController::show`) so jellyfin-web's own `GeneralCommand`
+/// directional navigation (castoff's `RemoteCommand` opcode,
+/// `MoveUp`/`MoveDown`/`MoveLeft`/`MoveRight`/`Select`/`Back`) has something
+/// to move focus *from*. Confirmed by reading jellyfin-web's real source
+/// (`src/scripts/browser.js`, `src/components/layoutManager.js`,
+/// `src/apps/modern/routes/home.tsx`): a route's list view only auto-focuses
+/// an item on load when `layoutManager.tv` is true, and that in turn only
+/// becomes true when `browser.js`'s `isTv()` matches a `tv` substring
+/// (case-insensitively) in the user agent -- there is no other trigger (no
+/// manual setting, no capability negotiated over the API). Without it,
+/// `document.activeElement` stays the page's `<body>`, and
+/// `inputManager.handleCommand`'s `focusManager.moveUp(sourceElement)` /
+/// `select(sourceElement)` (`sourceElement.click()`) on that element are
+/// genuine no-ops: the `POST /Sessions/{id}/Command` call still reaches the
+/// server and the tab's WebSocket still delivers it (confirmed: no error
+/// anywhere, and `SetVolume` over the exact same `general_command` path
+/// already works), but nothing on screen moves. This exactly reproduced a
+/// live bug report (`MoveUp`/`MoveDown`/`Back` logged as received, nothing
+/// visibly happened) and contradicts the `castoff-jellyfin-integration-ux`
+/// report's §4.2 claim that TV layout mode is not required for these
+/// commands to function -- that claim did not hold up against jellyfin-web's
+/// actual `home.tsx` (`autoFocus: previousIndex == null && layoutManager.tv`).
+/// The literal Chromium product/version tokens are cosmetic (only the `tv`
+/// substring matters to Jellyfin); they are not kept in sync with the pinned
+/// `pkgs.chromium` version on purpose, since no part of this feature depends
+/// on a site reading the exact Chrome version back out of this string.
+const JELLYFIN_TV_USER_AGENT: &str =
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) \
+     Chrome/149.0.7827.200 Safari/537.36 SmartTV";
+
 /// Root the browser engine's directories are created under, unless
 /// `CASTOFF_BROWSER_PROFILE_DIR` overrides it. Deliberately a *fixed* short
 /// absolute path rather than `std::env::temp_dir()`: `temp_dir()` honours
@@ -170,9 +201,11 @@ impl Browser {
     }
 
     /// Chromium argv for `url` (program excluded). Pure so tests can assert
-    /// the exact flags the appliance launches with.
-    fn args(&self, url: &str) -> Vec<String> {
-        vec![
+    /// the exact flags the appliance launches with. `tv_ui` adds a
+    /// TV-flavored `--user-agent` override -- see its own doc comment on
+    /// `JELLYFIN_TV_USER_AGENT`.
+    fn args(&self, url: &str, tv_ui: bool) -> Vec<String> {
+        let mut args = vec![
             // The appliance session is pure Wayland (Cage); Chromium's
             // default ozone platform is X11, so this is explicit rather than
             // inferred from the environment.
@@ -191,10 +224,42 @@ impl Browser {
             // (the end-to-end test asserts on them).
             "--force-color-profile=srgb".to_string(),
             format!("--user-data-dir={}", self.profile_dir.display()),
-        ]
+            // A command arriving over a page's own WebSocket (e.g. Jellyfin's
+            // session-control channel driving jellyfin-web's `playbackManager`)
+            // is not a user gesture, so without this flag Chromium's default
+            // autoplay policy rejects the resulting `play()` call outright --
+            // exactly the "stuck at splash screen" failure upstream describes
+            // (jellyfin-web#4901). Confirmed necessary and sufficient against
+            // the pinned Chromium build (see `castoff-jellyfin-cast-research`
+            // report): without it, `play()` rejects with `NotAllowedError`;
+            // with it, playback starts. Safe to apply unconditionally to every
+            // page this controller shows, not just Jellyfin's -- this is a
+            // kiosk with no mouse/keyboard for a user gesture to ever come
+            // from regardless of which page is on screen.
+            "--autoplay-policy=no-user-gesture-required".to_string(),
+            // An ephemeral, OS-assigned DevTools port: `jellyfin.rs`'s login
+            // flow (`maybe_start_login`/`login_via_browser_tab`) drives the
+            // displayed Jellyfin login page via CDP (`cdp.rs`) -- clicking
+            // its own Quick Connect button and reading back the token/user/
+            // device id its own login flow obtained, since that is
+            // `localStorage`-backed state no page from a different origin
+            // could write for it. `0` (rather than a fixed port) avoids any
+            // collision with another process, including a second
+            // `WebpageController` in this same test binary; the actual port
+            // Chromium picked is read back from its own
+            // `DevToolsActivePort` file (`cdp::wait_for_devtools_port`).
+            // Harmless for every other displayed page: nothing makes this
+            // daemon connect to it unless a Jellyfin server was detected.
+            "--remote-debugging-port=0".to_string(),
+        ];
+        if tv_ui {
+            args.push(format!("--user-agent={JELLYFIN_TV_USER_AGENT}"));
+        }
+        args
     }
 
-    /// Remove Chromium's process-singleton files from the profile directory.
+    /// Remove Chromium's process-singleton files from the profile directory,
+    /// plus the previous engine's `DevToolsActivePort`.
     ///
     /// Every browser in this controller shares one `--user-data-dir`, and
     /// Chromium admits only one browser per profile via these files. A
@@ -202,8 +267,18 @@ impl Browser {
     /// detect a lock whose pid is dead, but removing them after the previous
     /// engine has been reaped makes the restart deterministic instead of
     /// relying on that detection.
+    ///
+    /// `DevToolsActivePort` matters for the same reason: it is also written
+    /// once, at startup, under this same shared profile directory (see
+    /// `args`' `--remote-debugging-port=0`), and the next engine would not
+    /// rewrite it until *its own* DevTools HTTP server binds. Without
+    /// removing the stale file here, `cdp::wait_for_devtools_port` could
+    /// read the *previous*, now-dead engine's port instead of waiting for
+    /// the new one -- this is the one place in `show` where the old engine
+    /// is already confirmed gone and the new one has not spawned yet, so it
+    /// cannot race either side.
     fn clear_singleton_artifacts(&self) {
-        for name in ["SingletonLock", "SingletonSocket", "SingletonCookie"] {
+        for name in ["SingletonLock", "SingletonSocket", "SingletonCookie", "DevToolsActivePort"] {
             let path = self.profile_dir.join(name);
             match std::fs::remove_file(&path) {
                 Ok(()) => {}
@@ -211,8 +286,8 @@ impl Browser {
                 Err(e) => error!(
                     path = %path.display(),
                     error = %e,
-                    "failed to clear a stale browser profile singleton file; the next \
-                     engine start will fall back to Chromium's own stale-lock detection"
+                    "failed to clear a stale browser profile file; the next engine's \
+                     singleton-lock detection or DevTools port discovery may see stale state"
                 ),
             }
         }
@@ -220,7 +295,8 @@ impl Browser {
 
     /// Start Chromium on `url`. Returns as soon as the process is spawned;
     /// loading and painting the page happen inside the engine afterwards.
-    fn spawn(&self, url: &str) -> Result<Child> {
+    /// `tv_ui` is threaded straight into `args` -- see `JELLYFIN_TV_USER_AGENT`.
+    fn spawn(&self, url: &str, tv_ui: bool) -> Result<Child> {
         self.check_paths_fit()?;
         // Chromium needs its `TMPDIR` to exist before it starts (it creates
         // its process-singleton socket under it), and it is one shared
@@ -233,7 +309,7 @@ impl Browser {
         })?;
         let mut command = Command::new(&self.program);
         command
-            .args(self.args(url))
+            .args(self.args(url, tv_ui))
             // The engine's own temp dir, so Chromium's process-singleton
             // socket path cannot inherit a deep ambient `TMPDIR` -- see the
             // field's doc comment.
@@ -267,6 +343,10 @@ impl Browser {
 /// The page currently on screen, plus everything needed to take it down.
 struct ActivePage {
     pid: i32,
+    /// The URL this page was shown with. Lets a caller (e.g. `Player`'s
+    /// Jellyfin routing) recognize *which* page is on screen without a new
+    /// parallel tracking mechanism of its own.
+    url: String,
     /// Signals (once) that the browser process has been reaped.
     exited: Receiver<()>,
 }
@@ -313,6 +393,24 @@ impl WebpageController {
         self.state.lock().unwrap().current.is_some()
     }
 
+    /// The URL currently displayed, if any.
+    pub(crate) fn active_url(&self) -> Option<String> {
+        self.state
+            .lock()
+            .unwrap()
+            .current
+            .as_ref()
+            .map(|p| p.url.clone())
+    }
+
+    /// This controller's shared `--user-data-dir`, fixed for its whole
+    /// lifetime (see `Browser::profile_dir`). `jellyfin.rs`'s
+    /// `maybe_start_login` reads `DevToolsActivePort` under it to find the
+    /// just-shown engine's own CDP port.
+    pub(crate) fn profile_dir(&self) -> PathBuf {
+        self.browser.profile_dir.clone()
+    }
+
     /// Display `url`, replacing whatever page (if any) is on screen.
     ///
     /// The incumbent engine is taken down and *reaped* before the
@@ -323,7 +421,11 @@ impl WebpageController {
     /// incumbent's lock -- or hand its URL to the incumbent and exit --
     /// leaving the sender's page undisplayed. The brief idle gap between the
     /// two engines is the accepted cost of that ordering.
-    pub(crate) fn show(&self, url: &str) -> Result<()> {
+    ///
+    /// `tv_ui` is threaded straight into `Browser::spawn`/`args` -- pass the
+    /// caller's own `JellyfinSession::controls(url)` check (see
+    /// `JELLYFIN_TV_USER_AGENT`'s doc comment for why this matters).
+    pub(crate) fn show(&self, url: &str, tv_ui: bool) -> Result<()> {
         validate_url(url)?;
 
         // Take the incumbent out of `current` and wait for its process to be
@@ -338,7 +440,7 @@ impl WebpageController {
         }
         self.browser.clear_singleton_artifacts();
 
-        let mut child = self.browser.spawn(url)?;
+        let mut child = self.browser.spawn(url, tv_ui)?;
         let pid = child.id() as i32;
         let (exited_tx, exited_rx) = mpsc::channel();
 
@@ -347,6 +449,7 @@ impl WebpageController {
             state.generation += 1;
             state.current = Some(ActivePage {
                 pid,
+                url: url.to_string(),
                 exited: exited_rx,
             });
             state.generation
@@ -474,10 +577,13 @@ mod tests {
             profile_dir: PathBuf::from("/tmp/castoff-browser-test"),
             temp_dir: PathBuf::from("/tmp/castoff-browser-tmp-test"),
         };
-        let args = browser.args("http://127.0.0.1:8000/dashboard");
+        let args = browser.args("http://127.0.0.1:8000/dashboard", false);
 
         assert!(args.iter().any(|a| a == "--ozone-platform=wayland"));
         assert!(args.iter().any(|a| a == "--kiosk"));
+        assert!(args
+            .iter()
+            .any(|a| a == "--autoplay-policy=no-user-gesture-required"));
         assert!(args
             .iter()
             .any(|a| a == "--app=http://127.0.0.1:8000/dashboard"));
@@ -487,6 +593,33 @@ mod tests {
         // The URL must never be its own argv element, where Chromium could
         // read it as a flag.
         assert!(!args.iter().any(|a| a == "http://127.0.0.1:8000/dashboard"));
+        // A plain (non-Jellyfin) page must not get the TV user-agent override.
+        assert!(!args.iter().any(|a| a.starts_with("--user-agent=")));
+    }
+
+    /// A Jellyfin page (`tv_ui: true`) must launch with a TV-flavored
+    /// `--user-agent`: without it, jellyfin-web never auto-focuses anything
+    /// on load (`layoutManager.tv` gate), so the D-pad `RemoteCommand`s this
+    /// override exists for have no focused element to move -- see
+    /// `JELLYFIN_TV_USER_AGENT`'s doc comment. Reproduces a live bug report
+    /// (`MoveUp`/`MoveDown`/`Back` reached the server, nothing moved).
+    #[test]
+    fn browser_args_set_a_tv_user_agent_for_jellyfin_pages() {
+        let browser = Browser {
+            program: "chromium".to_string(),
+            profile_dir: PathBuf::from("/tmp/castoff-browser-test"),
+            temp_dir: PathBuf::from("/tmp/castoff-browser-tmp-test"),
+        };
+        let args = browser.args("http://jellyfin.lan:8096/web/index.html", true);
+
+        let user_agent = args
+            .iter()
+            .find(|a| a.starts_with("--user-agent="))
+            .unwrap_or_else(|| panic!("expected a --user-agent flag, got: {args:?}"));
+        assert!(
+            user_agent.to_lowercase().contains("tv"),
+            "the user agent must contain \"tv\" for jellyfin-web's isTv() to match: {user_agent}"
+        );
     }
 
     /// Regression test for the failure seen on real hardware: a deep ambient
@@ -546,7 +679,7 @@ mod tests {
             );
             // `spawn` is what reaches Chromium, so it must refuse before that.
             let err = browser
-                .spawn("http://127.0.0.1:8000/dashboard")
+                .spawn("http://127.0.0.1:8000/dashboard", false)
                 .expect_err("spawn must refuse instead of launching Chromium");
             assert!(
                 err.to_string()
